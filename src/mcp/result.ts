@@ -605,11 +605,17 @@ function sanitizedFailureMessage(value: string): string {
 function snapshotDescriptorStrings(
   value: unknown,
 ): readonly string[] | undefined {
-  if (
-    INTRINSICS.utilIsProxy(value) ||
-    !INTRINSICS.arrayIsArray(value) ||
-    INTRINSICS.reflectGetPrototypeOf(value) !== INTRINSICS.arrayPrototype
-  ) {
+  if (typeof value !== "object" || value === null) return undefined;
+  if (INTRINSICS.utilIsProxy(value) || !INTRINSICS.arrayIsArray(value)) {
+    return undefined;
+  }
+  let prototype: object | null;
+  try {
+    prototype = INTRINSICS.reflectGetPrototypeOf(value);
+  } catch {
+    return undefined;
+  }
+  if (prototype !== INTRINSICS.arrayPrototype && prototype !== null) {
     return undefined;
   }
 
