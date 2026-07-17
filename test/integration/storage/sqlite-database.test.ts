@@ -2,7 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import Database from "better-sqlite3";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { AppError } from "../../../src/domain/errors.js";
 import {
   migrateSqliteDatabase,
@@ -11,6 +12,8 @@ import {
   runInNewImmediateTransaction,
   sqliteVersionAtLeast,
 } from "../../../src/storage/sqlite-database.js";
+
+type PragmaOptions = Parameters<Database.Database["pragma"]>[1];
 
 const roots: string[] = [];
 
@@ -191,6 +194,71 @@ describe("SQLite connection hardening", () => {
       database.close();
     },
   );
+
+  test("retries a transient busy error while enabling WAL", () => {
+    const root = mkdtempSync(join(tmpdir(), "github-stars-db-"));
+    roots.push(root);
+    const path = join(root, "state.sqlite3");
+    const originalPragma = Reflect.get(Database.prototype, "pragma");
+    let injectedBusyErrors = 0;
+    const pragmaSpy = vi
+      .spyOn(Database.prototype, "pragma")
+      .mockImplementation(function (
+        this: Database.Database,
+        source: string,
+        options?: PragmaOptions,
+      ): unknown {
+        if (source === "journal_mode = WAL" && injectedBusyErrors === 0) {
+          injectedBusyErrors += 1;
+          throw new Database.SqliteError("database is locked", "SQLITE_BUSY");
+        }
+        return Reflect.apply(originalPragma, this, [source, options]);
+      });
+
+    let database: Database.Database | undefined;
+    try {
+      database = openSqliteDatabase(path);
+      expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
+      expect(injectedBusyErrors).toBe(1);
+    } finally {
+      database?.close();
+      pragmaSpy.mockRestore();
+    }
+  });
+
+  test("does not rewrite the persistent WAL mode on later opens", () => {
+    const root = mkdtempSync(join(tmpdir(), "github-stars-db-"));
+    roots.push(root);
+    const path = join(root, "state.sqlite3");
+    const bootstrap = openSqliteDatabase(path);
+    bootstrap.close();
+
+    const originalPragma = Reflect.get(Database.prototype, "pragma");
+    let walWriteAttempts = 0;
+    const pragmaSpy = vi
+      .spyOn(Database.prototype, "pragma")
+      .mockImplementation(function (
+        this: Database.Database,
+        source: string,
+        options?: PragmaOptions,
+      ): unknown {
+        if (source === "journal_mode = WAL") {
+          walWriteAttempts += 1;
+          throw new Database.SqliteError("database is locked", "SQLITE_BUSY");
+        }
+        return Reflect.apply(originalPragma, this, [source, options]);
+      });
+
+    let database: Database.Database | undefined;
+    try {
+      database = openSqliteDatabase(path);
+      expect(database.pragma("journal_mode", { simple: true })).toBe("wal");
+      expect(walWriteAttempts).toBe(0);
+    } finally {
+      database?.close();
+      pragmaSpy.mockRestore();
+    }
+  });
 
   test("closes and reports a storage error for a non-UTF-8 database", async () => {
     const root = mkdtempSync(join(tmpdir(), "github-stars-db-"));

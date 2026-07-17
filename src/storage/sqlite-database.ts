@@ -11,6 +11,13 @@ import {
   runInNewImmediateTransaction,
 } from "./sqlite-transaction.js";
 
+const WAL_BOOTSTRAP_RETRY_DELAYS_MS = [
+  0, 2, 4, 8, 16, 32, 64, 128, 256, 512,
+] as const;
+const WAL_BOOTSTRAP_WAIT = new Int32Array(
+  new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+);
+
 function storageError(message: string, cause?: unknown): AppError {
   return new AppError("STORAGE_ERROR", message, {
     ...(cause === undefined ? {} : { cause }),
@@ -63,6 +70,45 @@ function verifyPragma(
   }
 }
 
+function isSqliteBusy(error: unknown): error is Database.SqliteError {
+  return (
+    error instanceof Database.SqliteError &&
+    error.code.startsWith("SQLITE_BUSY")
+  );
+}
+
+function ensureWalMode(database: Database.Database): void {
+  let lastBusyError: Database.SqliteError | undefined;
+  for (const delayMs of WAL_BOOTSTRAP_RETRY_DELAYS_MS) {
+    if (delayMs > 0) {
+      Atomics.wait(WAL_BOOTSTRAP_WAIT, 0, 0, delayMs);
+    }
+    try {
+      const currentMode = simplePragma(database, "journal_mode");
+      if (
+        typeof currentMode === "string" &&
+        currentMode.toLowerCase() === "wal"
+      ) {
+        return;
+      }
+      const enabledMode = database.pragma("journal_mode = WAL", {
+        simple: true,
+      });
+      if (
+        typeof enabledMode === "string" &&
+        enabledMode.toLowerCase() === "wal"
+      ) {
+        return;
+      }
+      throw storageError("SQLite WAL mode is required");
+    } catch (error) {
+      if (!isSqliteBusy(error)) throw error;
+      lastBusyError = error;
+    }
+  }
+  throw lastBusyError ?? storageError("SQLite WAL mode is required");
+}
+
 export function openSqliteDatabase(path: string): Database.Database {
   let database: Database.Database | undefined;
   try {
@@ -96,15 +142,7 @@ export function openSqliteDatabase(path: string): Database.Database {
     database.pragma("trusted_schema = OFF");
     database.pragma("synchronous = FULL");
     if (path !== ":memory:") {
-      const journalMode = database.pragma("journal_mode = WAL", {
-        simple: true,
-      });
-      if (
-        typeof journalMode !== "string" ||
-        journalMode.toLowerCase() !== "wal"
-      ) {
-        throw storageError("SQLite WAL mode is required");
-      }
+      ensureWalMode(database);
       database.pragma("mmap_size = 0");
       verifyPragma(database, "mmap_size", 0);
       verifyPragma(database, "journal_mode", "wal");
