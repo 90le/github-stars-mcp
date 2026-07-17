@@ -389,6 +389,131 @@ describe("MutationExecutor live preconditions", () => {
     expect(github.mutations).toEqual([]);
   });
 
+  it("rejects incomplete, unsupported, and unsafe operation fields with zero hooks or live reads", async () => {
+    const requiredFields = [
+      "operationId",
+      "kind",
+      "dependsOn",
+      "preconditions",
+      "before",
+      "after",
+      "inverse",
+      "risk",
+      "repositoryId",
+      "repositoryDatabaseId",
+      "coordinates",
+    ] as const;
+
+    for (const field of requiredFields) {
+      const github = new StatefulGitHub();
+      const candidate = {
+        ...starOperation(),
+      } as unknown as Record<string, unknown>;
+      delete candidate[field];
+
+      await expect(
+        executor(github).prepare(
+          candidate as unknown as ResolvedOperation,
+          emptyExecutionContext(),
+        ),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        retryable: false,
+      });
+      expect(github.reads, field).toEqual([]);
+      expect(github.mutations, field).toEqual([]);
+    }
+
+    for (const candidate of [
+      {
+        ...starOperation(),
+        route: "DELETE /repos/{owner}/{repo}",
+      },
+      {
+        ...starOperation(),
+        document: "mutation UnexpectedAuthority { deleteRepository }",
+      },
+    ]) {
+      const github = new StatefulGitHub();
+      await expect(
+        executor(github).prepare(
+          candidate as unknown as ResolvedOperation,
+          emptyExecutionContext(),
+        ),
+      ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+      expect(github.reads).toEqual([]);
+      expect(github.mutations).toEqual([]);
+    }
+
+    const unsafeOperationIds = [
+      "github_pat_executor-secret",
+      "not-an-operation-id",
+      "op_",
+      "op_control\u0085value",
+      `op_${"x".repeat(126)}`,
+    ];
+    for (const operationId of unsafeOperationIds) {
+      const github = new StatefulGitHub();
+      let caught: unknown;
+      try {
+        await executor(github).prepare(
+          {
+            ...starOperation(),
+            operationId,
+          },
+          emptyExecutionContext(),
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({ code: "VALIDATION_ERROR" });
+      expect(JSON.stringify(caught)).not.toContain(operationId);
+      expect(github.reads).toEqual([]);
+      expect(github.mutations).toEqual([]);
+    }
+
+    let getterCalls = 0;
+    const accessor = { ...starOperation() } as Record<string, unknown>;
+    Object.defineProperty(accessor, "route", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        throw new Error("getter-secret");
+      },
+    });
+    const accessorGitHub = new StatefulGitHub();
+    await expect(
+      executor(accessorGitHub).prepare(
+        accessor as unknown as ResolvedOperation,
+        emptyExecutionContext(),
+      ),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(getterCalls).toBe(0);
+    expect(accessorGitHub.reads).toEqual([]);
+
+    let proxyTrapCalls = 0;
+    const proxied = new Proxy(starOperation(), {
+      get() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy-secret");
+      },
+      getOwnPropertyDescriptor() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy-secret");
+      },
+      ownKeys() {
+        proxyTrapCalls += 1;
+        throw new Error("proxy-secret");
+      },
+    });
+    const proxyGitHub = new StatefulGitHub();
+    await expect(
+      executor(proxyGitHub).prepare(proxied, emptyExecutionContext()),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(proxyTrapCalls).toBe(0);
+    expect(proxyGitHub.reads).toEqual([]);
+  });
+
   it.each([
     ["node ID", asRepositoryId("R_other"), repositoryDatabaseId],
     ["database ID", repositoryId, asRepositoryDatabaseId("999")],
@@ -447,6 +572,30 @@ describe("MutationExecutor live preconditions", () => {
       expect(github.mutations).toEqual([]);
     },
   );
+
+  it("requires the requested stable List ID for update preconditions", async () => {
+    const github = new StatefulGitHub();
+    const wrongId = asUserListId("UL_other");
+    const sameMetadata = github.lists.get(listId)!;
+    github.getUserList = () => {
+      github.reads.push(`getUserList:${listId}`);
+      return Promise.resolve(
+        Object.freeze({
+          ...sameMetadata,
+          listId: wrongId,
+        }),
+      );
+    };
+
+    await expect(
+      executor(github).prepare(updateOperation(), emptyExecutionContext()),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      retryable: false,
+    });
+    expect(github.reads).toEqual([`getUserList:${listId}`]);
+    expect(github.mutations).toEqual([]);
+  });
 
   it("rejects a changed complete membership set before mutation", async () => {
     const github = new StatefulGitHub();
@@ -871,6 +1020,7 @@ describe("MutationExecutor allowlisted operations", () => {
     github.memberships.set(repositoryId, Object.freeze([listId]));
     const context = emptyExecutionContext();
     context.createdListIdsByOperationId.set("op_created_a", utf16First);
+    context.createdListIdsByOperationId.set("op_created_b", utf8First);
     const service = executor(github);
     const operation = membershipOperation(
       Object.freeze([
@@ -879,7 +1029,10 @@ describe("MutationExecutor allowlisted operations", () => {
           kind: "created",
           createOperationId: "op_created_a",
         }),
-        Object.freeze({ kind: "existing", listId: utf8First }),
+        Object.freeze({
+          kind: "created",
+          createOperationId: "op_created_b",
+        }),
       ]),
     );
 
@@ -897,7 +1050,10 @@ describe("MutationExecutor allowlisted operations", () => {
       },
     });
     expect(context.createdListIdsByOperationId).toEqual(
-      new Map([["op_created_a", utf16First]]),
+      new Map([
+        ["op_created_a", utf16First],
+        ["op_created_b", utf8First],
+      ]),
     );
   });
 

@@ -66,6 +66,11 @@ async function rejectedError(promise: Promise<unknown>): Promise<AppError> {
   return error as AppError;
 }
 
+const FORBIDDEN_CURSOR_CODE_UNITS = Object.freeze([
+  ...Array.from({ length: 0x20 }, (_, codeUnit) => codeUnit),
+  ...Array.from({ length: 0x21 }, (_, offset) => 0x7f + offset),
+]);
+
 describe("GitHub User List read contracts", () => {
   it("exposes only the approved named adapter methods", () => {
     expectTypeOf<OctokitGitHubAdapter>().toMatchTypeOf<GitHubSyncReadPort>();
@@ -394,6 +399,27 @@ describe("GitHub User List read contracts", () => {
     },
   );
 
+  it.each(FORBIDDEN_CURSOR_CODE_UNITS)(
+    "rejects metadata cursor control code unit U+%s before dispatch",
+    async (codeUnit) => {
+      const dispatch = vi.fn();
+      const adapter = new OctokitGitHubAdapter(
+        graphqlOnlyTransport({}, dispatch),
+      );
+
+      await expect(
+        adapter.listUserLists(`safe${String.fromCharCode(codeUnit)}cursor`),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        details: {
+          operation: "listUserLists",
+          reason: "invalid_cursor",
+        },
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([
     ["", null, "invalid_list_id"],
     ["UL\n1", null, "invalid_list_id"],
@@ -418,6 +444,30 @@ describe("GitHub User List read contracts", () => {
       ).rejects.toMatchObject({
         code: "VALIDATION_ERROR",
         details: { operation: "listUserListItems", reason },
+      });
+      expect(dispatch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(FORBIDDEN_CURSOR_CODE_UNITS)(
+    "rejects membership cursor control code unit U+%s before dispatch",
+    async (codeUnit) => {
+      const dispatch = vi.fn();
+      const adapter = new OctokitGitHubAdapter(
+        graphqlOnlyTransport({}, dispatch),
+      );
+
+      await expect(
+        adapter.listUserListItems(
+          asUserListId("UL_1"),
+          `safe${String.fromCharCode(codeUnit)}cursor`,
+        ),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        details: {
+          operation: "listUserListItems",
+          reason: "invalid_cursor",
+        },
       });
       expect(dispatch).not.toHaveBeenCalled();
     },
@@ -451,6 +501,33 @@ describe("GitHub User List read contracts", () => {
     });
     expect(scripted.requests).toHaveLength(1);
   });
+
+  it.each(FORBIDDEN_CURSOR_CODE_UNITS)(
+    "rejects remote cursor control code unit U+%s as malformed data",
+    async (codeUnit) => {
+      const scripted = createScriptedGitHubAdapter([
+        {
+          kind: "graphql",
+          operation: "listLists",
+          graphqlOperation: "ViewerLists",
+          status: 200,
+          data: viewerListsData([], {
+            hasNextPage: true,
+            endCursor: `safe${String.fromCharCode(codeUnit)}cursor`,
+          }),
+        },
+      ]);
+
+      await expect(scripted.adapter.listUserLists(null)).rejects.toMatchObject({
+        code: "GITHUB_UNAVAILABLE",
+        details: {
+          operation: "ViewerLists",
+          reason: "malformed_remote_data",
+        },
+      });
+      expect(scripted.requests).toHaveLength(1);
+    },
+  );
 
   it.each([
     ["oversized page", Array.from({ length: 101 }, () => rawUserList())],

@@ -47,7 +47,9 @@ function wellFormedUnicode(value: string): boolean {
 function controlFree(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
-    if (codeUnit <= 0x1f || codeUnit === 0x7f) return false;
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) {
+      return false;
+    }
   }
   return true;
 }

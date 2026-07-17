@@ -744,7 +744,7 @@ const COMMON_OPERATION_KEYS = [
   "risk",
 ] as const;
 
-function parseResolvedOperation(value: JsonValue): ResolvedOperation {
+function parseResolvedOperationValue(value: JsonValue): ResolvedOperation {
   const input = record(value, "resolved operation");
   const kind = text(input.kind as JsonValue, "resolved operation kind", 32);
   if (!OPERATION_KINDS.has(kind)) {
@@ -867,6 +867,10 @@ function parseResolvedOperation(value: JsonValue): ResolvedOperation {
     ),
     targetLists: Object.freeze(targetLists),
   });
+}
+
+export function parseResolvedOperation(input: unknown): ResolvedOperation {
+  return parseResolvedOperationValue(canonicalJsonClone(input));
 }
 
 function compareResolvedTargets(
@@ -1135,7 +1139,7 @@ function parsePlanExecutableSafe(value: JsonValue): PlanExecutableContent {
   const operations: ResolvedOperation[] = [];
   for (let index = 0; index < operationInputs.length; index += 1) {
     operations.push(
-      parseResolvedOperation(operationInputs[index] as JsonValue),
+      parseResolvedOperationValue(operationInputs[index] as JsonValue),
     );
   }
 

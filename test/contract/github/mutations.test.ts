@@ -535,7 +535,7 @@ describe("closed GitHub live read and mutation boundary", () => {
         "op_update",
       ),
     ).rejects.toMatchObject({
-      code: "GITHUB_UNAVAILABLE",
+      code: "RECONCILIATION_REQUIRED",
       retryable: false,
     });
     expect(scripted.requests).toHaveLength(1);
@@ -832,7 +832,7 @@ describe("closed GitHub live read and mutation boundary", () => {
     expect(reset.waits).toEqual([]);
   });
 
-  it("returns null only for a null UserList node and fails closed on wrong node types", async () => {
+  it("returns null only for a null UserList node and fails closed on wrong type or identity", async () => {
     const missing = createScriptedGitHubAdapter([
       {
         kind: "graphql",
@@ -868,6 +868,29 @@ describe("closed GitHub live read and mutation boundary", () => {
       retryable: false,
     });
     expect(JSON.stringify(error)).not.toContain("raw-wrong-node-secret");
+
+    const wrongIdentity = createScriptedGitHubAdapter([
+      {
+        kind: "graphql",
+        operation: "getUserList",
+        graphqlOperation: "GetUserList",
+        status: 200,
+        data: {
+          node: {
+            __typename: "UserList",
+            ...rawUserList({ id: "UL_other" }),
+          },
+        },
+      },
+    ]);
+    const identityError = await caught(
+      wrongIdentity.adapter.getUserList(asUserListId("UL_expected")),
+    );
+    expect(identityError).toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      retryable: false,
+    });
+    expect(JSON.stringify(identityError)).not.toContain("UL_other");
   });
 
   it("stops reverse membership pagination on cancellation between calls", async () => {
@@ -1046,7 +1069,7 @@ describe("closed GitHub live read and mutation boundary", () => {
         ),
       );
       expect(error).toMatchObject({
-        code: "GITHUB_UNAVAILABLE",
+        code: "RECONCILIATION_REQUIRED",
         retryable: false,
       });
       expect(scripted.requests).toHaveLength(1);
@@ -1069,7 +1092,7 @@ describe("closed GitHub live read and mutation boundary", () => {
       malformed.adapter.star(repository, "op_header"),
     );
     expect(malformedError).toMatchObject({
-      code: "GITHUB_UNAVAILABLE",
+      code: "RECONCILIATION_REQUIRED",
       retryable: false,
     });
     expect(JSON.stringify(malformedError)).not.toContain("raw\nrequest-secret");
@@ -1150,7 +1173,7 @@ describe("closed GitHub live read and mutation boundary", () => {
     const error = await caught(adapter.star(repository, "op_colliding_header"));
 
     expect(error).toMatchObject({
-      code: "GITHUB_UNAVAILABLE",
+      code: "RECONCILIATION_REQUIRED",
       retryable: false,
     });
     expect(harness.requests).toHaveLength(1);
@@ -1348,7 +1371,7 @@ describe("closed GitHub live read and mutation boundary", () => {
     );
 
     expect(error).toMatchObject({
-      code: "GITHUB_UNAVAILABLE",
+      code: "RECONCILIATION_REQUIRED",
       retryable: false,
     });
     expect(scripted.requests).toHaveLength(1);
@@ -1372,6 +1395,48 @@ describe("closed GitHub live read and mutation boundary", () => {
     );
   });
 
+  it("keeps only trusted create operation context when response parsing is ambiguous", async () => {
+    const scripted = createScriptedGitHubAdapter([
+      {
+        kind: "graphql",
+        operation: "createUserList",
+        graphqlOperation: "CreateUserList",
+        status: 200,
+        headers: { "x-github-request-id": "ONE, TWO" },
+        data: {
+          createUserList: {
+            list: rawUserList({
+              id: "UL_untrusted_response",
+              name: "Created",
+              slug: "created",
+              description: null,
+              isPrivate: false,
+            }),
+            clientMutationId: "op_create_ambiguous",
+          },
+        },
+      },
+    ]);
+
+    const error = await caught(
+      scripted.adapter.createUserList(
+        { name: "Created", description: null, isPrivate: false },
+        "op_create_ambiguous",
+      ),
+    );
+
+    expect(error).toMatchObject({
+      code: "RECONCILIATION_REQUIRED",
+      retryable: false,
+      details: {
+        operationId: "op_create_ambiguous",
+        mutationName: "createUserList",
+      },
+    });
+    expect(scripted.requests).toHaveLength(1);
+    expect(JSON.stringify(error)).not.toContain("UL_untrusted_response");
+  });
+
   it.each(["204", 204.5, 99, 600, 200] as const)(
     "rejects malformed or non-success REST mutation status %s",
     async (status) => {
@@ -1391,7 +1456,7 @@ describe("closed GitHub live read and mutation boundary", () => {
       await expect(
         new OctokitGitHubAdapter(transport).star(repository, "op_bad_status"),
       ).rejects.toMatchObject({
-        code: "GITHUB_UNAVAILABLE",
+        code: "RECONCILIATION_REQUIRED",
         retryable: false,
       });
     },
@@ -1451,7 +1516,7 @@ describe("closed GitHub live read and mutation boundary", () => {
         "op_graphql_status",
       ),
     ).rejects.toMatchObject({
-      code: "GITHUB_UNAVAILABLE",
+      code: "RECONCILIATION_REQUIRED",
       retryable: false,
     });
 

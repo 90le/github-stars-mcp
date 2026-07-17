@@ -83,8 +83,8 @@ export class MutationPacer {
   ) {
     if (
       typeof intervalMs !== "number" ||
-      !Number.isFinite(intervalMs) ||
-      intervalMs < 0
+      !Number.isSafeInteger(intervalMs) ||
+      intervalMs < DEFAULT_INTERVAL_MS
     ) {
       throw new AppError(
         "VALIDATION_ERROR",

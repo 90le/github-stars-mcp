@@ -80,6 +80,23 @@ function skippedOutcome() {
 }
 
 describe("MutationPacer", () => {
+  it.each([0, 999, 1_000.5, Number.MAX_SAFE_INTEGER + 1])(
+    "rejects a non-safe or sub-second interval %s",
+    (intervalMs) => {
+      const runtime = new ManualRuntime();
+      let caught: unknown;
+      try {
+        new MutationPacer(runtime, intervalMs);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toMatchObject({
+        code: "VALIDATION_ERROR",
+        details: { reason: "invalid_mutation_interval" },
+      });
+    },
+  );
+
   it("starts concurrent mutations FIFO at 0, 1000, and 2000 with one active dispatch", async () => {
     const runtime = new AutoAdvanceRuntime();
     const pacer = new MutationPacer(runtime);

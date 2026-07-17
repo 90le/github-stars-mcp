@@ -40,6 +40,7 @@ import {
   type GraphqlReadOperation,
   type GraphqlTransportError,
 } from "./allowed-operations.js";
+import { AmbiguousMutationError } from "./errors.js";
 import {
   parseGraphqlInputCursor,
   parseGraphqlNextCursor,
@@ -116,6 +117,40 @@ function malformedRemote(operation: string): AppError {
       details: { operation, reason: "malformed_remote_data" },
     },
   );
+}
+
+function isMalformedMutationResponse(error: unknown): boolean {
+  if (!(error instanceof AppError) || error.code !== "GITHUB_UNAVAILABLE") {
+    return false;
+  }
+  let details: unknown;
+  try {
+    details = Object.getOwnPropertyDescriptor(error, "details")?.value;
+  } catch {
+    return false;
+  }
+  return (
+    details !== null &&
+    typeof details === "object" &&
+    !Array.isArray(details) &&
+    Object.getOwnPropertyDescriptor(details, "reason")?.value ===
+      "malformed_remote_data"
+  );
+}
+
+function parseDispatchedMutationResult<T>(
+  operation: "star" | "unstar" | GraphqlMutationOperation,
+  operationId: string,
+  parse: () => T,
+): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof AppError && !isMalformedMutationResponse(error)) {
+      throw error;
+    }
+    throw new AmbiguousMutationError(operationId, operation, error);
+  }
 }
 
 function controlFree(value: string): boolean {
@@ -1960,7 +1995,9 @@ export class OctokitGitHubAdapter implements GitHubPort {
     if (required(node, "__typename", operationName) !== "UserList") {
       throw malformedRemote(operationName);
     }
-    return normalizeUserList(rawNode, operationName);
+    const list = normalizeUserList(rawNode, operationName);
+    if (list.listId !== validatedId) throw malformedRemote(operationName);
+    return list;
   }
 
   async checkStar(
@@ -2052,7 +2089,9 @@ export class OctokitGitHubAdapter implements GitHubPort {
       validatedId,
       signal,
     );
-    return restMutationReceipt(response, operation);
+    return parseDispatchedMutationResult(operation, validatedId, () =>
+      restMutationReceipt(response, operation),
+    );
   }
 
   async unstar(
@@ -2072,7 +2111,9 @@ export class OctokitGitHubAdapter implements GitHubPort {
       validatedId,
       signal,
     );
-    return restMutationReceipt(response, operation);
+    return parseDispatchedMutationResult(operation, validatedId, () =>
+      restMutationReceipt(response, operation),
+    );
   }
 
   async createUserList(
@@ -2092,7 +2133,9 @@ export class OctokitGitHubAdapter implements GitHubPort {
       validatedId,
       signal,
     );
-    return userListMutationResult(response, operation, validatedId, null);
+    return parseDispatchedMutationResult(operation, validatedId, () =>
+      userListMutationResult(response, operation, validatedId, null),
+    );
   }
 
   async updateUserList(
@@ -2115,11 +2158,8 @@ export class OctokitGitHubAdapter implements GitHubPort {
       validatedId,
       signal,
     );
-    return userListMutationResult(
-      response,
-      operation,
-      validatedId,
-      validatedListId,
+    return parseDispatchedMutationResult(operation, validatedId, () =>
+      userListMutationResult(response, operation, validatedId, validatedListId),
     );
   }
 
@@ -2140,7 +2180,9 @@ export class OctokitGitHubAdapter implements GitHubPort {
       validatedId,
       signal,
     );
-    return deleteUserListReceipt(response, validatedId);
+    return parseDispatchedMutationResult(operation, validatedId, () =>
+      deleteUserListReceipt(response, validatedId),
+    );
   }
 
   async setRepositoryListIds(
@@ -2166,11 +2208,13 @@ export class OctokitGitHubAdapter implements GitHubPort {
       validatedOperation,
       signal,
     );
-    return membershipMutationReceipt(
-      response,
-      validatedRepositoryId,
-      validatedIds,
-      validatedOperation,
+    return parseDispatchedMutationResult(operation, validatedOperation, () =>
+      membershipMutationReceipt(
+        response,
+        validatedRepositoryId,
+        validatedIds,
+        validatedOperation,
+      ),
     );
   }
 

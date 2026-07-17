@@ -16,7 +16,10 @@ import {
 import { AppError } from "../../domain/errors.js";
 import type { RepositoryId, UserListId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
-import type { ResolvedOperation } from "../../domain/plan.js";
+import {
+  parseResolvedOperation,
+  type ResolvedOperation,
+} from "../../domain/plan.js";
 import type {
   RepositoryCoordinates,
   UserList,
@@ -97,6 +100,7 @@ const OPERATION_KINDS = new Set<ResolvedOperation["kind"]>([
   "list_delete",
   "list_membership_set",
 ]);
+const MAX_OPERATION_ID = 128;
 
 function validationError(reason: string): AppError {
   return new AppError("VALIDATION_ERROR", "Prepared mutation is invalid", {
@@ -196,6 +200,31 @@ function text(value: JsonValue | undefined): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
 }
 
+function validOperationId(value: string): boolean {
+  if (
+    value.length <= 3 ||
+    value.length > MAX_OPERATION_ID ||
+    !value.startsWith("op_") ||
+    value !== value.trim()
+  ) {
+    return false;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) {
+      return false;
+    }
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 function metadataState(value: JsonValue): JsonObject | null {
   const record = safeJsonObject(value);
   if (
@@ -284,7 +313,9 @@ function validMembershipTargets(value: JsonValue | undefined): boolean {
     if (target === null) return false;
     return target.kind === "existing"
       ? text(target.listId) !== null
-      : target.kind === "created" && text(target.createOperationId) !== null;
+      : target.kind === "created" &&
+          typeof target.createOperationId === "string" &&
+          validOperationId(target.createOperationId);
   });
 }
 
@@ -293,13 +324,18 @@ function validMembershipAfterIds(value: JsonValue | undefined): boolean {
   return (value as readonly JsonValue[]).every((candidate) => {
     if (typeof candidate === "string") return candidate.length > 0;
     const reference = jsonObject(candidate);
-    return reference !== null && text(reference.createOperationId) !== null;
+    return (
+      reference !== null &&
+      typeof reference.createOperationId === "string" &&
+      validOperationId(reference.createOperationId)
+    );
   });
 }
 
 function operationShapeIsValid(record: JsonObject): boolean {
   if (
-    text(record.operationId) === null ||
+    typeof record.operationId !== "string" ||
+    !validOperationId(record.operationId) ||
     typeof record.kind !== "string" ||
     !OPERATION_KINDS.has(record.kind as ResolvedOperation["kind"])
   ) {
@@ -368,12 +404,15 @@ function operationShapeIsValid(record: JsonObject): boolean {
 }
 
 function operationSnapshot(operation: ResolvedOperation): ResolvedOperation {
-  const cloned = freezeJsonValue(canonicalJsonClone(operation));
-  const record = jsonObject(cloned);
+  const parsed = parseResolvedOperation(operation);
+  const record = jsonObject(parsed as unknown as JsonValue);
   if (record === null || !operationShapeIsValid(record)) {
     throw validationError("invalid_operation");
   }
-  return cloned as unknown as ResolvedOperation;
+  if (parsed.dependsOn.some((operationId) => !validOperationId(operationId))) {
+    throw validationError("invalid_operation");
+  }
+  return parsed;
 }
 
 function validContext(context: ExecutionContext): boolean {
@@ -606,6 +645,7 @@ export class MutationExecutor {
       if (list === null) return frozenJson({ exists: false });
       if (operation.kind === "list_update") {
         return frozenJson({
+          listId: list.listId,
           name: list.name,
           description: list.description,
           isPrivate: list.isPrivate,
@@ -651,7 +691,10 @@ export class MutationExecutor {
       const expected = metadataState(operation.before);
       const current = metadataState(state);
       return (
-        expected !== null && current !== null && sameJson(expected, current)
+        actual.listId === operation.listId &&
+        expected !== null &&
+        current !== null &&
+        sameJson(expected, current)
       );
     }
 
@@ -716,7 +759,10 @@ export class MutationExecutor {
       const expected = metadataState(operation.after);
       const current = metadataState(state);
       return (
-        expected !== null && current !== null && sameJson(expected, current)
+        actual.listId === operation.listId &&
+        expected !== null &&
+        current !== null &&
+        sameJson(expected, current)
       );
     }
 
