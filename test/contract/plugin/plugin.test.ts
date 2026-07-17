@@ -532,14 +532,17 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
   ],
   ["unquoted env with a short alphabetic value", "Ab", "TOKEN =   BeArEr Ab"],
   ["unquoted YAML with a one-character value", "Q", "token:\tBEARER Q"],
+  ["camelCase token key", "Ef", "accessToken: Bearer Ef"],
   ["env key suffix without spaces", "Ab", "API_TOKEN=Bearer Ab"],
   [
     "env key suffix with spaces and a trailing comment",
     "Cd",
     "GITHUB_TOKEN = Bearer Cd # local",
   ],
+  ["shell export", "Ij", "export API_TOKEN=Bearer Ij"],
   ["YAML sequence value", "Ab", "- Bearer Ab"],
   ["YAML sequence mapping", "Ef", "- authorization: Bearer Ef"],
+  ["YAML sequence camelCase token key", "Gh", "- accessToken: Bearer Gh"],
   ["bounded bare value", "Gh", "Bearer Gh"],
   [
     "whitespace-separated config with a trailing comment",
@@ -551,6 +554,8 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
     "Alpha",
     'headers.set("Authorization", "  Bearer Alpha");',
   ],
+  ["JS line comment", "Kl", "// Authorization: Bearer Kl"],
+  ["JS block comment", "Mn", "/* Authorization: Bearer Mn */"],
   ["unterminated quoted literal", "Qq", 'const value = "Bearer Qq'],
   [
     "escaped nested literal",

@@ -985,11 +985,11 @@ function readConfigKey(source, start) {
 }
 
 function bearerConfigKey(key) {
-  const normalized = key.toLowerCase();
+  const normalized = key.replaceAll(/[^A-Za-z0-9]/gu, "").toLowerCase();
   return (
     normalized === "authorization" ||
     normalized === "token" ||
-    normalized.endsWith("_token")
+    normalized.endsWith("token")
   );
 }
 
@@ -1015,21 +1015,45 @@ function configEntryContainsBearer(line, start) {
   return false;
 }
 
-function configLineContainsBearer(line) {
+function commentConfigSource(line) {
+  const index = skipBearerWhitespace(line, 0, true);
+  if (line.slice(index, index + 2) === "//") {
+    return line.slice(index + 2);
+  }
+  if (line.slice(index, index + 2) === "/*") {
+    const end = line.indexOf("*/", index + 2);
+    return line.slice(index + 2, end === -1 ? line.length : end);
+  }
+  return line;
+}
+
+function configContentStart(line) {
   const index = skipBearerWhitespace(line, 0, true);
   if (
-    line[index] === "-" &&
-    (line[index + 1] === " " || line[index + 1] === "\t")
+    line.slice(index, index + 6) === "export" &&
+    (line[index + 6] === " " || line[index + 6] === "\t")
+  ) {
+    return skipBearerWhitespace(line, index + 6, true);
+  }
+  return index;
+}
+
+function configLineContainsBearer(line) {
+  const source = commentConfigSource(line);
+  const index = configContentStart(source);
+  if (
+    source[index] === "-" &&
+    (source[index + 1] === " " || source[index + 1] === "\t")
   ) {
     const valueStart = index + 1;
     return (
-      configValueContainsBearer(line, valueStart) ||
-      configEntryContainsBearer(line, valueStart)
+      configValueContainsBearer(source, valueStart) ||
+      configEntryContainsBearer(source, valueStart)
     );
   }
   return (
-    configEntryContainsBearer(line, index) ||
-    completeBearerValue(line, index, true)
+    configEntryContainsBearer(source, index) ||
+    completeBearerValue(source, index, true)
   );
 }
 
