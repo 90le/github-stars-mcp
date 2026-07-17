@@ -72,6 +72,7 @@ const VIRTUAL_LIB_SOURCE = `
   type Readonly<T> = {
     readonly [P in keyof T]: T[P];
   };
+  type Uppercase<S extends string> = intrinsic;
 `;
 
 function canonicalFileName(fileName: string): string {
@@ -478,16 +479,66 @@ function typeHasSourceDeclaration(type: ts.Type): boolean {
   return symbols.every((symbol) => symbol === undefined);
 }
 
-const PRIMITIVE_TYPE_FLAGS =
-  ts.TypeFlags.StringLike |
-  ts.TypeFlags.NumberLike |
-  ts.TypeFlags.BigIntLike |
-  ts.TypeFlags.BooleanLike |
-  ts.TypeFlags.ESSymbolLike |
+const CLOSED_LEAF_TYPE_FLAGS =
+  ts.TypeFlags.String |
+  ts.TypeFlags.Number |
+  ts.TypeFlags.BigInt |
+  ts.TypeFlags.Boolean |
+  ts.TypeFlags.ESSymbol |
+  ts.TypeFlags.StringLiteral |
+  ts.TypeFlags.NumberLiteral |
+  ts.TypeFlags.BigIntLiteral |
+  ts.TypeFlags.BooleanLiteral |
+  ts.TypeFlags.UniqueESSymbol |
+  ts.TypeFlags.EnumLiteral |
   ts.TypeFlags.Void |
   ts.TypeFlags.Undefined |
   ts.TypeFlags.Null |
   ts.TypeFlags.Never;
+const CLOSED_OBJECT_SHAPE_FLAGS =
+  ts.ObjectFlags.Class |
+  ts.ObjectFlags.Interface |
+  ts.ObjectFlags.Reference |
+  ts.ObjectFlags.Tuple |
+  ts.ObjectFlags.Anonymous |
+  ts.ObjectFlags.Mapped |
+  ts.ObjectFlags.ObjectLiteral;
+const OBJECT_FLAG_PRIMITIVE_UNION = 1 << 15;
+const OBJECT_FLAG_CONTAINS_WIDENING_TYPE = 1 << 16;
+const OBJECT_FLAG_CONTAINS_OBJECT_OR_ARRAY_LITERAL = 1 << 17;
+const OBJECT_FLAG_NON_INFERRABLE_TYPE = 1 << 18;
+const OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES_COMPUTED = 1 << 19;
+const OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES = 1 << 20;
+const OBJECT_FLAG_IS_CLASS_INSTANCE_CLONE = 1 << 24;
+const OBJECT_FLAG_IDENTICAL_BASE_TYPE_CALCULATED = 1 << 25;
+const OBJECT_FLAG_IDENTICAL_BASE_TYPE_EXISTS = 1 << 26;
+const CLOSED_OBJECT_METADATA_FLAGS =
+  ts.ObjectFlags.Instantiated |
+  ts.ObjectFlags.FreshLiteral |
+  ts.ObjectFlags.ArrayLiteral |
+  OBJECT_FLAG_CONTAINS_WIDENING_TYPE |
+  OBJECT_FLAG_CONTAINS_OBJECT_OR_ARRAY_LITERAL |
+  OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES_COMPUTED |
+  OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES |
+  OBJECT_FLAG_IDENTICAL_BASE_TYPE_CALCULATED |
+  ts.ObjectFlags.SingleSignatureType;
+const UNRESOLVED_OBJECT_FLAGS =
+  ts.ObjectFlags.EvolvingArray |
+  ts.ObjectFlags.ObjectLiteralPatternWithComputedProperties |
+  ts.ObjectFlags.ReverseMapped |
+  ts.ObjectFlags.JsxAttributes |
+  ts.ObjectFlags.JSLiteral |
+  OBJECT_FLAG_PRIMITIVE_UNION |
+  OBJECT_FLAG_NON_INFERRABLE_TYPE |
+  ts.ObjectFlags.ContainsSpread |
+  ts.ObjectFlags.ObjectRestType |
+  ts.ObjectFlags.InstantiationExpressionType |
+  OBJECT_FLAG_IS_CLASS_INSTANCE_CLONE |
+  OBJECT_FLAG_IDENTICAL_BASE_TYPE_EXISTS;
+const CLASSIFIED_OBJECT_FLAGS =
+  CLOSED_OBJECT_SHAPE_FLAGS |
+  CLOSED_OBJECT_METADATA_FLAGS |
+  UNRESOLVED_OBJECT_FLAGS;
 
 function collectCapabilityNames(surface: ProgramSurface): readonly string[] {
   const { program, sourceFiles } = surface;
@@ -507,7 +558,12 @@ function collectCapabilityNames(surface: ProgramSurface): readonly string[] {
       names.add(UNRESOLVED_PUBLIC_NAME);
       return;
     }
-    if ((type.flags & PRIMITIVE_TYPE_FLAGS) !== 0) return;
+    if (
+      (type.flags & CLOSED_LEAF_TYPE_FLAGS) !== 0 &&
+      (type.flags & ~CLOSED_LEAF_TYPE_FLAGS) === 0
+    ) {
+      return;
+    }
     if (visitedTypes.has(type)) return;
     visitedTypes.add(type);
 
@@ -518,8 +574,58 @@ function collectCapabilityNames(surface: ProgramSurface): readonly string[] {
       }
       return;
     }
-    if ((type.flags & ts.TypeFlags.Object) === 0) return;
+    if ((type.flags & ts.TypeFlags.Object) === 0) {
+      names.add(UNRESOLVED_PUBLIC_NAME);
+      return;
+    }
     if (!force && !typeHasSourceDeclaration(type)) return;
+    const objectFlags = (type as ts.ObjectType).objectFlags;
+    if (
+      (objectFlags & CLOSED_OBJECT_SHAPE_FLAGS) === 0 ||
+      (objectFlags & UNRESOLVED_OBJECT_FLAGS) !== 0 ||
+      (objectFlags & ~CLASSIFIED_OBJECT_FLAGS) !== 0
+    ) {
+      names.add(UNRESOLVED_PUBLIC_NAME);
+      return;
+    }
+    const aliasTypeArguments = type.aliasTypeArguments ?? [];
+    for (let index = 0; index < aliasTypeArguments.length; index += 1) {
+      const argument = aliasTypeArguments[index];
+      if (argument !== undefined) visitType(argument, true);
+    }
+    for (const declaration of type.aliasSymbol?.getDeclarations() ?? []) {
+      if (!ts.isTypeAliasDeclaration(declaration)) continue;
+      const parameters = declaration.typeParameters ?? [];
+      for (
+        let index = aliasTypeArguments.length;
+        index < parameters.length;
+        index += 1
+      ) {
+        const parameter = parameters[index];
+        if (parameter?.default === undefined) {
+          names.add(UNRESOLVED_PUBLIC_NAME);
+          continue;
+        }
+        try {
+          visitType(checker.getTypeFromTypeNode(parameter.default), true);
+        } catch {
+          names.add(UNRESOLVED_PUBLIC_NAME);
+        }
+      }
+    }
+    if ((objectFlags & ts.ObjectFlags.Reference) !== 0) {
+      let referenceArguments: readonly ts.Type[];
+      try {
+        referenceArguments = checker.getTypeArguments(type as ts.TypeReference);
+      } catch {
+        names.add(UNRESOLVED_PUBLIC_NAME);
+        return;
+      }
+      for (let index = 0; index < referenceArguments.length; index += 1) {
+        const argument = referenceArguments[index];
+        if (argument !== undefined) visitType(argument, true);
+      }
+    }
 
     for (const symbol of [type.aliasSymbol, type.getSymbol()]) {
       for (const declaration of symbol?.getDeclarations() ?? []) {
@@ -615,6 +721,55 @@ function collectCapabilityNames(surface: ProgramSurface): readonly string[] {
     return current;
   };
 
+  const visitTypeReferenceArguments = (
+    reference: ts.TypeReferenceNode,
+  ): void => {
+    const referenced = checker.getSymbolAtLocation(reference.typeName);
+    if (referenced === undefined) {
+      names.add(UNRESOLVED_PUBLIC_NAME);
+      return;
+    }
+    const target = resolveAlias(referenced);
+    if (target === null) {
+      names.add(UNRESOLVED_PUBLIC_NAME);
+      return;
+    }
+    const parameters: ts.TypeParameterDeclaration[] = [];
+    for (const declaration of target.getDeclarations() ?? []) {
+      const declaredParameters =
+        ts.isTypeAliasDeclaration(declaration) ||
+        ts.isInterfaceDeclaration(declaration) ||
+        ts.isClassDeclaration(declaration)
+          ? declaration.typeParameters
+          : undefined;
+      for (const parameter of declaredParameters ?? []) {
+        parameters.push(parameter);
+      }
+    }
+    const arguments_ = reference.typeArguments ?? [];
+    for (let index = 0; index < arguments_.length; index += 1) {
+      const argument = arguments_[index];
+      if (argument === undefined) continue;
+      try {
+        visitType(checker.getTypeFromTypeNode(argument), true);
+      } catch {
+        names.add(UNRESOLVED_PUBLIC_NAME);
+      }
+    }
+    for (let index = arguments_.length; index < parameters.length; index += 1) {
+      const parameter = parameters[index];
+      if (parameter?.default === undefined) {
+        names.add(UNRESOLVED_PUBLIC_NAME);
+        continue;
+      }
+      try {
+        visitType(checker.getTypeFromTypeNode(parameter.default), true);
+      } catch {
+        names.add(UNRESOLVED_PUBLIC_NAME);
+      }
+    }
+  };
+
   const visitExport = (exported: ts.Symbol): void => {
     const target = resolveAlias(exported);
     if (target === null) {
@@ -623,6 +778,12 @@ function collectCapabilityNames(surface: ProgramSurface): readonly string[] {
     }
     for (const declaration of target.getDeclarations() ?? []) {
       scanComputedDeclaration(declaration, names);
+      if (
+        ts.isTypeAliasDeclaration(declaration) &&
+        ts.isTypeReferenceNode(declaration.type)
+      ) {
+        visitTypeReferenceArguments(declaration.type);
+      }
     }
 
     if ((target.flags & ts.SymbolFlags.Module) !== 0) {
@@ -932,6 +1093,100 @@ describe("GitHub capability boundary", () => {
         export { unresolved as E };
       `),
     ).toEqual([UNRESOLVED_PUBLIC_NAME]);
+  });
+
+  it.each([
+    [
+      "conditional",
+      "export type E<T> = T extends string ? { request(): void } : {};",
+    ],
+    [
+      "nested conditional",
+      `
+        export type E<T> = {
+          nested: T extends string
+            ? T extends "safe" ? { request(): void } : {}
+            : {};
+        };
+      `,
+    ],
+    ["keyof/index", "export type E<T> = keyof T;"],
+    ["indexed access", "export type E<T, K extends keyof T> = T[K];"],
+    [
+      "infer-dependent substitution",
+      "export type E<T> = T extends { value: infer U } ? U : never;",
+    ],
+    ["type parameter", "export type E<T> = T;"],
+    ["string mapping", "export type E<T extends string> = Uppercase<T>;"],
+    ["non-primitive keyword", "export type E = object;"],
+    ["template literal", "export type E = `prefix-${string}`;"],
+  ])(
+    "fails closed for the unresolved TypeFlags family %s",
+    (_name, contents) => {
+      expect(publicCapabilityNames(contents)).toEqual([UNRESOLVED_PUBLIC_NAME]);
+    },
+  );
+
+  it.each([
+    ["open mapped", "export type E<T> = { [K in keyof T]: T[K] };"],
+    [
+      "callable open mapped",
+      "export type E<T> = { [K in keyof T]: () => T[K] };",
+    ],
+    [
+      "generic reference",
+      "type Box<T> = { value: T }; export type E<T> = Box<T>;",
+    ],
+    [
+      "default-any instantiation",
+      "type Box<T = any> = {}; export type E = Box;",
+    ],
+    [
+      "instantiated open mapped alias",
+      "type Mapper<T> = { [K in keyof T]: () => void }; export type E<T> = Mapper<T>;",
+    ],
+    ["open callable", "export type E<T> = () => T;"],
+    ["array/indexed", "export type E = readonly string[];"],
+    ["tuple/reference", "export type E = readonly [string];"],
+    ["unresolved alias", "export type E = MissingCapabilityAlias;"],
+  ])(
+    "fails closed for the unresolved ObjectFlags family %s",
+    (_name, contents) => {
+      expect(publicCapabilityNames(contents)).toContain(UNRESOLVED_PUBLIC_NAME);
+    },
+  );
+
+  it("accepts only closed primitive, literal, object, wrapper, intersection, and callable controls", () => {
+    expect(
+      publicCapabilityNames(`
+        export type Primitive =
+          | string | number | bigint | boolean | symbol
+          | "safe" | 42 | 42n | true
+          | never | void | null | undefined;
+        export type ClosedObject = {
+          nested: {
+            value: string;
+          };
+        };
+        export type ClosedReadonly = Readonly<{
+          nested: {
+            value: number;
+          };
+        }>;
+        export type ClosedIntersection =
+          { left: string } & { right: number };
+        export type ClosedMapped = {
+          readonly [K in keyof { safe: string }]:
+            { safe: string }[K];
+        };
+        export type ClosedCall = () => string;
+      `),
+    ).toEqual([]);
+    expect(
+      publicCapabilityNames(
+        "export type ClosedCallable = { request<T>(): T };",
+      ),
+    ).toEqual(["request"]);
   });
 
   it("makes the mutation manifest fail compilation when GitHubMutationPort grows", () => {

@@ -25,6 +25,7 @@ const INTRINSICS = FREEZE({
   reflectGetOwnPropertyDescriptor: Reflect.getOwnPropertyDescriptor,
   reflectGetPrototypeOf: Reflect.getPrototypeOf,
   reflectOwnKeys: Reflect.ownKeys,
+  reflectSetPrototypeOf: Reflect.setPrototypeOf,
   stringCharCodeAt: String.prototype.charCodeAt,
   stringFromValue: String,
   stringReplaceAll: String.prototype.replaceAll,
@@ -43,7 +44,11 @@ function failInternalRedaction(): never {
 }
 
 function createInternalArray<T>(): T[] {
-  return [];
+  const array: T[] = [];
+  if (!INTRINSICS.reflectSetPrototypeOf(array, null)) {
+    failInternalRedaction();
+  }
+  return array;
 }
 
 function appendInternalArray<T>(target: T[], value: T): void {
@@ -64,10 +69,7 @@ function appendInternalArray<T>(target: T[], value: T): void {
 }
 
 function createInternalRecord(): Record<string, JsonValue> {
-  return INTRINSICS.objectCreate(INTRINSICS.objectPrototype) as Record<
-    string,
-    JsonValue
-  >;
+  return INTRINSICS.objectCreate(null) as Record<string, JsonValue>;
 }
 
 const EMPTY_SECRET_REGISTRY = INTRINSICS.objectFreeze(

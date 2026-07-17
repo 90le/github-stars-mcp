@@ -583,6 +583,173 @@ describe("domain errors and redaction", () => {
     });
   });
 
+  test("returns prototype-free records and JSON arrays that stringify without inherited hooks", () => {
+    const secret = "prototype-free-output-secret";
+    const objectInput = { nested: ["visible", secret] };
+    const arrayInput = ["visible", secret];
+    const secrets = [secret];
+    const objectToJsonDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      "toJSON",
+    );
+    const arrayToJsonDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "toJSON",
+    );
+    const arrayIteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const arrayPushDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "push",
+    );
+    const numericDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      "1",
+    );
+    if (
+      arrayIteratorDescriptor === undefined ||
+      !("value" in arrayIteratorDescriptor) ||
+      arrayPushDescriptor === undefined ||
+      !("value" in arrayPushDescriptor)
+    ) {
+      throw new Error("array prototype descriptors are required");
+    }
+    const originalIterator = arrayIteratorDescriptor.value as unknown;
+    const originalPush = arrayPushDescriptor.value as unknown;
+    let hookCalls = 0;
+    let objectJson: string | undefined;
+    let arrayJson: string | undefined;
+    let objectPrototype: object | null | undefined;
+    let nestedArrayPrototype: object | null | undefined;
+    let arrayPrototype: object | null | undefined;
+    let arraySemantics = false;
+
+    try {
+      Object.defineProperty(Object.prototype, "toJSON", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          hookCalls += 1;
+          return () => {
+            hookCalls += 1;
+            return "object prototype toJSON ran";
+          };
+        },
+      });
+      Object.defineProperty(Array.prototype, "toJSON", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          hookCalls += 1;
+          return () => {
+            hookCalls += 1;
+            return "array prototype toJSON ran";
+          };
+        },
+      });
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          hookCalls += 1;
+          return originalIterator;
+        },
+      });
+      Object.defineProperty(Array.prototype, "push", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          hookCalls += 1;
+          return originalPush;
+        },
+      });
+      Object.defineProperty(Object.prototype, "1", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          hookCalls += 1;
+          return "numeric prototype getter ran";
+        },
+        set: function setNumericProperty(value: unknown): void {
+          hookCalls += 1;
+          Object.defineProperty(this, "1", {
+            configurable: true,
+            enumerable: true,
+            value,
+            writable: true,
+          });
+        },
+      });
+
+      const objectRedacted = redactSecrets(objectInput, secrets);
+      const arrayRedacted = redactSecrets(arrayInput, secrets);
+      if (
+        objectRedacted === null ||
+        typeof objectRedacted !== "object" ||
+        Array.isArray(objectRedacted)
+      ) {
+        throw new TypeError("redacted object must remain a record");
+      }
+      if (!Array.isArray(arrayRedacted)) {
+        throw new TypeError("redacted array must retain JSON array semantics");
+      }
+      const nestedDescriptor = Reflect.getOwnPropertyDescriptor(
+        objectRedacted,
+        "nested",
+      );
+      if (
+        nestedDescriptor === undefined ||
+        !("value" in nestedDescriptor) ||
+        !Array.isArray(nestedDescriptor.value)
+      ) {
+        throw new TypeError("redacted nested array is required");
+      }
+
+      objectPrototype = Reflect.getPrototypeOf(objectRedacted);
+      nestedArrayPrototype = Reflect.getPrototypeOf(nestedDescriptor.value);
+      arrayPrototype = Reflect.getPrototypeOf(arrayRedacted);
+      arraySemantics = Array.isArray(arrayRedacted);
+      objectJson = JSON.stringify(objectRedacted);
+      arrayJson = JSON.stringify(arrayRedacted);
+    } finally {
+      if (numericDescriptor === undefined) {
+        Reflect.deleteProperty(Object.prototype, "1");
+      } else {
+        Object.defineProperty(Object.prototype, "1", numericDescriptor);
+      }
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        arrayIteratorDescriptor,
+      );
+      Object.defineProperty(Array.prototype, "push", arrayPushDescriptor);
+      if (arrayToJsonDescriptor === undefined) {
+        Reflect.deleteProperty(Array.prototype, "toJSON");
+      } else {
+        Object.defineProperty(Array.prototype, "toJSON", arrayToJsonDescriptor);
+      }
+      if (objectToJsonDescriptor === undefined) {
+        Reflect.deleteProperty(Object.prototype, "toJSON");
+      } else {
+        Object.defineProperty(
+          Object.prototype,
+          "toJSON",
+          objectToJsonDescriptor,
+        );
+      }
+    }
+
+    expect(objectPrototype).toBeNull();
+    expect(nestedArrayPrototype).toBeNull();
+    expect(arrayPrototype).toBeNull();
+    expect(arraySemantics).toBe(true);
+    expect(objectJson).toBe('{"nested":["visible","[REDACTED]"]}');
+    expect(arrayJson).toBe('["visible","[REDACTED]"]');
+    expect(hookCalls).toBe(0);
+  });
+
   test("does not consult poisoned Object prototype indices for sparse arrays or registries", () => {
     const numericDescriptor = Object.getOwnPropertyDescriptor(
       Object.prototype,

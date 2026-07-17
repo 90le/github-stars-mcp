@@ -334,9 +334,12 @@ describe("InspectService", () => {
       },
     });
     expect(first.operations).toHaveLength(50);
-    expect(first.operations.map(({ sequence }) => sequence)).toEqual(
-      Array.from({ length: 50 }, (_, index) => index + 1),
-    );
+    expect(
+      Array.from(
+        { length: first.operations.length },
+        (_, index) => first.operations[index]?.sequence,
+      ),
+    ).toEqual(Array.from({ length: 50 }, (_, index) => index + 1));
     expect(first.nextCursor).not.toBeNull();
     expect(cursorPayload(first.nextCursor!)).toEqual({
       version: 1,
@@ -359,10 +362,15 @@ describe("InspectService", () => {
     expect(third.operations).toHaveLength(20);
     expect(third.nextCursor).toBeNull();
     const sequences = [
-      ...first.operations,
-      ...second.operations,
-      ...third.operations,
-    ].map(({ sequence }) => sequence);
+      first.operations,
+      second.operations,
+      third.operations,
+    ].flatMap((operations) =>
+      Array.from(
+        { length: operations.length },
+        (_, index) => operations[index]?.sequence,
+      ),
+    );
     expect(new Set(sequences).size).toBe(120);
     expect(sequences).toEqual(
       Array.from({ length: 120 }, (_, index) => index + 1),
