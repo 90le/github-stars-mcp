@@ -56,8 +56,8 @@ function validationError(message: string): never {
   throw new AppError("VALIDATION_ERROR", message);
 }
 
-function placeholders(count: number): string {
-  return Array.from({ length: count }, () => "?").join(", ");
+function jsonSet(values: readonly (string | number)[]): string {
+  return JSON.stringify(values);
 }
 
 function combine(
@@ -91,8 +91,8 @@ function compileStringLeaf(
   if (op === "in" || op === "not_in") {
     const values = value as readonly string[];
     return {
-      sql: `COALESCE(${column} ${op === "not_in" ? "NOT " : ""}IN (${placeholders(values.length)}), 0)`,
-      params: values,
+      sql: `COALESCE(${column} ${op === "not_in" ? "NOT " : ""}IN (SELECT value FROM json_each(?)), 0)`,
+      params: [jsonSet(values)],
     };
   }
   return {
@@ -108,8 +108,8 @@ function compileNumberLeaf(
   if (op === "in" || op === "not_in") {
     const values = value as readonly number[];
     return {
-      sql: `rv.stargazer_count ${op === "not_in" ? "NOT " : ""}IN (${placeholders(values.length)})`,
-      params: values,
+      sql: `rv.stargazer_count ${op === "not_in" ? "NOT " : ""}IN (SELECT value FROM json_each(?))`,
+      params: [jsonSet(values)],
     };
   }
   const operator = {
@@ -152,14 +152,18 @@ function listMembershipPredicate(
   operator: "=" | "IN",
   value: string | readonly string[],
 ): SqlFragment {
-  const values = typeof value === "string" ? [value] : value;
+  const setPredicate =
+    operator === "IN" ? "IN (SELECT value FROM json_each(?))" : "= ?";
   return {
     sql:
       "EXISTS (SELECT 1 FROM list_memberships m " +
       "WHERE m.snapshot_id = ss.snapshot_id " +
       "AND m.repository_id = ss.repository_id " +
-      `AND m.list_id ${operator} (${operator === "=" ? "?" : placeholders(values.length)}))`,
-    params: values,
+      `AND m.list_id ${setPredicate})`,
+    params:
+      operator === "IN"
+        ? [jsonSet(value as readonly string[])]
+        : [value as string],
   };
 }
 
@@ -193,14 +197,15 @@ function compileCollectionLeaf(
     const condition =
       op === "contains" || op === "not_contains"
         ? "topic.value = ?"
-        : `topic.value IN (${placeholders(values.length)})`;
+        : "topic.value IN (SELECT value FROM json_each(?))";
     const negate = op === "not_contains" || op === "not_in";
     return {
       sql:
         `${negate ? "NOT " : ""}EXISTS (` +
         "SELECT 1 FROM json_each(rv.topics_json) AS topic " +
         `WHERE ${condition})`,
-      params: values,
+      params:
+        op === "contains" || op === "not_contains" ? values : [jsonSet(values)],
     };
   }
 

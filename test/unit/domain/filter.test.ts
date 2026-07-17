@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHmac } from "node:crypto";
 import Database from "better-sqlite3";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import {
   createCursorCodec,
   hashFilter,
@@ -548,8 +548,103 @@ describe("closed repository filter language", () => {
     ]) {
       const compiled = compileFilter(parseFilter(input));
       expect(compiled.sql).not.toContain(hostile);
-      expect(compiled.params).toContain(hostile);
+      expect(
+        compiled.params.some((parameter) =>
+          String(parameter).includes(hostile),
+        ),
+      ).toBe(true);
     }
+  });
+
+  test("normalizes bounded sets and compiles each through one JSON bind", () => {
+    const stringSet = parseFilter({
+      field: "owner",
+      op: "in",
+      value: ["\u{10000}", "é", "a", "\uE000", "é"],
+    });
+    expect(stringSet).toEqual({
+      field: "owner",
+      op: "in",
+      value: ["a", "é", "\uE000", "\u{10000}"],
+    });
+    expect(
+      parseFilter({
+        field: "stargazer_count",
+        op: "not_in",
+        value: [10, -2, 10, 1],
+      }),
+    ).toEqual({
+      field: "stargazer_count",
+      op: "not_in",
+      value: [-2, 1, 10],
+    });
+
+    for (const input of [
+      { field: "owner", op: "in", value: ["OpenAI", "Other"] },
+      { field: "stargazer_count", op: "not_in", value: [8, 9] },
+      { field: "topics", op: "in", value: ["mcp", "agent"] },
+      { field: "list_ids", op: "not_in", value: ["UL_2", "UL_3"] },
+    ]) {
+      const compiled = compileFilter(parseFilter(input));
+      expect(compiled.sql).toContain("json_each(?)");
+      expect(compiled.params).toHaveLength(1);
+      expect(JSON.parse(String(compiled.params[0]))).toBeInstanceOf(Array);
+    }
+  });
+
+  test("accepts and executes 5,000 set members with bounded SQL parameters", () => {
+    const values = Array.from(
+      { length: 4_999 },
+      (_, index) => `owner-${index}`,
+    );
+    values.push("OpenAI");
+    const input = { field: "owner", op: "in", value: values };
+    const filter = parseFilter(input);
+    const compiled = compileFilter(filter);
+
+    expect(compiled.params).toHaveLength(1);
+    expect(compiled.sql.match(/\?/gu)).toHaveLength(1);
+    expect(sqlMatches(withView({ owner: "OpenAI" }, "large-set"), input)).toBe(
+      true,
+    );
+  });
+
+  test("rejects oversized individual and aggregate filter sets", () => {
+    expectValidationError(
+      () =>
+        parseFilter({
+          field: "owner",
+          op: "in",
+          value: Array.from({ length: 5_001 }, (_, index) => `owner-${index}`),
+        }),
+      /5,?000|set/iu,
+    );
+
+    expectValidationError(
+      () =>
+        parseFilter({
+          all: [
+            {
+              field: "owner",
+              op: "in",
+              value: Array.from(
+                { length: 5_000 },
+                (_, index) => `owner-${index}`,
+              ),
+            },
+            {
+              field: "topics",
+              op: "not_in",
+              value: Array.from(
+                { length: 5_000 },
+                (_, index) => `topic-${index}`,
+              ),
+            },
+            { field: "list_ids", op: "in", value: ["UL_over_budget"] },
+          ],
+        }),
+      /10,?000|set/iu,
+    );
   });
 });
 
@@ -1119,6 +1214,10 @@ describe("review hardening regressions", () => {
     hostile.revoke();
     expectValidationError(() => createCursorCodec(hostile.proxy));
 
+    const detachedKey = new Uint8Array(32).fill(0xdd);
+    structuredClone(detachedKey, { transfer: [detachedKey.buffer] });
+    expectValidationError(() => createCursorCodec(detachedKey));
+
     const mutableKey = new Uint8Array(32).fill(0x19);
     const copiedKeyCodec = createCursorCodec(mutableKey);
     mutableKey.fill(0x20);
@@ -1133,6 +1232,60 @@ describe("review hardening regressions", () => {
     });
     expect(() =>
       createCursorCodec(new Uint8Array(32).fill(0x19)).decodeList(
+        cursor,
+        listContext,
+      ),
+    ).not.toThrow();
+  });
+
+  test("uses intrinsic key length and rejects forged typed-array metadata", () => {
+    class LyingShortKey extends Uint8Array {
+      override get byteLength(): number {
+        return 64;
+      }
+
+      override get length(): number {
+        return 64;
+      }
+    }
+    class LyingFullKey extends Uint8Array {
+      override get byteLength(): number {
+        return 0;
+      }
+
+      override get length(): number {
+        return 0;
+      }
+    }
+
+    expectValidationError(() => createCursorCodec(new LyingShortKey(8)));
+    expect(() => createCursorCodec(new LyingFullKey(32))).not.toThrow();
+  });
+
+  test("copies signing keys outside Buffer slabs without retaining source bytes", () => {
+    const pooledKey = Buffer.allocUnsafe(32).fill(0x6d);
+    expect(pooledKey.buffer.byteLength).toBeGreaterThan(pooledKey.byteLength);
+    const bufferFrom = vi.spyOn(Buffer, "from");
+    let isolatedCodec: ReturnType<typeof createCursorCodec>;
+    try {
+      isolatedCodec = createCursorCodec(pooledKey);
+      expect(bufferFrom).not.toHaveBeenCalled();
+    } finally {
+      bufferFrom.mockRestore();
+    }
+
+    pooledKey.fill(0);
+    const listContext = {
+      kind: "lists",
+      snapshotId: SNAPSHOT_ID,
+      selectionHash: "c".repeat(64),
+    } as const;
+    const cursor = isolatedCodec.encodeList(listContext, {
+      values: ["isolated"],
+      listId: asUserListId("UL_ISOLATED"),
+    });
+    expect(() =>
+      createCursorCodec(new Uint8Array(32).fill(0x6d)).decodeList(
         cursor,
         listContext,
       ),
@@ -1290,5 +1443,81 @@ describe("review hardening regressions", () => {
     } finally {
       database.close();
     }
+  });
+
+  test("canonicalizes manually constructed temporal views for ordering and cursors", () => {
+    const views = [
+      withView(
+        {
+          repositoryId: asRepositoryId("R_TIME_A"),
+          fullName: "time/a",
+          updatedAt: "2026-07-16T00:00:00Z",
+        },
+        "TIME_A",
+      ),
+      withView(
+        {
+          repositoryId: asRepositoryId("R_TIME_B"),
+          fullName: "time/b",
+          updatedAt: "2026-07-16T00:00:00.000Z",
+        },
+        "TIME_B",
+      ),
+      withView(
+        {
+          repositoryId: asRepositoryId("R_TIME_C"),
+          fullName: "time/c",
+          updatedAt: "2026-07-16T00:00:01.000Z",
+        },
+        "TIME_C",
+      ),
+    ];
+    const sort = [{ field: "updated_at", direction: "asc" }] as const;
+    const memoryOrder = [...views].sort((left, right) =>
+      compareRepositories(left, right, sort),
+    );
+    expect(memoryOrder.map((view) => view.repositoryId)).toEqual([
+      "R_TIME_A",
+      "R_TIME_B",
+      "R_TIME_C",
+    ]);
+
+    const position = repositoryCursorPosition(memoryOrder[0]!, sort);
+    expect(position.values[0]).toBe("2026-07-16T00:00:00.000Z");
+    const context = {
+      kind: "repositories",
+      snapshotId: SNAPSHOT_ID,
+      filterHash: hashFilter(null),
+      sort,
+    } as const;
+    const cursor = codec.encodeRepository(context, position);
+    const compiled = compileCursor(
+      sort,
+      codec.decodeRepository(cursor, context),
+    );
+    const database = createDatabase(views);
+    try {
+      const sqlOrder = (
+        database
+          .prepare(
+            `SELECT ss.repository_id AS repositoryId
+             FROM repository_versions rv
+             JOIN snapshot_stars ss ON ss.repository_id = rv.repository_id
+             WHERE ${compiled.sql}
+             ORDER BY ${compileOrder(sort)}`,
+          )
+          .all(...compiled.params) as { repositoryId: string }[]
+      ).map((row) => row.repositoryId);
+      expect(sqlOrder).toEqual(["R_TIME_B", "R_TIME_C"]);
+    } finally {
+      database.close();
+    }
+
+    const invalid = withView(
+      { updatedAt: "Thu, 01 Jan 1970 00:00:00 GMT" },
+      "invalid-time",
+    );
+    expectValidationError(() => compareRepositories(invalid, views[0]!, sort));
+    expectValidationError(() => repositoryCursorPosition(invalid, sort));
   });
 });

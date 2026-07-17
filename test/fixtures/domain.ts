@@ -1,6 +1,6 @@
 import { asUserListId } from "../../src/domain/ids.js";
 import {
-  repositorySchema,
+  repositoryViewSchema,
   type RepositoryView,
 } from "../../src/domain/repository.js";
 
@@ -25,8 +25,10 @@ export const repositoryInputFixture = {
   updatedAt: "2026-07-16T01:00:00.000Z",
 } as const;
 
-export const repositoryViewFixture: RepositoryView = {
-  ...repositorySchema.parse(repositoryInputFixture),
-  starredAt: "2026-07-15T12:00:00.000Z",
-  listIds: [asUserListId("UL_1")],
-};
+export const repositoryViewFixture: RepositoryView = repositoryViewSchema.parse(
+  {
+    ...repositoryInputFixture,
+    starredAt: "2026-07-15T12:00:00.000Z",
+    listIds: [asUserListId("UL_1")],
+  },
+);

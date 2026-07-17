@@ -71,6 +71,14 @@ const repositoryIdSchema = z
   })
   .transform((value) => value as RepositoryId);
 
+const userListIdSchema = z
+  .string()
+  .min(1, "user_list_id must not be empty")
+  .refine((value) => value === value.trim(), {
+    message: "user_list_id must be trim-equal",
+  })
+  .transform((value) => value as UserListId);
+
 const repositoryDatabaseIdSchema = z
   .string()
   .regex(
@@ -120,7 +128,7 @@ const topicsSchema = z
     ].sort(),
   );
 
-export const repositorySchema = z
+const repositoryObjectSchema = z
   .object({
     repositoryId: repositoryIdSchema,
     repositoryDatabaseId: repositoryDatabaseIdSchema,
@@ -141,4 +149,46 @@ export const repositorySchema = z
     pushedAt: isoTimestampSchema.nullable(),
     updatedAt: isoTimestampSchema,
   })
-  .transform((repository): Repository => repository);
+  .strict();
+
+export const repositorySchema = repositoryObjectSchema.transform(
+  (repository): Repository => repository,
+);
+
+export const starRecordSchema = z
+  .object({
+    repositoryId: repositoryIdSchema,
+    starredAt: isoTimestampSchema,
+  })
+  .strict()
+  .transform((star): StarRecord => star);
+
+export const userListSchema = z
+  .object({
+    listId: userListIdSchema,
+    name: trimmedNameSchema,
+    slug: trimmedNameSchema,
+    description: z.string().nullable(),
+    isPrivate: z.boolean(),
+    createdAt: isoTimestampSchema,
+    updatedAt: isoTimestampSchema,
+    lastAddedAt: isoTimestampSchema.nullable(),
+  })
+  .strict()
+  .transform((list): UserList => list);
+
+export const repositoryViewSchema = repositoryObjectSchema
+  .extend({
+    starredAt: isoTimestampSchema,
+    listIds: z.array(userListIdSchema),
+  })
+  .strict()
+  .transform((view): RepositoryView => view);
+
+export const observedRepositoryMetadataSchema = z
+  .object({
+    repository: repositorySchema,
+    observedAt: isoTimestampSchema,
+  })
+  .strict()
+  .transform((observation): ObservedRepositoryMetadata => observation);

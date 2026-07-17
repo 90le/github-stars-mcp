@@ -185,6 +185,9 @@ const SORT_FIELDS = new Set<RepositorySort["field"]>([
   "starred_at",
   "full_name",
 ]);
+const MAX_SET_ENTRIES = 5_000;
+const MAX_TOTAL_SET_MEMBERS = 10_000;
+
 function validationError(message: string): never {
   throw new AppError("VALIDATION_ERROR", message);
 }
@@ -303,28 +306,48 @@ function denseArray(value: unknown, label: string): readonly unknown[] {
   }
 }
 
-function denseStringArray(value: unknown, label: string): readonly string[] {
-  const entries = denseArray(value, label);
-  if (
-    entries.length === 0 ||
-    entries.some((entry) => typeof entry !== "string")
-  ) {
-    return validationError(`${label} must be a non-empty string array`);
-  }
-  return entries as readonly string[];
+function compareUtf8(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
 
-function denseNumberArray(value: unknown, label: string): readonly number[] {
+function denseStringSet(
+  value: unknown,
+  label: string,
+  registerMembers: (count: number) => void,
+): readonly string[] {
   const entries = denseArray(value, label);
   if (
     entries.length === 0 ||
+    entries.length > MAX_SET_ENTRIES ||
+    entries.some((entry) => typeof entry !== "string")
+  ) {
+    return validationError(`${label} must contain 1 to 5,000 string entries`);
+  }
+  registerMembers(entries.length);
+  return [...new Set(entries as readonly string[])].sort(compareUtf8);
+}
+
+function denseNumberSet(
+  value: unknown,
+  label: string,
+  registerMembers: (count: number) => void,
+): readonly number[] {
+  const entries = denseArray(value, label);
+  if (
+    entries.length === 0 ||
+    entries.length > MAX_SET_ENTRIES ||
     entries.some(
       (entry) => typeof entry !== "number" || !Number.isFinite(entry),
     )
   ) {
-    return validationError(`${label} must be a non-empty finite-number array`);
+    return validationError(
+      `${label} must contain 1 to 5,000 finite-number entries`,
+    );
   }
-  return entries as readonly number[];
+  registerMembers(entries.length);
+  return [...new Set(entries as readonly number[])].sort(
+    (left, right) => left - right,
+  );
 }
 
 function daysInUtcMonth(year: number, month: number): number {
@@ -433,6 +456,7 @@ function normalizeRelativeTimestamp(
 function parseLeaf(
   record: Record<string, unknown>,
   context: FilterParseContext | undefined,
+  registerSetMembers: (count: number) => void,
 ): FilterExpression {
   requireExactKeys(record, ["field", "op", "value"], "filter leaf");
   const { field, op, value } = record;
@@ -458,7 +482,7 @@ function parseLeaf(
       return {
         field: stringField,
         op,
-        value: denseStringArray(value, `${field} ${op}`),
+        value: denseStringSet(value, `${field} ${op}`, registerSetMembers),
       };
     }
     if (typeof value !== "string") {
@@ -479,7 +503,7 @@ function parseLeaf(
       return {
         field,
         op,
-        value: denseNumberArray(value, `${field} ${op}`),
+        value: denseNumberSet(value, `${field} ${op}`, registerSetMembers),
       };
     }
     if (typeof value !== "number" || !Number.isFinite(value)) {
@@ -539,7 +563,7 @@ function parseLeaf(
       return {
         field: collectionField,
         op,
-        value: denseStringArray(value, `${field} ${op}`),
+        value: denseStringSet(value, `${field} ${op}`, registerSetMembers),
       };
     }
     if (typeof value !== "string") {
@@ -569,6 +593,16 @@ export function parseFilter(
   context?: FilterParseContext,
 ): FilterExpression {
   let leaves = 0;
+  let setMembers = 0;
+
+  function registerSetMembers(count: number): void {
+    setMembers += count;
+    if (setMembers > MAX_TOTAL_SET_MEMBERS) {
+      validationError(
+        "filter sets must not contain more than 10,000 total members",
+      );
+    }
+  }
 
   function parseNode(value: unknown, depth: number): FilterExpression {
     if (depth > 12) {
@@ -607,7 +641,7 @@ export function parseFilter(
     if (leaves > 100) {
       return validationError("filter must not contain more than 100 leaves");
     }
-    return parseLeaf(record, context);
+    return parseLeaf(record, context, registerSetMembers);
   }
 
   try {
@@ -831,11 +865,22 @@ function repositorySortValue(
     case "stargazer_count":
       return view.stargazerCount;
     case "pushed_at":
-      return view.pushedAt;
+      return view.pushedAt === null
+        ? null
+        : canonicalUtcTimestamp(
+            view.pushedAt,
+            "repository pushed_at sort timestamp",
+          );
     case "updated_at":
-      return view.updatedAt;
+      return canonicalUtcTimestamp(
+        view.updatedAt,
+        "repository updated_at sort timestamp",
+      );
     case "starred_at":
-      return view.starredAt;
+      return canonicalUtcTimestamp(
+        view.starredAt,
+        "repository starred_at sort timestamp",
+      );
     case "full_name":
       return view.fullName;
     case "repository_id":
@@ -845,10 +890,7 @@ function repositorySortValue(
 
 function compareNonNull(left: string | number, right: string | number): number {
   if (typeof left === "string" && typeof right === "string") {
-    return Buffer.compare(
-      Buffer.from(left, "utf8"),
-      Buffer.from(right, "utf8"),
-    );
+    return compareUtf8(left, right);
   }
   if (left < right) return -1;
   if (left > right) return 1;

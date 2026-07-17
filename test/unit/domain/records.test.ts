@@ -15,7 +15,11 @@ import {
 import { SystemRuntime } from "../../../src/app/ports/runtime-port.js";
 import type { JsonValue } from "../../../src/domain/json.js";
 import {
+  observedRepositoryMetadataSchema,
   repositorySchema,
+  repositoryViewSchema,
+  starRecordSchema,
+  userListSchema,
   type AccountBinding,
   type ListMembership,
   type ObservedRepositoryMetadata,
@@ -104,6 +108,95 @@ test("validates stable identities and normalizes topics", () => {
     repositorySchema.safeParse({
       ...repositoryInputFixture,
       url: "not a URL",
+    }).success,
+  ).toBe(false);
+
+  const parsedStar = starRecordSchema.parse({
+    repositoryId: "R_1",
+    starredAt: "2026-07-16T00:00:00Z",
+  });
+  expect(parsedStar.starredAt).toBe("2026-07-16T00:00:00.000Z");
+
+  const parsedList = userListSchema.parse({
+    listId: "UL_1",
+    name: "Agents",
+    slug: "agents",
+    description: null,
+    isPrivate: false,
+    createdAt: "2026-07-16T00:00:00.1Z",
+    updatedAt: "2026-07-16T01:00:00Z",
+    lastAddedAt: "2026-07-16T01:30:00.12Z",
+  });
+  expect(parsedList).toMatchObject({
+    createdAt: "2026-07-16T00:00:00.100Z",
+    updatedAt: "2026-07-16T01:00:00.000Z",
+    lastAddedAt: "2026-07-16T01:30:00.120Z",
+  });
+
+  const parsedView = repositoryViewSchema.parse({
+    ...repositoryInputFixture,
+    pushedAt: "2026-07-16T00:00:00Z",
+    starredAt: "2026-07-15T12:00:00Z",
+    listIds: ["UL_1"],
+  });
+  expect(parsedView.pushedAt).toBe("2026-07-16T00:00:00.000Z");
+  expect(parsedView.starredAt).toBe("2026-07-15T12:00:00.000Z");
+
+  const parsedObservation = observedRepositoryMetadataSchema.parse({
+    repository: {
+      ...repositoryInputFixture,
+      updatedAt: "2026-07-16T01:00:00Z",
+    },
+    observedAt: "2026-07-16T02:00:00Z",
+  });
+  expect(parsedObservation.repository.updatedAt).toBe(
+    "2026-07-16T01:00:00.000Z",
+  );
+  expect(parsedObservation.observedAt).toBe("2026-07-16T02:00:00.000Z");
+
+  for (const invalid of [
+    {
+      schema: starRecordSchema,
+      value: {
+        repositoryId: " R_1",
+        starredAt: "2026-07-16T00:00:00Z",
+      },
+    },
+    {
+      schema: userListSchema,
+      value: {
+        ...parsedList,
+        updatedAt: "2026-07-16T01:00:00.1234Z",
+      },
+    },
+    {
+      schema: repositoryViewSchema,
+      value: { ...parsedView, starredAt: "yesterday" },
+    },
+    {
+      schema: observedRepositoryMetadataSchema,
+      value: {
+        repository: { ...repositoryInputFixture, updatedAt: "later" },
+        observedAt: "2026-07-16T02:00:00Z",
+      },
+    },
+  ]) {
+    expect(invalid.schema.safeParse(invalid.value).success).toBe(false);
+  }
+
+  expect(
+    starRecordSchema.safeParse({ ...parsedStar, unexpected: true }).success,
+  ).toBe(false);
+  expect(
+    userListSchema.safeParse({ ...parsedList, unexpected: true }).success,
+  ).toBe(false);
+  expect(
+    repositoryViewSchema.safeParse({ ...parsedView, unexpected: true }).success,
+  ).toBe(false);
+  expect(
+    observedRepositoryMetadataSchema.safeParse({
+      ...parsedObservation,
+      unexpected: true,
     }).success,
   ).toBe(false);
   expect(() =>

@@ -105,6 +105,19 @@ const HASH = /^[a-f0-9]{64}$/u;
 const MAC = /^[a-f0-9]{64}$/u;
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
 const validatedRepositoryPayloads = new WeakSet<object>();
+const typedArrayPrototype = Object.getPrototypeOf(
+  Uint8Array.prototype,
+) as object;
+const typedArrayByteLength = (
+  Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength") as {
+    readonly get: (this: void) => unknown;
+  }
+).get;
+const intrinsicUint8ArraySet = (
+  Object.getOwnPropertyDescriptor(typedArrayPrototype, "set") as {
+    readonly value: (this: void, source: Uint8Array) => void;
+  }
+).value;
 
 function cursorError(message: string): never {
   throw new AppError("VALIDATION_ERROR", message);
@@ -497,20 +510,36 @@ function listPosition(input: unknown): {
   };
 }
 
-function signingKeyCopy(signingKey: Uint8Array): Buffer {
+function intrinsicByteLength(value: Uint8Array): number {
+  return Reflect.apply(typedArrayByteLength, value, []) as number;
+}
+
+function signingKeyCopy(signingKey: Uint8Array): Uint8Array {
   try {
     if (
       typeof signingKey !== "object" ||
       signingKey === null ||
       utilTypes.isProxy(signingKey) ||
-      !(signingKey instanceof Uint8Array) ||
-      signingKey.byteLength < 32
+      !utilTypes.isUint8Array(signingKey)
     ) {
       return cursorError(
         "cursor signing key must be a Uint8Array of at least 32 bytes",
       );
     }
-    return Buffer.from(signingKey);
+    const actualLength = intrinsicByteLength(signingKey);
+    if (!Number.isSafeInteger(actualLength) || actualLength < 32) {
+      return cursorError(
+        "cursor signing key must be a Uint8Array of at least 32 bytes",
+      );
+    }
+    const copy = new Uint8Array(actualLength);
+    Reflect.apply(intrinsicUint8ArraySet, copy, [signingKey]);
+    if (intrinsicByteLength(copy) !== actualLength || actualLength < 32) {
+      return cursorError(
+        "cursor signing key must be a Uint8Array of at least 32 bytes",
+      );
+    }
+    return copy;
   } catch (error) {
     if (error instanceof AppError) throw error;
     return cursorError(
@@ -519,7 +548,7 @@ function signingKeyCopy(signingKey: Uint8Array): Buffer {
   }
 }
 
-function authenticate(payloadText: string, mac: string, key: Buffer): void {
+function authenticate(payloadText: string, mac: string, key: Uint8Array): void {
   if (!MAC.test(mac)) {
     return cursorError("cursor authentication code is invalid");
   }
@@ -538,7 +567,7 @@ function authenticate(payloadText: string, mac: string, key: Buffer): void {
   }
 }
 
-function encodedEnvelope(payload: unknown, key: Buffer): string {
+function encodedEnvelope(payload: unknown, key: Uint8Array): string {
   const payloadText = canonicalJson(payload);
   let mac: string;
   try {
@@ -559,7 +588,7 @@ function encodedEnvelope(payload: unknown, key: Buffer): string {
 
 function decodedEnvelope(
   cursor: string,
-  key: Buffer,
+  key: Uint8Array,
 ): Readonly<Record<string, unknown>> {
   if (
     typeof cursor !== "string" ||
@@ -608,7 +637,7 @@ function decodedEnvelope(
 function decodeRepositoryPayload(
   cursor: string,
   context: NormalizedRepositoryContext,
-  key: Buffer,
+  key: Uint8Array,
 ): ValidatedRepositoryCursorPayload {
   const payload = decodedEnvelope(cursor, key);
   exactKeys(
@@ -672,7 +701,7 @@ function decodeRepositoryPayload(
 function decodeListPayload(
   cursor: string,
   context: NormalizedListContext,
-  key: Buffer,
+  key: Uint8Array,
 ): ListCursorPayload {
   const payload = decodedEnvelope(cursor, key);
   exactKeys(
