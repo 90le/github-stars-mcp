@@ -860,71 +860,123 @@ function bearerTokenCharacter(character) {
   return /[A-Za-z0-9._~+/-]/u.test(character);
 }
 
-function escapedBearerTokenCharacterLength(source, start) {
-  if (source[start] !== "\\") return 0;
-  const marker = source[start + 1];
-  const digits = marker === "u" ? 4 : marker === "x" ? 2 : 0;
-  if (digits === 0) return 0;
-  const encoded = source.slice(start + 2, start + 2 + digits);
+function decodedHexEscape(source, start, digits) {
+  const encoded = source.slice(start, start + digits);
   if (encoded.length !== digits || !/^[0-9A-Fa-f]+$/u.test(encoded)) {
-    return 0;
+    return null;
   }
-  const decoded = String.fromCodePoint(Number.parseInt(encoded, 16));
-  return bearerTokenCharacter(decoded) ? digits + 2 : 0;
+  return Number.parseInt(encoded, 16);
 }
 
-function bearerTokenCharacterLength(source, start) {
-  return bearerTokenCharacter(source[start])
-    ? 1
-    : escapedBearerTokenCharacterLength(source, start);
-}
+function decodedStringEscape(source, start) {
+  const marker = source[start + 1];
+  if (marker === undefined) return { value: "\\", length: 1 };
 
-function completeBearerCredentialAt(source, start) {
-  let index = skipBearerWhitespace(source, start);
-  if (source.slice(index, index + 6).toLowerCase() !== "bearer") return false;
-  index += 6;
-  if (!bearerWhitespace(source[index])) return false;
-  index = skipBearerWhitespace(source, index);
-
-  let tokenLength = bearerTokenCharacterLength(source, index);
-  if (tokenLength === 0) return false;
-  while (tokenLength > 0) {
-    index += tokenLength;
-    tokenLength = bearerTokenCharacterLength(source, index);
+  if (marker === "u" && source[start + 2] === "{") {
+    const close = source.indexOf("}", start + 3);
+    if (close !== -1) {
+      const digits = close - start - 3;
+      const codePoint =
+        digits >= 1 && digits <= 6
+          ? decodedHexEscape(source, start + 3, digits)
+          : null;
+      if (codePoint !== null && codePoint <= 0x10ffff) {
+        return {
+          value: String.fromCodePoint(codePoint),
+          length: close - start + 1,
+        };
+      }
+    }
+    return { value: "\\u", length: 2 };
   }
-  while (source[index] === "=") index += 1;
 
-  const boundary = source[index];
-  return (
-    boundary === undefined ||
-    bearerWhitespace(boundary) ||
-    "\"'`,;)}]#".includes(boundary) ||
-    (boundary === "\\" && "\"'`".includes(source[index + 1] ?? ""))
-  );
+  if (marker === "u" || marker === "x") {
+    const digits = marker === "u" ? 4 : 2;
+    const codePoint = decodedHexEscape(source, start + 2, digits);
+    return codePoint === null
+      ? { value: `\\${marker}`, length: 2 }
+      : { value: String.fromCodePoint(codePoint), length: digits + 2 };
+  }
+
+  if (marker === "\r") {
+    return {
+      value: "",
+      length: source[start + 2] === "\n" ? 3 : 2,
+    };
+  }
+  if (marker === "\n") return { value: "", length: 2 };
+
+  const simpleEscapes = {
+    0: "\0",
+    b: "\b",
+    f: "\f",
+    n: "\n",
+    r: "\r",
+    t: "\t",
+    v: "\v",
+    "\\": "\\",
+    '"': '"',
+    "'": "'",
+    "`": "`",
+    "/": "/",
+  };
+  return {
+    value: Object.hasOwn(simpleEscapes, marker)
+      ? simpleEscapes[marker]
+      : marker,
+    length: 2,
+  };
 }
 
 function quoteCharacter(character) {
   return character === '"' || character === "'" || character === "`";
 }
 
-function quotedLiteralEnd(source, start) {
+function readQuotedLiteral(source, start) {
   const quote = source[start];
-  for (let index = start + 1; index < source.length; index++) {
+  if (!quoteCharacter(quote)) return null;
+  let value = "";
+  for (let index = start + 1; index < source.length; ) {
+    if (source[index] === quote) {
+      return { value, end: index + 1, terminated: true };
+    }
     if (source[index] === "\\") {
-      index += 1;
+      const escape = decodedStringEscape(source, index);
+      value += escape.value;
+      index += escape.length;
       continue;
     }
-    if (source[index] === quote) return index;
+    value += source[index];
+    index += 1;
   }
-  return source.length;
+  return { value, end: source.length, terminated: false };
+}
+
+function bearerCredentialEnd(source, start) {
+  let index = skipBearerWhitespace(source, start);
+  if (source.slice(index, index + 6).toLowerCase() !== "bearer") return null;
+  index += 6;
+  if (!bearerWhitespace(source[index])) return null;
+  index = skipBearerWhitespace(source, index);
+
+  if (!bearerTokenCharacter(source[index])) return null;
+  while (bearerTokenCharacter(source[index])) index += 1;
+  while (source[index] === "=") index += 1;
+  return index;
+}
+
+function completeBearerValue(source, start, allowComment = false) {
+  const end = bearerCredentialEnd(source, start);
+  if (end === null) return false;
+  const tail = skipBearerWhitespace(source, end);
+  return tail === source.length || (allowComment && source[tail] === "#");
 }
 
 function readConfigKey(source, start) {
-  const quote = source[start];
-  if (quoteCharacter(quote)) {
-    const end = quotedLiteralEnd(source, start);
-    if (end === source.length) return null;
-    return { key: source.slice(start + 1, end), end: end + 1 };
+  const literal = readQuotedLiteral(source, start);
+  if (literal !== null) {
+    if (!literal.terminated) return null;
+    return { key: literal.value, end: literal.end };
   }
   const match = /^[A-Za-z_][A-Za-z0-9_.-]*/u.exec(source.slice(start));
   return match === null
@@ -934,24 +986,23 @@ function readConfigKey(source, start) {
 
 function bearerConfigKey(key) {
   const normalized = key.toLowerCase();
-  return normalized === "authorization" || normalized === "token";
+  return (
+    normalized === "authorization" ||
+    normalized === "token" ||
+    normalized.endsWith("_token")
+  );
 }
 
 function configValueContainsBearer(source, start) {
-  let index = skipBearerWhitespace(source, start, true);
-  if (quoteCharacter(source[index])) index += 1;
-  return completeBearerCredentialAt(source, index);
+  const index = skipBearerWhitespace(source, start, true);
+  const literal = readQuotedLiteral(source, index);
+  return literal === null
+    ? completeBearerValue(source, index, true)
+    : completeBearerValue(literal.value, 0);
 }
 
-function configLineContainsBearer(line) {
-  let index = skipBearerWhitespace(line, 0, true);
-  if (
-    line[index] === "-" &&
-    (line[index + 1] === " " || line[index + 1] === "\t")
-  ) {
-    return configValueContainsBearer(line, index + 1);
-  }
-
+function configEntryContainsBearer(line, start) {
+  const index = skipBearerWhitespace(line, start, true);
   const key = readConfigKey(line, index);
   if (key === null || !bearerConfigKey(key.key)) return false;
   const valueSeparator = skipBearerWhitespace(line, key.end, true);
@@ -964,26 +1015,40 @@ function configLineContainsBearer(line) {
   return false;
 }
 
-function quotedContentContainsBearer(source) {
-  for (let index = 0; index < source.length; index++) {
-    if (!quoteCharacter(source[index])) continue;
-    if (completeBearerCredentialAt(source, index + 1)) return true;
-    const lineEnd = source.indexOf("\n", index + 1);
-    const contents = source.slice(
-      index + 1,
-      lineEnd === -1 ? source.length : lineEnd,
+function configLineContainsBearer(line) {
+  const index = skipBearerWhitespace(line, 0, true);
+  if (
+    line[index] === "-" &&
+    (line[index + 1] === " " || line[index + 1] === "\t")
+  ) {
+    const valueStart = index + 1;
+    return (
+      configValueContainsBearer(line, valueStart) ||
+      configEntryContainsBearer(line, valueStart)
     );
-    if (configLineContainsBearer(contents)) return true;
+  }
+  return (
+    configEntryContainsBearer(line, index) ||
+    completeBearerValue(line, index, true)
+  );
+}
+
+function quotedContentContainsBearer(source, depth) {
+  for (let index = 0; index < source.length; index++) {
+    const literal = readQuotedLiteral(source, index);
+    if (literal === null) continue;
+    if (completeBearerValue(literal.value, 0)) return true;
+    if (depth < 4 && literalBearerValue(literal.value, depth + 1)) return true;
   }
   return false;
 }
 
-function literalBearerValue(source) {
+function literalBearerValue(source, depth = 0) {
   for (const rawLine of source.split("\n")) {
     const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
     if (configLineContainsBearer(line)) return true;
   }
-  return quotedContentContainsBearer(source);
+  return quotedContentContainsBearer(source, depth);
 }
 
 function containsCredentialMaterial(contents) {

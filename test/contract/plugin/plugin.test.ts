@@ -532,7 +532,15 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
   ],
   ["unquoted env with a short alphabetic value", "Ab", "TOKEN =   BeArEr Ab"],
   ["unquoted YAML with a one-character value", "Q", "token:\tBEARER Q"],
+  ["env key suffix without spaces", "Ab", "API_TOKEN=Bearer Ab"],
+  [
+    "env key suffix with spaces and a trailing comment",
+    "Cd",
+    "GITHUB_TOKEN = Bearer Cd # local",
+  ],
   ["YAML sequence value", "Ab", "- Bearer Ab"],
+  ["YAML sequence mapping", "Ef", "- authorization: Bearer Ef"],
+  ["bounded bare value", "Gh", "Bearer Gh"],
   [
     "whitespace-separated config with a trailing comment",
     "Ab",
@@ -550,6 +558,16 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
     'const value = "{\\"Authorization\\":\\"Bearer Yy\\"}";',
   ],
   ["escaped token character", "\\u0041", 'const value = "Bearer \\u0041";'],
+  [
+    "JS braced Unicode escape",
+    String.raw`\u{0049}`,
+    String.raw`const value = "Bearer \u{0049}";`,
+  ],
+  [
+    "JSON escaped solidus",
+    String.raw`Ab\/Cd`,
+    String.raw`{"Authorization":"Bearer Ab\/Cd"}`,
+  ],
   [
     "double-quoted JSON",
     "eyJhbGciOiJIUzI1NiJ9.payload.signature",
@@ -1381,6 +1399,18 @@ describe("Codex plugin package", () => {
     [
       "prose after a colon",
       "Authentication schemes: Bearer token-based authentication is supported.\n",
+    ],
+    [
+      "scheme-leading prose in a quoted literal",
+      'const note = "Bearer token-based authentication is supported.";\n',
+    ],
+    [
+      "scheme-leading prose in a YAML bullet",
+      "- Bearer token-based authentication is supported.\n",
+    ],
+    [
+      "a product regex with an escaped solidus in a string literal",
+      String.raw`const pattern = "Bearer \\/[A-Za-z0-9]+/";` + "\n",
     ],
     [
       "quoted prose where Bearer occurs later",
