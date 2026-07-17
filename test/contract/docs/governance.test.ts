@@ -69,6 +69,13 @@ describe("open-source governance", () => {
     expect(security).toMatch(/reproduction steps/i);
     expect(security).toMatch(/security impact/i);
     expect(security).toMatch(/do not include.*token/i);
+    expect(security).toMatch(
+      /project intends to coordinate disclosure timing with the reporter/i,
+    );
+    expect(security).toMatch(/maintainers publish the advisory/i);
+    expect(security).not.toMatch(
+      /until the maintainers and reporter agree to disclose/i,
+    );
     expect(security).not.toMatch(/open a public issue for a vulnerability/i);
     expect(security).not.toMatch(
       /(?:respond|reply|fix|resolve).{0,30}(?:within|in)\s+\d+\s+(?:hour|day)/i,

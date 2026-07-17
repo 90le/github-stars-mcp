@@ -13,7 +13,7 @@ Upgrade to the newest 1.x release before reporting behavior that an existing pat
 
 ## Private vulnerability reporting
 
-Use [GitHub private vulnerability reporting](https://github.com/90le/github-stars-mcp/security/advisories/new) to contact the maintainers. GitHub keeps the draft advisory and its discussion private until the maintainers and reporter agree to disclose it.
+Use [GitHub private vulnerability reporting](https://github.com/90le/github-stars-mcp/security/advisories/new) to contact the maintainers. GitHub keeps the draft advisory and its discussion private before publication. The project intends to coordinate disclosure timing with the reporter. The maintainers publish the advisory after they assess user risk and fix readiness.
 
 Do not post suspected security defects in issues, discussions, pull requests, or social media.
 
