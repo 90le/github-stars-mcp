@@ -15,8 +15,15 @@
 - Source uses strict TypeScript ESM and emitted `.js` suffixes in relative imports.
 - GraphQL IDs are branded non-empty strings; REST repository numeric IDs are branded decimal strings.
 - `repository_id` means GraphQL node ID; `repository_database_id` means REST numeric ID as decimal text.
-- SQLite uses WAL for file databases, `foreign_keys=ON`, `busy_timeout=5000`, `synchronous=NORMAL`, and numbered migrations.
-- Sync creates a `building` snapshot, appends bounded page batches, then atomically publishes `complete`; interrupted work remains unreadable and startup recovery marks it `failed`.
+- SQLite requires 3.38+, UTF-8, JSON1, `foreign_keys=ON`,
+  `trusted_schema=OFF`, `mmap_size=0`, `busy_timeout=5000`,
+  `synchronous=FULL`, WAL for file databases, and checksum-verified numbered
+  migrations.
+- Sync creates a lease-bound `building` snapshot, appends bounded page
+  batches, then atomically verifies its still-active lease, actual counts, and
+  List coverage while publishing `complete`; interrupted work remains
+  unreadable and startup recovery skips another live process before failing
+  abandoned drafts.
 - Canonical JSON accepts JSON values only, sorts keys recursively, preserves array order, rejects non-finite numbers, and hashes UTF-8 with SHA-256.
 - Executable plan content includes account, snapshot, protected IDs, resolved operations, and dependencies; lifecycle metadata and caller note are excluded.
 - Credentials never enter config values, errors, logs, persistence, plans, runs, or fixtures.
@@ -158,7 +165,7 @@ test("validates stable identities and normalizes topics", () => {
     fullName: "OpenAI/SDK", description: null, url: "https://github.com/OpenAI/SDK",
     stargazerCount: 10, isFork: false, isArchived: false, isDisabled: false, isPrivate: false, visibility: "public",
     primaryLanguage: "TypeScript", topics: ["MCP", "mcp", " Agent "],
-    licenseSpdxId: "Apache-2.0", pushedAt: "2026-07-16T00:00:00Z", updatedAt: "2026-07-16T01:00:00Z"
+    licenseSpdxId: "Apache-2.0", pushedAt: "2026-07-16T00:00:00.000Z", updatedAt: "2026-07-16T01:00:00.000Z"
   });
   expect(repository.topics).toEqual(["agent", "mcp"]);
 });
@@ -221,11 +228,20 @@ nonnegative integer stars, and canonical UTC ISO timestamps ending in `Z`;
 numeric-offset timestamps are rejected rather than stored in mixed forms.
 
 ```ts
-export interface SnapshotDraft { readonly id: SnapshotId; readonly binding: AccountBinding; readonly mode: "full" | "incremental"; readonly startedAt: string }
+export type ListCoverage = "collecting" | "complete" | "unavailable" | "omitted";
+export interface SnapshotDraft { readonly id: SnapshotId; readonly binding: AccountBinding; readonly mode: "full" | "incremental"; readonly listCoverage: Exclude<ListCoverage,"complete">; readonly startedAt: string }
 export interface SnapshotCounts { readonly repositories: number; readonly stars: number; readonly lists: number; readonly memberships: number }
-export interface Snapshot extends SnapshotDraft { readonly status: "building" | "complete" | "failed"; readonly completedAt: string | null; readonly failedAt: string | null; readonly counts: SnapshotCounts; readonly warningCount: number; readonly sourceRateLimit: JsonValue|null }
+export interface Snapshot extends Omit<SnapshotDraft,"listCoverage"> { readonly listCoverage: ListCoverage; readonly status: "building" | "complete" | "failed"; readonly completedAt: string | null; readonly failedAt: string | null; readonly counts: SnapshotCounts; readonly warningCount: number; readonly sourceRateLimit: JsonValue|null }
 export interface SnapshotBatch { readonly repositories: readonly ObservedRepositoryMetadata[]; readonly stars: readonly StarRecord[]; readonly lists: readonly UserList[]; readonly memberships: readonly ListMembership[] }
+export interface SnapshotVerificationBatch { readonly stars: readonly StarRecord[]; readonly lists: readonly UserList[]; readonly memberships: readonly ListMembership[] }
 ```
+
+Task 6 deliberately revisits these snapshot contracts after the basic record
+slice is complete: it adds strict runtime parsers, deep freezing, coverage
+state invariants, detached-clone behavior at the storage boundary, and an
+order-independent verification staging type. Verification batches contain
+only the remote identity/timestamp/List relationship data needed to prove set
+equality; they never duplicate repository metadata.
 
 - [ ] **Step 4: Verify records and types**
 Run `npm test -- test/unit/domain/records.test.ts && npm run typecheck && npm run lint`; expect one passing test and zero static-check errors.
@@ -347,7 +363,7 @@ import { repositoryViewFixture } from "../../fixtures/domain.js";
 test("evaluates filters while parameterizing caller text", () => {
   const nested = parseFilter({ all: [
     { field: "stargazer_count", op: "lt", value: 10000 },
-    { field: "pushed_at", op: "before", value: "2023-07-16T00:00:00Z" }
+    { field: "pushed_at", op: "before", value: "2023-07-16T00:00:00.000Z" }
   ] });
   expect(matchesFilter(repositoryViewFixture, nested)).toBe(true);
   for (const input of [
@@ -399,10 +415,16 @@ export type FilterExpression =
   | { readonly field: "is_unclassified"; readonly op: "eq"|"neq"; readonly value:boolean };
 export interface RepositorySort { readonly field: "stargazer_count"|"pushed_at"|"updated_at"|"starred_at"|"full_name"; readonly direction: "asc"|"desc" }
 export interface RepositoryQuery { readonly snapshotId: SnapshotId; readonly filter: FilterExpression|null; readonly sort: readonly RepositorySort[]; readonly pageSize: number; readonly cursor: string|null }
-export interface RepositoryQueryPage { readonly items: readonly RepositoryView[]; readonly total: number; readonly aggregates: { readonly byLanguage: Readonly<Record<string, number>>; readonly archived: number; readonly forks: number }; readonly nextCursor: string|null }
-export interface ListView extends UserList { readonly repositoryIds: readonly RepositoryId[] }
+export interface LanguageAggregate { readonly language:string|null; readonly count:number }
+export interface RepositoryQueryPage { readonly items: readonly RepositoryView[]; readonly total: number; readonly aggregates: { readonly languages:readonly LanguageAggregate[]; readonly archived: number; readonly forks: number }; readonly nextCursor: string|null }
+export interface ListSummary extends UserList { readonly repositoryCount:number }
 export interface ListQuery { readonly snapshotId: SnapshotId; readonly pageSize: number; readonly cursor: string|null }
-export interface ListQueryPage { readonly items: readonly ListView[]; readonly total: number; readonly nextCursor: string|null }
+export interface ListQueryPage { readonly coverage:"complete"; readonly items: readonly ListSummary[]; readonly total: number; readonly nextCursor: string|null }
+export type ListMembershipSelector = {readonly kind:"list";readonly listId:UserListId}|{readonly kind:"repository";readonly repositoryId:RepositoryId};
+export interface ListMembershipQuery { readonly snapshotId:SnapshotId; readonly selector:ListMembershipSelector; readonly pageSize:number; readonly cursor:string|null }
+export type ListMembershipQueryPage =
+  | {readonly coverage:"complete";readonly selector:{readonly kind:"list";readonly listId:UserListId};readonly repositoryIds:readonly RepositoryId[];readonly total:number;readonly nextCursor:string|null}
+  | {readonly coverage:"complete";readonly selector:{readonly kind:"repository";readonly repositoryId:RepositoryId};readonly listIds:readonly UserListId[];readonly total:number;readonly nextCursor:string|null};
 ```
 
 `parseFilter(input, { now })` limits depth to 12 and leaves to 100, rejects
@@ -451,7 +473,7 @@ pair, including nulls and `is_unclassified`, plus 5,000-value and aggregate
 budget boundaries.
 
 `createCursorCodec(signingKey)` defensively copies a caller-injected key of at
-least 32 actual bytes and returns repository/List encode and decode methods.
+least 32 actual bytes and returns repository/List/List-membership encode and decode methods.
 It obtains typed-array length/data through intrinsic operations, so overridden
 subclass properties cannot fake the length, copies into a dedicated unpooled
 `Uint8Array` backing store, and retains no `Buffer` view of the key. Tests
@@ -461,6 +483,42 @@ Repository cursors are max-4-KiB base64url canonical JSON envelopes with
 `{mac,payload:{v:1,kind:"repositories",snapshotId,filterHash,sortHash,values,nulls,repositoryId}}`;
 List cursors use
 `{mac,payload:{v:1,kind:"lists",snapshotId,selectionHash,values,listId}}`.
+List-membership cursors use
+one of
+`{mac,payload:{v:1,kind:"list_memberships",snapshotId,selectionHash,selector:{kind:"list",listId},boundaryRepositoryId}}`
+or
+`{mac,payload:{v:1,kind:"list_memberships",snapshotId,selectionHash,selector:{kind:"repository",repositoryId},boundaryListId}}`.
+The selector is the exact normalized direction, and no generic boundary field
+or alternate encoding is accepted.
+
+Task 6 adds these exact codec types and methods:
+
+```ts
+export type ListMembershipCursorContext =
+  | Readonly<{v:1;kind:"list_memberships";snapshotId:SnapshotId;selector:{kind:"list";listId:UserListId}}>
+  | Readonly<{v:1;kind:"list_memberships";snapshotId:SnapshotId;selector:{kind:"repository";repositoryId:RepositoryId}}>;
+export type ListMembershipCursorPosition =
+  | Readonly<{selector:{kind:"list";listId:UserListId};boundaryRepositoryId:RepositoryId}>
+  | Readonly<{selector:{kind:"repository";repositoryId:RepositoryId};boundaryListId:UserListId}>;
+export type ValidatedListMembershipCursorPayload =
+  | Readonly<{v:1;kind:"list_memberships";snapshotId:SnapshotId;selectionHash:string;selector:{kind:"list";listId:UserListId};boundaryRepositoryId:RepositoryId}>
+  | Readonly<{v:1;kind:"list_memberships";snapshotId:SnapshotId;selectionHash:string;selector:{kind:"repository";repositoryId:RepositoryId};boundaryListId:UserListId}>;
+export function assertValidatedListMembershipCursorPayload(
+  value: unknown,
+): asserts value is ValidatedListMembershipCursorPayload;
+export interface CursorCodec {
+  // existing repository/List methods
+  encodeListMembership(context:ListMembershipCursorContext,position:ListMembershipCursorPosition):string;
+  decodeListMembership(cursor:string,context:ListMembershipCursorContext):ValidatedListMembershipCursorPayload;
+}
+```
+
+The context and position selectors must match exactly. Decode returns a
+runtime-branded frozen discriminated payload and validates the boundary ID
+according to direction; no generic `boundaryId` API escapes the codec. The
+brand is held in a module-private `WeakSet<object>` and
+`assertValidatedListMembershipCursorPayload` rejects frozen lookalikes that
+were not returned by this codec.
 `mac` is lowercase-hex HMAC-SHA-256 over the canonical payload and is checked
 with constant-time comparison. Decode descriptor-snapshots data-only plain
 objects and dense arrays, rejects cycles/exotic prototypes/accessors/symbols
@@ -471,6 +529,22 @@ frozen `ValidatedRepositoryCursorPayload`; no sort-only/partial decoder is
 exported, and `compileCursor` accepts only that fully validated payload.
 Canonical re-encoding after changing any boundary, plus reuse across any
 context boundary, raises `VALIDATION_ERROR`.
+Neither List codec accepts a caller-selected `selectionHash`. The codec
+derives it as `sha256Hex(canonicalJson(context))`, where the only List-page
+context is `{v:1,kind:"lists",snapshotId}` and the membership context is the
+exact `{v:1,kind:"list_memberships",snapshotId,selector}` union above.
+Canonical object-key ordering is therefore part of the wire contract. Lock
+these vectors in tests:
+
+```text
+{"kind":"lists","snapshotId":"snap_1","v":1}
+  -> ebacad18c114f59f8b4a83de0dd9a0d62b4b336beccaaa64a36fbe7f5ea17230
+{"kind":"list_memberships","selector":{"kind":"list","listId":"L_1"},"snapshotId":"snap_1","v":1}
+  -> 0ca224c01b214e4f2b666ebad73a4031237f8623aa9a5da850d9c13394ee76b9
+{"kind":"list_memberships","selector":{"kind":"repository","repositoryId":"R_1"},"snapshotId":"snap_1","v":1}
+  -> 44f61d13268a2be2b6b420fe28536027f1ce9f6f05c62e9753cd4ad64bf992f9
+```
+
 Every nullable sort uses explicit `NULLS LAST` semantics in both directions,
 encoded null markers, and a stable ID final key. Tests cover null/non-null
 boundaries, duplicate sort values, empty final pages, cursor tampering, and
@@ -638,10 +712,13 @@ git commit -m "feat: define immutable plans and run lifecycle"
 **Files:**
 - Create: `src/app/ports/storage-port.ts`
 - Create: `test/fixtures/memory-storage.ts`, `test/unit/ports/storage-port.test.ts`
+- Modify: `src/domain/snapshot.ts`, `src/domain/filter.ts`, `src/domain/cursor.ts`, `src/domain/run.ts`, `test/fixtures/domain.ts`
 
 **Interfaces:**
 - Consumes: all domain contracts from Tasks 2, 4, 5.
-- Produces: exact port for plans 02/03 and `SQLiteStore`.
+- Produces: exact port for plans 02/03 and `SQLiteStore`, bounded List
+  membership pages, immutable dispatch-attempt history, strict storage
+  parsers, and a faithful in-memory contract implementation.
 
 - [ ] **Step 1: Write the failing fake-port contract test**
 
@@ -649,10 +726,20 @@ git commit -m "feat: define immutable plans and run lifecycle"
 import { expect, test } from "vitest";
 import type { StoragePort } from "../../../src/app/ports/storage-port.js";
 import { createMemoryStorage } from "../../fixtures/memory-storage.js";
-test("StoragePort transactions are synchronous", () => {
+test("transactions are synchronous, rollback thenables, and revoke leaked facades", () => {
   const store: StoragePort = createMemoryStorage();
+  store.migrate();
   expect(store.withTransaction(() => "committed")).toBe("committed");
-  expect(store.getSchemaVersion()).toBe(1); store.close();
+  let leaked: unknown;
+  expect(() => store.withTransaction((tx) => {
+    leaked=tx;
+    tx.savePlan(changePlanFixture);
+    return Promise.resolve("must roll back");
+  })).toThrow(/synchronous|thenable/iu);
+  expect(store.getPlan(changePlanFixture.id)).toBeNull();
+  expect(() => (leaked as StorageTransaction).getPlan(changePlanFixture.id)).toThrow();
+  expect(store.getSchemaVersion()).toBe(1);
+  store.close();
 });
 ```
 
@@ -662,37 +749,78 @@ Run `npm test -- test/unit/ports/storage-port.test.ts`; expect FAIL resolving `s
 - [ ] **Step 3: Define every exact method**
 
 ```ts
-export interface Lease { readonly name:string; readonly ownerId:string; readonly acquiredAt:string; readonly expiresAt:string }
+export interface Lease { readonly name:string; readonly ownerId:string; readonly acquiredAt:string; readonly heartbeatAt:string; readonly expiresAt:string }
 export interface AcquireLeaseInput { readonly name:string; readonly ownerId:string; readonly now:string; readonly expiresAt:string }
-export interface AuditPage { readonly items:readonly RunOperation[]; readonly nextSequence:number|null }
+export interface LeaseGuard { readonly name:string; readonly ownerId:string; readonly now:string }
+export interface CompleteSnapshotInput { readonly id:SnapshotId; readonly completedAt:string; readonly listCoverage:Exclude<ListCoverage,"collecting">; readonly counts:SnapshotCounts; readonly warningCount:number; readonly sourceRateLimit:JsonValue|null; readonly lease:LeaseGuard }
+export interface FailSnapshotInput { readonly id:SnapshotId; readonly failedAt:string; readonly sourceRateLimit:JsonValue|null; readonly lease:LeaseGuard }
+export interface AuditPage { readonly items:readonly RunOperation[]; readonly total:number; readonly nextSequence:number|null }
+export type RunOperationCounts=Readonly<Record<RunOperationStatus,number>>;
+export interface IncompleteRunSummary { readonly runId:RunId; readonly planId:PlanId; readonly state:"pending"|"running"|"partial"; readonly startedAt:string; readonly finishedAt:string|null; readonly counts:RunOperationCounts }
+export interface IncompleteRunSummaries { readonly items:readonly IncompleteRunSummary[]; readonly total:number; readonly truncated:boolean }
+export type RunOperationAttemptStatus="running"|"succeeded"|"failed"|"unresolved";
+interface RunOperationAttemptBase { readonly runId:RunId;readonly operationId:string;readonly attempt:number;readonly before:JsonValue;readonly startedAt:string }
+export type RunOperationAttempt =
+  | Readonly<RunOperationAttemptBase & {status:"running";reconciliation:"pending";after:null;externalRequestId:null;error:null;finishedAt:null}>
+  | Readonly<RunOperationAttemptBase & {status:"succeeded";reconciliation:"not_required";after:JsonValue;externalRequestId:string|null;error:null;finishedAt:string}>
+  | Readonly<RunOperationAttemptBase & {status:"failed";reconciliation:"confirmed_not_applied";after:JsonValue;externalRequestId:string|null;error:SerializedDomainError;finishedAt:string}>
+  | Readonly<RunOperationAttemptBase & {status:"unresolved";reconciliation:"unknown";after:JsonValue;externalRequestId:string|null;error:SerializedDomainError&{readonly retryable:false};finishedAt:string}>;
+export interface RunOperationAttemptPage { readonly items:readonly RunOperationAttempt[]; readonly total:number; readonly nextAttempt:number|null }
+interface RunOperationReconciliationBase { readonly runId:RunId;readonly operationId:string;readonly attempt:number;readonly eventSequence:number;readonly after:JsonValue;readonly observedAt:string }
+export type RunOperationReconciliation =
+  | Readonly<RunOperationReconciliationBase & {status:"succeeded";reconciliation:"confirmed_applied";error:null}>
+  | Readonly<RunOperationReconciliationBase & {status:"failed";reconciliation:"confirmed_not_applied";error:SerializedDomainError&{readonly retryable:true}}>
+  | Readonly<RunOperationReconciliationBase & {status:"unresolved";reconciliation:"unknown";error:SerializedDomainError&{readonly retryable:false}}>;
+export interface RunOperationReconciliationPage { readonly items:readonly RunOperationReconciliation[]; readonly total:number; readonly nextEventSequence:number|null }
+interface FinishBeforeDispatchBase { readonly phase:"before_dispatch";readonly runId:RunId;readonly operationId:string;readonly finishedAt:string;readonly lease:LeaseGuard }
+interface FinishAfterDispatchBase { readonly phase:"after_dispatch";readonly runId:RunId; readonly operationId:string; readonly externalRequestId:string|null; readonly after:JsonValue; readonly finishedAt:string; readonly lease:LeaseGuard }
+export type FinishRunOperationInput =
+  | Readonly<FinishBeforeDispatchBase & {readonly status:"skipped";readonly reconciliation:"not_required";readonly error:null}>
+  | Readonly<FinishBeforeDispatchBase & {readonly status:"failed";readonly reconciliation:"confirmed_not_applied";readonly error:SerializedDomainError}>
+  | Readonly<FinishAfterDispatchBase & {readonly status:"succeeded";readonly reconciliation:"not_required";readonly error:null}>
+  | Readonly<FinishAfterDispatchBase & {readonly status:"failed";readonly reconciliation:"confirmed_not_applied";readonly error:SerializedDomainError}>
+  | Readonly<FinishAfterDispatchBase & {readonly status:"unresolved";readonly reconciliation:"unknown";readonly error:SerializedDomainError&{readonly retryable:false}}>;
+interface ReconcileBase { readonly runId:RunId; readonly operationId:string; readonly after:JsonValue; readonly observedAt:string; readonly lease:LeaseGuard }
+export type ReconcileRunOperationInput =
+  | Readonly<ReconcileBase & {readonly status:"succeeded";readonly reconciliation:"confirmed_applied";readonly error:null}>
+  | Readonly<ReconcileBase & {readonly status:"failed";readonly reconciliation:"confirmed_not_applied";readonly error:SerializedDomainError&{readonly retryable:true}}>
+  | Readonly<ReconcileBase & {readonly status:"unresolved";readonly reconciliation:"unknown";readonly error:SerializedDomainError&{readonly retryable:false}}>;
 export interface StorageTransaction {
-  createSnapshot(draft:SnapshotDraft):Snapshot;
-  appendSnapshotBatch(id:SnapshotId,batch:SnapshotBatch):void;
-  completeSnapshot(input:{readonly id:SnapshotId;readonly completedAt:string;readonly counts:SnapshotCounts;readonly warningCount:number;readonly sourceRateLimit:JsonValue|null}):Snapshot;
-  failSnapshot(input:{readonly id:SnapshotId;readonly failedAt:string;readonly sourceRateLimit:JsonValue|null}):Snapshot;
+  assertLease(guard:LeaseGuard):Lease;
+  createSnapshot(input:{readonly draft:SnapshotDraft;readonly lease:LeaseGuard}):Snapshot;
+  appendSnapshotBatch(input:{readonly id:SnapshotId;readonly batch:SnapshotBatch;readonly lease:LeaseGuard}):void;
+  beginSnapshotVerification(input:{readonly id:SnapshotId;readonly listCoverage:Exclude<ListCoverage,"collecting">;readonly lease:LeaseGuard}):void;
+  appendSnapshotVerificationBatch(input:{readonly id:SnapshotId;readonly batch:SnapshotVerificationBatch;readonly lease:LeaseGuard}):void;
+  finishSnapshotVerification(input:{readonly id:SnapshotId;readonly lease:LeaseGuard}):void;
+  completeSnapshot(input:CompleteSnapshotInput):Snapshot;
+  failSnapshot(input:FailSnapshotInput):Snapshot;
   getCompleteSnapshot(id:SnapshotId):Snapshot|null;
   getLatestCompleteSnapshot(binding:AccountBinding):Snapshot|null;
   getRepositoryMetadata(id:RepositoryId):ObservedRepositoryMetadata|null;
   getSnapshotRepository(snapshotId:SnapshotId,repositoryId:RepositoryId):RepositoryView|null;
-  getSnapshotList(snapshotId:SnapshotId,listId:UserListId):ListView|null;
+  getSnapshotListSummary(snapshotId:SnapshotId,listId:UserListId):ListSummary|null;
   queryRepositories(input:RepositoryQuery):RepositoryQueryPage;
   queryLists(input:ListQuery):ListQueryPage;
+  queryListMemberships(input:ListMembershipQuery):ListMembershipQueryPage;
   hasStar(snapshotId:SnapshotId,repositoryId:RepositoryId):boolean;
   savePlan(plan:ChangePlan):void;
   getPlan(id:PlanId):ChangePlan|null;
   compareAndSetPlanState(input:{readonly planId:PlanId;readonly expected:readonly PlanState[];readonly next:PlanState}):ChangePlan;
-  createRun(run:ChangeRun):void;
+  createRun(input:{readonly run:ChangeRun;readonly lease:LeaseGuard}):void;
   getRun(id:RunId):ChangeRun|null;
   getLatestRunForPlan(planId:PlanId):ChangeRun|null;
-  compareAndSetRunState(input:{readonly runId:RunId;readonly expected:readonly RunState[];readonly next:RunState;readonly finishedAt:string|null}):ChangeRun;
-  createRunOperation(operation:RunOperation):void;
-  startRunOperation(input:{readonly runId:RunId;readonly operationId:string;readonly startedAt:string}):RunOperation;
+  compareAndSetRunState(input:{readonly runId:RunId;readonly expected:readonly RunState[];readonly next:RunState;readonly finishedAt:string|null;readonly lease:LeaseGuard}):ChangeRun;
+  createRunOperation(input:{readonly operation:RunOperation;readonly lease:LeaseGuard}):void;
+  startRunOperation(input:{readonly runId:RunId;readonly operationId:string;readonly startedAt:string;readonly lease:LeaseGuard}):RunOperation;
   getRunOperation(input:{readonly runId:RunId;readonly operationId:string}):RunOperation|null;
-  retryRunOperation(input:{readonly runId:RunId;readonly operationId:string}):RunOperation;
+  retryRunOperation(input:{readonly runId:RunId;readonly operationId:string;readonly maxAttempts:number;readonly lease:LeaseGuard}):RunOperation;
   listRunOperations(runId:RunId):readonly RunOperation[];
   listRunOperationsPage(input:{readonly runId:RunId;readonly afterSequence:number|null;readonly pageSize:number}):AuditPage;
-  finishRunOperation(input:{readonly runId:RunId;readonly operationId:string;readonly status:Exclude<RunOperationStatus,"pending"|"running">;readonly reconciliation:ReconciliationStatus;readonly attempts:number;readonly externalRequestId:string|null;readonly before:JsonValue;readonly after:JsonValue;readonly error:SerializedDomainError|null;readonly finishedAt:string}):RunOperation;
-  reconcileRunOperation(input:{readonly runId:RunId;readonly operationId:string;readonly status:"succeeded"|"failed"|"unresolved";readonly reconciliation:"confirmed_applied"|"confirmed_not_applied"|"unknown";readonly externalRequestId:string|null;readonly after:JsonValue;readonly error:SerializedDomainError|null;readonly finishedAt:string}):RunOperation;
+  finishRunOperation(input:FinishRunOperationInput):RunOperation;
+  reconcileRunOperation(input:ReconcileRunOperationInput):RunOperation;
+  getRunOperationAttempt(input:{readonly runId:RunId;readonly operationId:string;readonly attempt:number}):RunOperationAttempt|null;
+  listRunOperationAttemptsPage(input:{readonly runId:RunId;readonly operationId:string;readonly afterAttempt:number|null;readonly pageSize:number}):RunOperationAttemptPage;
+  listRunOperationReconciliationsPage(input:{readonly runId:RunId;readonly operationId:string;readonly afterEventSequence:number|null;readonly pageSize:number}):RunOperationReconciliationPage;
   acquireLease(input:AcquireLeaseInput):Lease|null;
   renewLease(input:AcquireLeaseInput):Lease;
   releaseLease(input:{readonly name:string;readonly ownerId:string}):void;
@@ -700,29 +828,189 @@ export interface StorageTransaction {
 export interface StoragePort extends StorageTransaction {
   migrate():void; getSchemaVersion():number;
   withTransaction<T>(fn:(tx:StorageTransaction)=>T):T;
+  getIncompleteRunSummaries(input:{readonly binding:AccountBinding;readonly limit:number}):IncompleteRunSummaries;
+  recoverAbandonedSnapshots(input:{readonly binding:AccountBinding;readonly lease:LeaseGuard}):readonly SnapshotId[];
+  recoverAbandonedRuns(input:{readonly binding:AccountBinding;readonly lease:LeaseGuard}):readonly RunId[];
   recoverIncompleteSnapshots(now:string):readonly SnapshotId[];
   recoverInterruptedRuns(now:string):readonly RunId[];
   close():void;
 }
 ```
 
-`memory-storage.ts` implements every method with Maps and structured clones;
-transactions snapshot Maps and restore on throw. Its tests prove
-`createRunOperation` inserts only `pending` with zero attempts,
-`startRunOperation` performs the sole `pending→running` CAS and increments
-attempts, and `retryRunOperation` changes only reconciled-unresolved or
-retryable-failed rows back to `pending` without changing attempts. Succeeded
-rows remain immutable. It exposes no raw SQL, generic query, `execute`, or
-async transaction. Its query implementation owns a private injected cursor
-codec; the cursor signing key is never a `StoragePort` method or property.
+`Snapshot`, query-page, attempt, reconciliation-event, and storage-input schemas strictly parse a
+descriptor-safe clone, reject unknown fields/aliases, and deeply freeze all
+returned values. The language aggregate is an ordered array rather than a
+property-keyed record, so a GitHub language such as `__proto__` is inert.
+`ListSummary` exposes `repositoryCount` and never embeds members.
+`queryListMemberships` is the only membership read and returns a strict
+direction-specific ID page (`repositoryIds` for List selection or `listIds`
+for repository selection) with a cursor authenticated against the exact
+snapshot and selector. Every List query and List-dependent repository filter
+rejects a snapshot whose coverage is not `complete`; other repository queries
+remain available.
+
+`memory-storage.ts` starts unmigrated, initializes a private random 32-byte
+cursor key only in `migrate()`, and rejects all other operations before ready.
+A deterministic key may be injected only through the fixture factory input;
+no key/codec getter, own property, transaction snapshot, error, or log is
+exposed. Repeated migration and close are idempotent. Writes parse detached
+copies; reads return new frozen detached values. Snapshot metadata versions
+and current pointers advance monotonically, and a completed snapshot remains
+unchanged after later metadata observations.
+
+Snapshot coverage transitions are exact: `collecting -> complete`,
+`unavailable -> unavailable`, and `omitted -> omitted`. No other publication
+pair is legal. A non-empty List/membership batch is accepted only while the
+building snapshot is `collecting`; unavailable/omitted snapshots always retain
+zero List/membership rows. An unsupported remote union member or interrupted
+List traversal fails the snapshot while it is still collecting and can never
+be downgraded into a publishable unavailable/omitted snapshot.
+After all first-pass batches, `beginSnapshotVerification` creates a private
+empty verification set for the requested final coverage.
+`appendSnapshotVerificationBatch` accepts at most 100 Stars, Lists, and
+memberships per call; a repeated Star/List/membership identity in that
+verification traversal is a collection-change error, never an idempotent
+upsert. `finishSnapshotVerification` marks the second traversal complete but
+does not publish. `completeSnapshot` is legal only after that marker and
+compares the staged and verification Stars `(repositoryId,starredAt)`, every
+normalized List metadata field, and memberships `(listId,repositoryId)` as
+order-independent exact sets. A mismatch rolls back publication. Verification
+rows are private implementation state, never queryable through `StoragePort`,
+and are cleared only in the same successful completion or failure/recovery
+transaction.
+The strict Snapshot parser also rejects `building|failed + complete`,
+`complete + collecting`, mismatched lifecycle timestamps, final
+unavailable/omitted counts above zero, and any nonnegative-count/rate-limit
+shape violation.
+
+Every guarded mutation atomically proves the exact lease owner and
+`expiresAt > now`. `acquireLease` returns null for every unexpired lease,
+including the same owner; it can take over only at `expiresAt <= now`.
+Only `renewLease` may extend the exact same owner and it preserves
+`acquiredAt`; a wrong-owner renew/release raises `PRECONDITION_FAILED`.
+Each service `LeaseScope` uses a fresh unpredictable owner ID, so two
+concurrent calls in one process cannot become same-owner entrants.
+`createRun` requires
+`pending/finishedAt:null`, exact plan binding, and a globally unique
+`planId`. `createRunOperation` accepts only a canonical
+`pending/not_required/attempts:0` row whose operation ID and zero-based
+sequence match that run's immutable plan. It also requires plan `applying`,
+run `running`, exact run/plan binding, and canonical equality between the
+audit row's `before` and the resolved plan operation's `before`. Duplicate
+create/save calls compare only immutable initial content and never reset a
+lifecycle that has advanced.
+
+`parseRunOperation`, `parseRunOperationAttempt`, and
+`parseRunOperationReconciliation` enforce the complete matrix, not just enum
+membership:
+
+- initial/retried projection: `pending/not_required`, null start/finish,
+  request/error/after, attempts zero for initial or positive after retry;
+- dispatch projection: `running/pending`, attempts at least one, non-null
+  start, null finish/error;
+- skipped: `skipped/not_required`, no attempt/start/request/error, null after;
+- success: `succeeded` with `not_required` direct dispatch or
+  `confirmed_applied` reconciliation, no error;
+- failure: `failed/confirmed_not_applied` with error; only a retryable error
+  can enter retry;
+- unresolved: `unresolved/unknown`, attempts at least one, non-null
+  start/finish and non-retryable error;
+- attempt rows: only running/pending, succeeded/not_required,
+  failed/confirmed_not_applied, or unresolved/unknown; no skipped attempt;
+- reconciliation events: only succeeded/confirmed_applied with null error,
+  failed/confirmed_not_applied with retryable error, or unresolved/unknown
+  with non-retryable error.
+
+`startRunOperation` is one lease-guarded CAS that proves run `running`, plan
+`applying`, moves `pending -> running`, increments attempts, and appends the
+matching immutable attempt intent. Nothing may await between its return and
+transport dispatch. Live precondition reads must therefore occur before
+`startRunOperation`; an already-desired or rejected precondition uses
+`phase:"before_dispatch"` and creates no attempt. The prepared mutation's
+`dispatchPrepared` method must synchronously initiate the one transport call
+before returning its Promise.
+
+`finishRunOperation` never accepts caller `before` or `attempts`.
+Before-dispatch finish accepts no caller request ID/after state and stores
+`null` for both; after-dispatch finish finalizes the current attempt and
+projection exactly once. `reconcileRunOperation` accepts only an unresolved
+projection, preserves the immutable attempt—including its original ambiguous
+`finishedAt`—appends a new `RunOperationReconciliation` event, and updates only
+the projection. Every subsequent unknown readback appends another event rather
+than overwriting history. A reconciliation event classified
+`confirmed_not_applied` must be retryable; a definitive before-dispatch or
+transport failure with the same reconciliation may be non-retryable. An
+`unknown` error must not be retryable.
+
+`retryRunOperation` accepts only
+`failed + confirmed_not_applied + error.retryable + attempts < maxAttempts`.
+It never accepts unresolved/unknown, never deletes attempt rows, preserves
+before/attempts, and clears projection start/finish/error/request/after before
+returning to `pending/not_required`. Succeeded and skipped rows are immutable.
+Attempt and reconciliation-event history is never deleted. Audit pages validate integer sizes `1..100`, reject negative boundaries or a
+boundary beyond the actual maximum, include a total over the whole selection,
+and set the next boundary to the last returned
+sequence/attempt/event-sequence only when more rows exist. Incomplete-run
+summaries are bounded, include all operation-status counts, and report
+total/truncation without an unbounded row array.
+
+Every compare-and-set first validates the requested domain transition even
+when the expected value matches. The expected array must be non-empty and
+unique, and every listed `expected -> next` edge must be legal before storage
+is read. Missing IDs raise `NOT_FOUND`; an actual state outside expected or an
+illegal/self edge raises `PRECONDITION_FAILED`. Run terminal `finishedAt`
+must be fresh and not precede start; `partial -> running` clears it and
+atomically rebinds the run's private stored lease name/owner to the new guard.
+Startup recovery skips snapshots/runs whose stored exact-owner lease remains
+active. Pending rows recover to retryable
+`failed/confirmed_not_applied` without an attempt; running attempts and
+projections recover to `unresolved/unknown`; the owning run/plan become
+partial exactly once.
+The two targeted recovery methods first validate the newly acquired
+account-scoped sync/apply guard, restrict candidates to its exact binding, and
+perform the same atomic transition. A lease takeover can therefore unblock
+abandoned work immediately in a long-running process rather than waiting for
+another restart.
+
+`withTransaction` rejects nesting and any call through the root store while a
+callback is active; only its transaction facade may access state. Calls to
+root `migrate`, `close`, or another `withTransaction` are likewise rejected.
+It supplies a revocable transaction facade.
+It rolls back every Map/index/lease/attempt mutation on throw, native Promise,
+proxy, or any callable-data/accessor/inherited thenable detected by walking
+descriptors without reading or invoking `then`. The facade is revoked before
+commit/rollback returns, so a captured
+`tx` cannot mutate later. It exposes no raw SQL, generic query, `execute`, or
+async transaction.
 
 - [ ] **Step 4: Verify exact structural compliance**
-Run `npm test -- test/unit/ports/storage-port.test.ts && npm run typecheck && npm run lint`; expect one pass and exact fake-port structural compliance.
+Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.test.ts test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect all tests pass, including:
+
+- commit/throw rollback; native Promise; own/inherited data or accessor
+  `then` with zero getter calls; Proxy result; nested transaction; root-store
+  reentry; and leaked facade calls after both commit and rollback;
+- detached/deep-frozen reads after caller mutation, hostile
+  accessor/proxy/symbol/sparse/custom-prototype input, and inert
+  `__proto__` language values;
+- all coverage transitions, batch 101 rejection, count rollback, immutable
+  metadata pinning, exact staged/verification set equality, reordered
+  verification batches accepted, duplicate or added/removed/changed
+  Star/List/membership verification rejected, repository/List/two-direction
+  membership cursor tamper/cross-context pages, runtime-brand lookalikes and
+  locked selection-hash vectors, and aggregates independent of cursor;
+- one-plan-one-run, binding/ID/sequence/before validation, idempotency without
+  lifecycle reset, full CAS/finished-time/resume-lease matrix;
+- every legal and illegal operation/attempt/reconciliation combination,
+  pending finish without attempt, multi-attempt preservation, append-only
+  reconciliation events, max-attempt boundary, and bounded audit pages;
+- active same-owner reacquire rejection, lease renewal/takeover/wrong
+  owner/backward time, exact-owner recovery skip, idempotent expired recovery,
+  and bounded incomplete-run totals.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/app/ports/storage-port.ts test/fixtures/memory-storage.ts test/unit/ports/storage-port.test.ts
+git add src/app/ports/storage-port.ts src/domain/snapshot.ts src/domain/filter.ts src/domain/cursor.ts src/domain/run.ts test/fixtures/domain.ts test/fixtures/memory-storage.ts test/unit/ports/storage-port.test.ts test/unit/domain/filter.test.ts test/unit/domain/plan-run.test.ts
 git commit -m "feat: define synchronous storage port"
 ```
 
@@ -743,33 +1031,51 @@ git commit -m "feat: define synchronous storage port"
 
 ```ts
 import { expect, test } from "vitest";
+import { createCursorCodec } from "../../../src/domain/cursor.js";
 import { migrateSqliteDatabase, openSqliteDatabase } from "../../../src/storage/sqlite-database.js";
 import { SnapshotRepository } from "../../../src/storage/snapshot-repository.js";
 import { LeaseRepository } from "../../../src/storage/lease-repository.js";
 import { snapshotBatchFixture, snapshotDraftFixture } from "../../fixtures/domain.js";
 test("hides building rows and publishes only after verification", () => {
-  const db=openSqliteDatabase(":memory:"); migrateSqliteDatabase(db,"2026-07-16T00:00:00Z");
-  const snapshots=new SnapshotRepository(db);
-  const building=snapshots.createSnapshot(snapshotDraftFixture);
-  snapshots.appendSnapshotBatch(building.id,snapshotBatchFixture);
+  const db=openSqliteDatabase(":memory:"); migrateSqliteDatabase(db,"2026-07-16T00:00:00.000Z");
+  const leases=new LeaseRepository(db);
+  leases.acquireLease({name:"sync:account",ownerId:"p1",now:"2026-07-16T00:00:00.000Z",expiresAt:"2026-07-16T00:05:00.000Z"});
+  const guard={name:"sync:account",ownerId:"p1",now:"2026-07-16T00:01:00.000Z"} as const;
+  const snapshots=new SnapshotRepository(db,createCursorCodec(new Uint8Array(32).fill(7)));
+  const building=snapshots.createSnapshot({draft:snapshotDraftFixture,lease:guard});
+  snapshots.appendSnapshotBatch({id:building.id,batch:snapshotBatchFixture,lease:guard});
   expect(snapshots.getCompleteSnapshot(building.id)).toBeNull();
-  const saved=snapshots.completeSnapshot({id:building.id,completedAt:"2026-07-16T01:00:00Z",counts:{repositories:1,stars:1,lists:1,memberships:1},warningCount:0,sourceRateLimit:null});
+  snapshots.beginSnapshotVerification({id:building.id,listCoverage:"complete",lease:guard});
+  snapshots.appendSnapshotVerificationBatch({
+    id:building.id,
+    batch:{
+      stars:snapshotBatchFixture.stars,
+      lists:snapshotBatchFixture.lists,
+      memberships:snapshotBatchFixture.memberships,
+    },
+    lease:guard,
+  });
+  snapshots.finishSnapshotVerification({id:building.id,lease:guard});
+  const saved=snapshots.completeSnapshot({id:building.id,completedAt:"2026-07-16T00:02:00.000Z",listCoverage:"complete",counts:{repositories:1,stars:1,lists:1,memberships:1},warningCount:0,sourceRateLimit:null,lease:guard});
   expect(snapshots.getCompleteSnapshot(saved.id)?.counts.repositories).toBe(1);
-  expect(db.pragma("foreign_keys",{simple:true})).toBe(1); db.close();
+  expect(db.pragma("foreign_keys",{simple:true})).toBe(1);
+  expect(db.pragma("synchronous",{simple:true})).toBe(2); db.close();
 });
 test("lease expires before another owner acquires", () => {
-  const db=openSqliteDatabase(":memory:"); migrateSqliteDatabase(db,"2026-07-16T00:00:00Z");
+  const db=openSqliteDatabase(":memory:"); migrateSqliteDatabase(db,"2026-07-16T00:00:00.000Z");
   const leases=new LeaseRepository(db);
-  expect(leases.acquireLease({name:"sync",ownerId:"p1",now:"2026-07-16T00:00:00Z",expiresAt:"2026-07-16T00:05:00Z"})?.ownerId).toBe("p1");
-  expect(leases.acquireLease({name:"sync",ownerId:"p2",now:"2026-07-16T00:01:00Z",expiresAt:"2026-07-16T00:06:00Z"})).toBeNull();
+  expect(leases.acquireLease({name:"sync",ownerId:"p1",now:"2026-07-16T00:00:00.000Z",expiresAt:"2026-07-16T00:05:00.000Z"})?.ownerId).toBe("p1");
+  expect(leases.acquireLease({name:"sync",ownerId:"p1",now:"2026-07-16T00:00:30.000Z",expiresAt:"2026-07-16T00:06:00.000Z"})).toBeNull();
+  expect(leases.acquireLease({name:"sync",ownerId:"p2",now:"2026-07-16T00:01:00.000Z",expiresAt:"2026-07-16T00:06:00.000Z"})).toBeNull();
+  expect(leases.renewLease({name:"sync",ownerId:"p1",now:"2026-07-16T00:01:30.000Z",expiresAt:"2026-07-16T00:07:00.000Z"})?.acquiredAt).toBe("2026-07-16T00:00:00.000Z");
   db.close();
 });
 test("later metadata observations cannot change a completed snapshot", () => {
-  const db=openSqliteDatabase(":memory:"); migrateSqliteDatabase(db,"2026-07-16T00:00:00Z");
-  const snapshots=new SnapshotRepository(db);
-  const first=completeSnapshotWith(snapshots,{stars:10,observedAt:"2026-07-16T00:00:00Z"});
+  const db=openSqliteDatabase(":memory:"); migrateSqliteDatabase(db,"2026-07-16T00:00:00.000Z");
+  const snapshots=new SnapshotRepository(db,createCursorCodec(new Uint8Array(32).fill(7)));
+  const first=completeSnapshotWith(snapshots,{stars:10,observedAt:"2026-07-16T00:00:00.000Z"});
   const before=snapshots.getSnapshotRepository(first.id,asRepositoryId("R_1"));
-  completeSnapshotWith(snapshots,{stars:20,observedAt:"2026-07-17T00:00:00Z"});
+  completeSnapshotWith(snapshots,{stars:20,observedAt:"2026-07-17T00:00:00.000Z"});
   expect(snapshots.getSnapshotRepository(first.id,asRepositoryId("R_1"))).toEqual(before);
   expect(snapshots.queryRepositories(queryFor(first.id)).items[0]?.stargazerCount).toBe(10);
   db.close();
@@ -781,85 +1087,478 @@ Run `npm test -- test/integration/storage/snapshot.test.ts`; expect FAIL resolvi
 
 - [ ] **Step 3: Implement schema and focused repositories**
 
-Migration 001 creates:
+Migration 001 creates only `STRICT` tables. Every JSON text column has
+`CHECK(json_valid(...))` and, for arrays, the corresponding
+`json_type(...)=` check. Every Boolean, enum, nonnegative count, lifecycle
+timestamp, hash, and relationship is constrained in SQL as well as parsed by
+the domain boundary. The schema includes the tables listed below; omitted
+Repository/List payload columns are the exact normalized fields from Task 2.
 
 ```sql
-CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
-CREATE TABLE runtime_secrets(name TEXT PRIMARY KEY,value BLOB NOT NULL CHECK(length(value)>=32),created_at TEXT NOT NULL);
-CREATE TABLE accounts(host TEXT NOT NULL,login TEXT NOT NULL,account_id TEXT NOT NULL,PRIMARY KEY(host,account_id),UNIQUE(host,login));
-CREATE TABLE repositories(repository_id TEXT PRIMARY KEY,repository_database_id TEXT NOT NULL UNIQUE,current_version_hash TEXT,observed_at TEXT NOT NULL);
-CREATE TABLE repository_versions(repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,version_hash TEXT NOT NULL,owner TEXT NOT NULL,name TEXT NOT NULL,full_name TEXT NOT NULL,description TEXT,url TEXT NOT NULL,stargazer_count INTEGER NOT NULL CHECK(stargazer_count>=0),is_fork INTEGER NOT NULL CHECK(is_fork IN(0,1)),is_archived INTEGER NOT NULL CHECK(is_archived IN(0,1)),is_disabled INTEGER NOT NULL CHECK(is_disabled IN(0,1)),is_private INTEGER NOT NULL CHECK(is_private IN(0,1)),visibility TEXT NOT NULL CHECK(visibility IN('public','private','internal')),primary_language TEXT,topics_json TEXT NOT NULL,license_spdx_id TEXT,pushed_at TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(repository_id,version_hash));
-CREATE TABLE snapshots(snapshot_id TEXT PRIMARY KEY,host TEXT NOT NULL,login TEXT NOT NULL,account_id TEXT NOT NULL,mode TEXT NOT NULL,status TEXT NOT NULL CHECK(status IN('building','complete','failed')),started_at TEXT NOT NULL,completed_at TEXT,failed_at TEXT,repositories_count INTEGER NOT NULL DEFAULT 0,stars_count INTEGER NOT NULL DEFAULT 0,lists_count INTEGER NOT NULL DEFAULT 0,memberships_count INTEGER NOT NULL DEFAULT 0,warning_count INTEGER NOT NULL DEFAULT 0,source_rate_limit_json TEXT,FOREIGN KEY(host,account_id) REFERENCES accounts(host,account_id));
-CREATE TABLE snapshot_stars(snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id) ON DELETE CASCADE,repository_id TEXT NOT NULL,version_hash TEXT NOT NULL,observed_at TEXT NOT NULL,starred_at TEXT NOT NULL,PRIMARY KEY(snapshot_id,repository_id),FOREIGN KEY(repository_id,version_hash) REFERENCES repository_versions(repository_id,version_hash));
-CREATE TABLE user_lists(snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id) ON DELETE CASCADE,list_id TEXT NOT NULL,name TEXT NOT NULL,slug TEXT NOT NULL,description TEXT,is_private INTEGER NOT NULL CHECK(is_private IN(0,1)),created_at TEXT NOT NULL,updated_at TEXT NOT NULL,last_added_at TEXT,PRIMARY KEY(snapshot_id,list_id));
-CREATE TABLE list_memberships(snapshot_id TEXT NOT NULL,list_id TEXT NOT NULL,repository_id TEXT NOT NULL,PRIMARY KEY(snapshot_id,list_id,repository_id),FOREIGN KEY(snapshot_id,list_id) REFERENCES user_lists(snapshot_id,list_id) ON DELETE CASCADE,FOREIGN KEY(snapshot_id,repository_id) REFERENCES snapshot_stars(snapshot_id,repository_id) ON DELETE CASCADE);
-CREATE TABLE repository_evidence(repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,source_ref TEXT NOT NULL,etag TEXT,content TEXT NOT NULL,truncated INTEGER NOT NULL CHECK(truncated IN(0,1)),fetched_at TEXT NOT NULL,expires_at TEXT NOT NULL,PRIMARY KEY(repository_id,source_ref));
-CREATE TABLE plans(plan_id TEXT PRIMARY KEY,state TEXT NOT NULL,host TEXT NOT NULL,login TEXT NOT NULL,account_id TEXT NOT NULL,snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id),hash TEXT NOT NULL,executable_json TEXT NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL,caller_note TEXT,warnings_json TEXT NOT NULL,summary_json TEXT NOT NULL);
-CREATE TABLE plan_operations(plan_id TEXT NOT NULL REFERENCES plans(plan_id) ON DELETE CASCADE,operation_id TEXT NOT NULL,sequence INTEGER NOT NULL,kind TEXT NOT NULL,operation_json TEXT NOT NULL,PRIMARY KEY(plan_id,operation_id),UNIQUE(plan_id,sequence));
-CREATE TABLE plan_operation_dependencies(plan_id TEXT NOT NULL,operation_id TEXT NOT NULL,depends_on_operation_id TEXT NOT NULL,PRIMARY KEY(plan_id,operation_id,depends_on_operation_id),FOREIGN KEY(plan_id,operation_id) REFERENCES plan_operations(plan_id,operation_id) ON DELETE CASCADE,FOREIGN KEY(plan_id,depends_on_operation_id) REFERENCES plan_operations(plan_id,operation_id) ON DELETE CASCADE);
-CREATE TABLE runs(run_id TEXT PRIMARY KEY,plan_id TEXT NOT NULL REFERENCES plans(plan_id),host TEXT NOT NULL,login TEXT NOT NULL,account_id TEXT NOT NULL,state TEXT NOT NULL,failure_mode TEXT NOT NULL,warnings_json TEXT NOT NULL,started_at TEXT NOT NULL,finished_at TEXT,totals_json TEXT NOT NULL,reconciliation_json TEXT NOT NULL);
-CREATE TABLE run_operations(run_id TEXT NOT NULL REFERENCES runs(run_id) ON DELETE CASCADE,operation_id TEXT NOT NULL,sequence INTEGER NOT NULL,status TEXT NOT NULL,reconciliation TEXT NOT NULL,attempts INTEGER NOT NULL,before_json TEXT NOT NULL,after_json TEXT NOT NULL,external_request_id TEXT,error_json TEXT,started_at TEXT,finished_at TEXT,PRIMARY KEY(run_id,operation_id),UNIQUE(run_id,sequence));
-CREATE TABLE leases(name TEXT PRIMARY KEY,owner_id TEXT NOT NULL,acquired_at TEXT NOT NULL,heartbeat_at TEXT NOT NULL,expires_at TEXT NOT NULL);
+CREATE TABLE schema_migrations(
+  version INTEGER PRIMARY KEY CHECK(version>0),
+  name TEXT NOT NULL UNIQUE,
+  checksum TEXT NOT NULL CHECK(length(checksum)=64 AND checksum NOT GLOB '*[^0-9a-f]*'),
+  applied_at TEXT NOT NULL
+) STRICT;
+CREATE TABLE runtime_secrets(
+  name TEXT PRIMARY KEY,
+  value BLOB NOT NULL CHECK(typeof(value)='blob' AND length(value)>=32),
+  created_at TEXT NOT NULL,
+  CHECK(name<>'cursor_hmac_sha256_v1' OR length(value)=32)
+) STRICT;
+CREATE TABLE leases(
+  name TEXT PRIMARY KEY, owner_id TEXT NOT NULL,
+  acquired_at TEXT NOT NULL, heartbeat_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  CHECK(length(name)>0 AND length(owner_id)>0),
+  CHECK(acquired_at<=heartbeat_at AND heartbeat_at<expires_at)
+) STRICT;
+CREATE TABLE accounts(
+  host TEXT NOT NULL, login TEXT NOT NULL, account_id TEXT NOT NULL,
+  PRIMARY KEY(host,account_id),
+  UNIQUE(host,login),
+  UNIQUE(host,login,account_id)
+) STRICT;
+CREATE TABLE repositories(
+  repository_id TEXT PRIMARY KEY, repository_database_id TEXT NOT NULL UNIQUE,
+  current_version_hash TEXT NOT NULL, observed_at TEXT NOT NULL,
+  FOREIGN KEY(repository_id,current_version_hash)
+    REFERENCES repository_versions(repository_id,version_hash)
+    DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+CREATE TABLE repository_versions(
+  repository_id TEXT NOT NULL,
+  version_hash TEXT NOT NULL CHECK(length(version_hash)=64 AND version_hash NOT GLOB '*[^0-9a-f]*'),
+  owner TEXT NOT NULL, name TEXT NOT NULL, full_name TEXT NOT NULL,
+  description TEXT, url TEXT NOT NULL,
+  stargazer_count INTEGER NOT NULL CHECK(stargazer_count>=0),
+  is_fork INTEGER NOT NULL CHECK(is_fork IN(0,1)),
+  is_archived INTEGER NOT NULL CHECK(is_archived IN(0,1)),
+  is_disabled INTEGER NOT NULL CHECK(is_disabled IN(0,1)),
+  is_private INTEGER NOT NULL CHECK(is_private IN(0,1)),
+  visibility TEXT NOT NULL CHECK(visibility IN('public','private','internal')),
+  primary_language TEXT,
+  topics_json TEXT NOT NULL CHECK(json_valid(topics_json) AND json_type(topics_json)='array'),
+  license_spdx_id TEXT, pushed_at TEXT, updated_at TEXT NOT NULL,
+  PRIMARY KEY(repository_id,version_hash),
+  FOREIGN KEY(repository_id) REFERENCES repositories(repository_id)
+    ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED
+) STRICT;
+CREATE TABLE snapshots(
+  snapshot_id TEXT PRIMARY KEY,
+  host TEXT NOT NULL, login TEXT NOT NULL, account_id TEXT NOT NULL,
+  mode TEXT NOT NULL CHECK(mode IN('full','incremental')),
+  status TEXT NOT NULL CHECK(status IN('building','complete','failed')),
+  list_coverage TEXT NOT NULL CHECK(list_coverage IN('collecting','complete','unavailable','omitted')),
+  lease_name TEXT NOT NULL, lease_owner_id TEXT NOT NULL,
+  started_at TEXT NOT NULL, completed_at TEXT, failed_at TEXT,
+  repositories_count INTEGER NOT NULL DEFAULT 0 CHECK(repositories_count>=0),
+  stars_count INTEGER NOT NULL DEFAULT 0 CHECK(stars_count>=0),
+  lists_count INTEGER NOT NULL DEFAULT 0 CHECK(lists_count>=0),
+  memberships_count INTEGER NOT NULL DEFAULT 0 CHECK(memberships_count>=0),
+  warning_count INTEGER NOT NULL DEFAULT 0 CHECK(warning_count>=0),
+  source_rate_limit_json TEXT CHECK(source_rate_limit_json IS NULL OR json_valid(source_rate_limit_json)),
+  UNIQUE(snapshot_id,host,login,account_id),
+  FOREIGN KEY(host,login,account_id)
+    REFERENCES accounts(host,login,account_id),
+  CHECK(
+    (status='building' AND completed_at IS NULL AND failed_at IS NULL) OR
+    (status='complete' AND completed_at IS NOT NULL AND failed_at IS NULL) OR
+    (status='failed' AND completed_at IS NULL AND failed_at IS NOT NULL)
+  ),
+  CHECK(
+    (status IN('building','failed') AND list_coverage<>'complete') OR
+    (status='complete' AND list_coverage<>'collecting')
+  ),
+  CHECK(list_coverage='complete' OR (lists_count=0 AND memberships_count=0))
+) STRICT;
 ```
 
-Add indexes for complete snapshot binding/time, snapshot repository pagination, and run sequence. `openSqliteDatabase` applies only the pragmas. `migrateSqliteDatabase(db, appliedAt)` applies pending migrations inside `BEGIN IMMEDIATE` and rejects schema newer than the binary.
+`snapshot_stars`, `user_lists`, `list_memberships`, and
+`repository_evidence` use the prior primary keys plus exact composite foreign
+keys; each is `STRICT`. `snapshot_stars` references the exact
+`(repository_id,version_hash)` metadata version. A membership references both
+the same-snapshot List and Star. The three-column account foreign key prevents
+a snapshot from combining one account's stable ID with another account's
+login on the same host; the two independent account uniques alone are not
+treated as an exact binding.
 
-`RuntimeSecretRepository.getOrCreateCursorSigningKey(createdAt)` generates 32
-cryptographically random bytes, inserts them with `INSERT OR IGNORE` inside a
-`BEGIN IMMEDIATE` transaction, then returns a defensive copy of the single
-persisted value. Concurrent/reopened stores therefore share the same
-installation key and old cursors survive restart. `SQLiteStore` constructs the
-cursor codec internally after migration; no application/storage port exposes
-the key, and tests prove it never enters logs, audits, exports, or errors.
-
-`createSnapshot` upserts the bound account then inserts `building`.
-`appendSnapshotBatch` canonicalizes each remote Repository, hashes only its
-query-relevant GitHub metadata, inserts an immutable `repository_versions` row
-idempotently, updates the identity row's current version plus local
-`observed_at`, and links the building snapshot Star to that exact version and
-observation time. It then inserts Lists and memberships only for that building
-ID. Every explicit/latest snapshot query joins `snapshot_stars` to
-`repository_versions` through both stable ID and version hash; it never joins
-the mutable current pointer. Thus a later sync cannot change an older
-snapshot's query results or plan hash. `getRepositoryMetadata` alone follows
-the current version and returns its local observation time for incremental
-reuse. Every incoming GitHub timestamp is canonicalized through the shared
-millisecond UTC utility before persistence.
-
-`queryRepositories` fully decodes/authenticates a cursor against the requested
-snapshot, normalized filter hash, and sort before passing the branded payload
-to `compileCursor`; it signs the next boundary with the same context.
-`queryLists` follows the same rule with one canonical fixed List selection.
-`completeSnapshot` verifies actual SQL counts match supplied counts and
-performs one guarded `building→complete` update. `failSnapshot` and startup
-recovery perform `building→failed`; failed/building snapshots never satisfy
-query methods. Queries compose only the allowlisted SQL compiler, fetch page
-size plus one, and aggregate the complete filtered set.
-
-Lease acquisition uses:
+Second-pass verification is stored separately, so remote page order cannot
+change the result and no repository-sized set is retained in process memory:
 
 ```sql
-INSERT INTO leases(name,owner_id,acquired_at,heartbeat_at,expires_at)
-VALUES(@name,@ownerId,@now,@now,@expiresAt)
-ON CONFLICT(name) DO UPDATE SET
-owner_id=@ownerId,acquired_at=@now,heartbeat_at=@now,expires_at=@expiresAt
-WHERE leases.expires_at<=@now OR leases.owner_id=@ownerId RETURNING *;
+CREATE TABLE snapshot_verifications(
+  snapshot_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL CHECK(status IN('collecting','verified')),
+  list_coverage TEXT NOT NULL
+    CHECK(list_coverage IN('complete','unavailable','omitted')),
+  FOREIGN KEY(snapshot_id) REFERENCES snapshots(snapshot_id) ON DELETE CASCADE
+) STRICT;
+CREATE TABLE snapshot_verification_stars(
+  snapshot_id TEXT NOT NULL, repository_id TEXT NOT NULL, starred_at TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id,repository_id),
+  FOREIGN KEY(snapshot_id) REFERENCES snapshot_verifications(snapshot_id)
+    ON DELETE CASCADE
+) STRICT;
+CREATE TABLE snapshot_verification_lists(
+  snapshot_id TEXT NOT NULL, list_id TEXT NOT NULL,
+  name TEXT NOT NULL, slug TEXT NOT NULL, description TEXT,
+  is_private INTEGER NOT NULL CHECK(is_private IN(0,1)),
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_added_at TEXT,
+  PRIMARY KEY(snapshot_id,list_id),
+  FOREIGN KEY(snapshot_id) REFERENCES snapshot_verifications(snapshot_id)
+    ON DELETE CASCADE
+) STRICT;
+CREATE TABLE snapshot_verification_memberships(
+  snapshot_id TEXT NOT NULL, list_id TEXT NOT NULL, repository_id TEXT NOT NULL,
+  PRIMARY KEY(snapshot_id,list_id,repository_id),
+  FOREIGN KEY(snapshot_id) REFERENCES snapshot_verifications(snapshot_id)
+    ON DELETE CASCADE
+) STRICT;
 ```
 
-Renew and release require the same owner.
+Each verification insert is a strict insert: a duplicate primary key is
+reported as `PRECONDITION_FAILED` with
+`details.reason="collection_changed"`, not ignored. Publication checks all
+three pairs with bidirectional `EXCEPT` over the complete normalized columns;
+there is no hash-only or traversal-order comparison. The verification tables
+have no public query path and are deleted atomically after successful
+publication or when a draft is failed/recovered.
 
-`prepareStateDirectory(path, platform)` creates new POSIX directories with
-mode `0700` and new database files with `0600`. Before and after opening, it
-removes all group/world permission bits from an existing directory, database,
-`-wal`, and `-shm` without adding an owner permission that was absent; failure
-to establish owner-only permissions is a `STORAGE_ERROR`. On Windows it relies
-on the user's inherited ACL, never shells out, and documents that behavior.
-Integration tests inspect POSIX modes, prove a second open does not broaden a
-pre-existing restrictive mode, and skip only the numeric-mode assertions on
-Windows.
+Plan tables are:
 
-- [ ] **Step 4: Verify rollback, foreign keys, queries, and lease ownership**
-Run `npm test -- test/integration/storage/snapshot.test.ts test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect all pass, including orphan-FK rejection, mid-save rollback, duplicate-free cursor pages, authenticated-tamper rejection, and cursor continuity after database reopen.
+```sql
+CREATE TABLE plans(
+  plan_id TEXT PRIMARY KEY,
+  state TEXT NOT NULL CHECK(state IN('ready','applying','applied','partial','expired','failed','superseded')),
+  host TEXT NOT NULL, login TEXT NOT NULL, account_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  hash TEXT NOT NULL CHECK(length(hash)=64 AND hash NOT GLOB '*[^0-9a-f]*'),
+  executable_json TEXT NOT NULL CHECK(json_valid(executable_json)),
+  created_at TEXT NOT NULL, expires_at TEXT NOT NULL,
+  caller_note TEXT,
+  warnings_json TEXT NOT NULL CHECK(json_valid(warnings_json) AND json_type(warnings_json)='array'),
+  summary_json TEXT NOT NULL CHECK(json_valid(summary_json) AND json_type(summary_json)='object'),
+  UNIQUE(plan_id,host,login,account_id),
+  FOREIGN KEY(snapshot_id,host,login,account_id)
+    REFERENCES snapshots(snapshot_id,host,login,account_id),
+  CHECK(created_at<expires_at)
+) STRICT;
+CREATE TABLE plan_operations(
+  plan_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK(sequence>=0),
+  kind TEXT NOT NULL CHECK(kind IN('star','unstar','list_create','list_update','list_delete','list_membership_set')),
+  operation_json TEXT NOT NULL CHECK(json_valid(operation_json)),
+  PRIMARY KEY(plan_id,operation_id),
+  UNIQUE(plan_id,sequence),
+  UNIQUE(plan_id,operation_id,sequence),
+  FOREIGN KEY(plan_id) REFERENCES plans(plan_id) ON DELETE CASCADE
+) STRICT;
+CREATE TABLE plan_operation_dependencies(
+  plan_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+  depends_on_operation_id TEXT NOT NULL,
+  PRIMARY KEY(plan_id,operation_id,depends_on_operation_id),
+  FOREIGN KEY(plan_id,operation_id)
+    REFERENCES plan_operations(plan_id,operation_id) ON DELETE CASCADE,
+  FOREIGN KEY(plan_id,depends_on_operation_id)
+    REFERENCES plan_operations(plan_id,operation_id) ON DELETE CASCADE,
+  CHECK(operation_id<>depends_on_operation_id)
+) STRICT;
+```
+
+Runs deliberately omit independently mutable `totals_json` and
+`reconciliation_json`; all totals derive from operation rows. One immutable
+plan has at most one run, and the database proves every run operation belongs
+to an operation in that run's plan:
+
+```sql
+CREATE TABLE runs(
+  run_id TEXT PRIMARY KEY, plan_id TEXT NOT NULL UNIQUE,
+  host TEXT NOT NULL, login TEXT NOT NULL, account_id TEXT NOT NULL,
+  lease_name TEXT NOT NULL, lease_owner_id TEXT NOT NULL,
+  state TEXT NOT NULL CHECK(state IN('pending','running','completed','partial','failed')),
+  failure_mode TEXT NOT NULL CHECK(failure_mode IN('stop','continue')),
+  warnings_json TEXT NOT NULL CHECK(json_valid(warnings_json) AND json_type(warnings_json)='array'),
+  started_at TEXT NOT NULL, finished_at TEXT,
+  UNIQUE(run_id,plan_id),
+  FOREIGN KEY(plan_id,host,login,account_id)
+    REFERENCES plans(plan_id,host,login,account_id),
+  CHECK(
+    (state IN('pending','running') AND finished_at IS NULL) OR
+    (state IN('completed','partial','failed') AND finished_at IS NOT NULL)
+  ),
+  CHECK(finished_at IS NULL OR finished_at>=started_at)
+) STRICT;
+CREATE TABLE run_operations(
+  run_id TEXT NOT NULL, plan_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK(sequence>=0),
+  status TEXT NOT NULL CHECK(status IN('pending','running','succeeded','skipped','failed','unresolved')),
+  reconciliation TEXT NOT NULL CHECK(reconciliation IN('not_required','pending','confirmed_applied','confirmed_not_applied','unknown')),
+  attempts INTEGER NOT NULL CHECK(attempts>=0),
+  before_json TEXT NOT NULL CHECK(json_valid(before_json)),
+  after_json TEXT NOT NULL CHECK(json_valid(after_json)),
+  external_request_id TEXT,
+  error_json TEXT CHECK(error_json IS NULL OR json_valid(error_json)),
+  started_at TEXT, finished_at TEXT,
+  PRIMARY KEY(run_id,operation_id), UNIQUE(run_id,sequence),
+  FOREIGN KEY(run_id,plan_id) REFERENCES runs(run_id,plan_id) ON DELETE CASCADE,
+  FOREIGN KEY(plan_id,operation_id,sequence)
+    REFERENCES plan_operations(plan_id,operation_id,sequence),
+  CHECK(
+    (status='pending' AND reconciliation='not_required'
+      AND started_at IS NULL AND finished_at IS NULL
+      AND external_request_id IS NULL AND error_json IS NULL
+      AND json_type(after_json)='null') OR
+    (status='running' AND reconciliation='pending' AND attempts>=1
+      AND started_at IS NOT NULL AND finished_at IS NULL
+      AND external_request_id IS NULL AND error_json IS NULL
+      AND json_type(after_json)='null') OR
+    (status='skipped' AND reconciliation='not_required'
+      AND started_at IS NULL AND finished_at IS NOT NULL
+      AND external_request_id IS NULL AND error_json IS NULL
+      AND json_type(after_json)='null') OR
+    (status='succeeded' AND reconciliation IN('not_required','confirmed_applied')
+      AND attempts>=1 AND started_at IS NOT NULL AND finished_at IS NOT NULL
+      AND error_json IS NULL) OR
+    (status='failed' AND reconciliation='confirmed_not_applied'
+      AND finished_at IS NOT NULL AND error_json IS NOT NULL
+      AND json_type(error_json,'$.retryable') IN('true','false')
+      AND ((started_at IS NULL AND external_request_id IS NULL
+            AND json_type(after_json)='null')
+           OR (started_at IS NOT NULL AND attempts>=1))) OR
+    (status='unresolved' AND reconciliation='unknown' AND attempts>=1
+      AND started_at IS NOT NULL AND finished_at IS NOT NULL
+      AND error_json IS NOT NULL
+      AND json_type(error_json,'$.retryable')='false'
+      AND json_extract(error_json,'$.retryable')=0)
+  ),
+  CHECK(finished_at IS NULL OR started_at IS NULL OR finished_at>=started_at)
+) STRICT;
+CREATE TABLE run_operation_attempts(
+  run_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL CHECK(attempt>=1),
+  status TEXT NOT NULL CHECK(status IN('running','succeeded','failed','unresolved')),
+  reconciliation TEXT NOT NULL CHECK(reconciliation IN('not_required','pending','confirmed_applied','confirmed_not_applied','unknown')),
+  before_json TEXT NOT NULL CHECK(json_valid(before_json)),
+  after_json TEXT NOT NULL CHECK(json_valid(after_json)),
+  external_request_id TEXT,
+  error_json TEXT CHECK(error_json IS NULL OR json_valid(error_json)),
+  started_at TEXT NOT NULL, finished_at TEXT,
+  PRIMARY KEY(run_id,operation_id,attempt),
+  FOREIGN KEY(run_id,operation_id)
+    REFERENCES run_operations(run_id,operation_id) ON DELETE CASCADE,
+  CHECK(
+    (status='running' AND reconciliation='pending'
+      AND finished_at IS NULL AND external_request_id IS NULL
+      AND error_json IS NULL AND json_type(after_json)='null') OR
+    (status='succeeded' AND reconciliation='not_required'
+      AND finished_at IS NOT NULL AND error_json IS NULL) OR
+    (status='failed' AND reconciliation='confirmed_not_applied'
+      AND finished_at IS NOT NULL AND error_json IS NOT NULL
+      AND json_type(error_json,'$.retryable') IN('true','false')) OR
+    (status='unresolved' AND reconciliation='unknown'
+      AND finished_at IS NOT NULL AND error_json IS NOT NULL
+      AND json_type(error_json,'$.retryable')='false'
+      AND json_extract(error_json,'$.retryable')=0)
+  ),
+  CHECK(finished_at IS NULL OR finished_at>=started_at)
+) STRICT;
+CREATE TABLE run_operation_reconciliations(
+  run_id TEXT NOT NULL, operation_id TEXT NOT NULL,
+  attempt INTEGER NOT NULL CHECK(attempt>=1),
+  event_sequence INTEGER NOT NULL CHECK(event_sequence>=1),
+  status TEXT NOT NULL CHECK(status IN('succeeded','failed','unresolved')),
+  reconciliation TEXT NOT NULL CHECK(reconciliation IN('confirmed_applied','confirmed_not_applied','unknown')),
+  after_json TEXT NOT NULL CHECK(json_valid(after_json)),
+  error_json TEXT CHECK(error_json IS NULL OR json_valid(error_json)),
+  observed_at TEXT NOT NULL,
+  PRIMARY KEY(run_id,operation_id,event_sequence),
+  FOREIGN KEY(run_id,operation_id,attempt)
+    REFERENCES run_operation_attempts(run_id,operation_id,attempt)
+    ON DELETE CASCADE,
+  CHECK(
+    (status='succeeded' AND reconciliation='confirmed_applied'
+      AND error_json IS NULL) OR
+    (status='failed' AND reconciliation='confirmed_not_applied'
+      AND error_json IS NOT NULL
+      AND json_type(error_json,'$.retryable')='true'
+      AND json_extract(error_json,'$.retryable')=1) OR
+    (status='unresolved' AND reconciliation='unknown'
+      AND error_json IS NOT NULL
+      AND json_type(error_json,'$.retryable')='false'
+      AND json_extract(error_json,'$.retryable')=0)
+  )
+) STRICT;
+```
+
+The migration also installs relationship triggers. They preserve the allowed
+recovery edge while making reconciliation/projection history inseparable:
+
+```sql
+CREATE TRIGGER run_operation_insert_requires_initial_projection
+BEFORE INSERT ON run_operations
+WHEN NEW.status<>'pending'
+  OR NEW.reconciliation<>'not_required'
+  OR NEW.attempts<>0
+BEGIN
+  SELECT RAISE(ABORT,'run operation must be inserted pending');
+END;
+
+CREATE TRIGGER reconciliation_requires_current_unresolved_attempt
+BEFORE INSERT ON run_operation_reconciliations
+BEGIN
+  SELECT CASE WHEN NOT EXISTS(
+    SELECT 1
+    FROM run_operations AS ro
+    JOIN run_operation_attempts AS a
+      ON a.run_id=ro.run_id
+     AND a.operation_id=ro.operation_id
+     AND a.attempt=ro.attempts
+    WHERE ro.run_id=NEW.run_id
+      AND ro.operation_id=NEW.operation_id
+      AND ro.status='unresolved'
+      AND ro.reconciliation='unknown'
+      AND ro.attempts=NEW.attempt
+      AND a.status='unresolved'
+      AND a.reconciliation='unknown'
+      AND a.finished_at IS NOT NULL
+      AND NEW.observed_at>=a.finished_at
+  ) THEN RAISE(ABORT,'reconciliation requires current unresolved attempt') END;
+END;
+
+CREATE TRIGGER reconciled_projection_requires_latest_event
+BEFORE UPDATE OF status,reconciliation,after_json,error_json,finished_at
+ON run_operations
+WHEN OLD.status='unresolved' AND OLD.reconciliation='unknown'
+BEGIN
+  SELECT CASE WHEN NOT EXISTS(
+    SELECT 1
+    FROM run_operation_reconciliations AS e
+    WHERE e.run_id=NEW.run_id
+      AND e.operation_id=NEW.operation_id
+      AND e.attempt=NEW.attempts
+      AND e.event_sequence=(
+        SELECT MAX(e2.event_sequence)
+        FROM run_operation_reconciliations AS e2
+        WHERE e2.run_id=NEW.run_id AND e2.operation_id=NEW.operation_id
+      )
+      AND e.status=NEW.status
+      AND e.reconciliation=NEW.reconciliation
+      AND e.after_json=NEW.after_json
+      AND (
+        (e.error_json IS NULL AND NEW.error_json IS NULL) OR
+        e.error_json=NEW.error_json
+      )
+  ) THEN RAISE(ABORT,'reconciled projection requires matching latest event') END;
+END;
+
+CREATE TRIGGER reconciliation_events_are_append_only_update
+BEFORE UPDATE ON run_operation_reconciliations
+BEGIN
+  SELECT RAISE(ABORT,'reconciliation events are append-only');
+END;
+CREATE TRIGGER reconciliation_events_are_append_only_delete
+BEFORE DELETE ON run_operation_reconciliations
+BEGIN
+  SELECT RAISE(ABORT,'reconciliation events are append-only');
+END;
+```
+
+`reconcileRunOperation` inserts the event first and updates its projection
+second inside one private repository transaction. Recovery may still change
+`running/pending -> unresolved/unknown` without inventing an event because
+the second trigger applies only when the old projection was already
+unresolved. Direct `running/pending -> failed/confirmed_not_applied` outcomes
+also remain legal without a reconciliation event. Raw-SQL negative integration
+tests prove that an event for a historical/non-current attempt, an observation
+before the ambiguous attempt finished, or an unresolved-projection rewrite
+without its matching latest event is rejected and fully rolled back. They also
+prove that a non-pending initial projection and any reconciliation-event
+update/delete are rejected.
+
+Indexes cover latest complete snapshot binding/time, recovery by stored lease,
+snapshot Star pagination, List fixed order
+`name COLLATE BINARY,list_id`, membership pagination in both directions, and
+run/attempt sequence. Language aggregates return sorted
+`{language:null|string,count}` rows, never dynamic object properties.
+
+`openSqliteDatabase` rejects SQLite older than 3.38, non-UTF-8, or missing
+JSON1, and applies/verifies `foreign_keys=ON`, `trusted_schema=OFF`,
+`mmap_size=0`, `busy_timeout=5000`, `synchronous=FULL`, plus WAL for file
+databases. `migrateSqliteDatabase` first enters `BEGIN IMMEDIATE`, then rereads
+the ledger and accepts only a contiguous prefix of the binary's
+LF-normalized `(version,name,sha256)` list. It rejects gaps, drift, and a
+database newer than the binary before applying the next migration. Concurrent
+first starts converge without duplicate or partially observed migrations.
+
+`RuntimeSecretRepository.getOrCreateCursorSigningKey(createdAt)` enters its
+own `BEGIN IMMEDIATE`, rereads/inserts exactly one 32-byte BLOB with a targeted
+conflict clause, validates its type/length, and returns an exclusive defensive
+copy. Startup copies it into `createCursorCodec`, wipes all temporary random
+and database buffers, then constructs repositories; no port or diagnostic can
+observe the key. SQLite methods reject use before the store reaches ready.
+
+`createSnapshot` atomically validates the active lease and persists its
+name/owner. `appendSnapshotBatch` accepts at most 100 of each remote collection
+per call, validates the same active lease, and writes only a `building`
+snapshot. Non-empty List/membership input requires stored coverage
+`collecting`; unavailable/omitted snapshots reject it. It canonicalizes each Repository, hashes query-relevant metadata,
+uses targeted conflict clauses, and on a hash/ID conflict compares exact
+content instead of silently ignoring it. Repository node/database IDs are
+immutable. The current metadata pointer advances only when
+`(observed_at,version_hash)` is lexically newer; every snapshot query joins its
+exact immutable version, never that pointer.
+
+`beginSnapshotVerification` creates exactly one empty private verification
+set for a building draft. Verification append methods enforce all per-array
+bounds and canonical records with ordinary strict inserts, so a duplicate
+remote identity fails instead of disappearing through conflict handling.
+`finishSnapshotVerification` changes only `collecting -> verified`.
+
+`completeSnapshot` requires that verified marker; uses bidirectional SQL
+`EXCEPT` to prove exact, order-independent equality for Star identity/time,
+all normalized List metadata columns, and membership relationships; runs
+actual distinct row counts and List-coverage checks; proves the
+stored/current exact-owner lease with `expires_at > lease.now`; publishes
+`building -> complete`; and deletes the private verification rows inside one
+`BEGIN IMMEDIATE`. It permits only stored
+`collecting -> complete`, `unavailable -> unavailable`, or
+`omitted -> omitted`; the latter two require zero List/membership rows. Any
+mismatch rolls back and returns the stable
+`PRECONDITION_FAILED/details.reason="collection_changed"` signal.
+`failSnapshot` is likewise owner/lease guarded and clears verification rows in
+its transaction. Recovery changes only building snapshots for which no
+matching unexpired stored lease exists and also clears those rows.
+Failed/building snapshots never satisfy queries.
+
+All three query families require `snapshot.status='complete'`, authenticate
+the exact cursor context, use only fixed SQL, fetch page size plus one, and
+compute totals/aggregates independently of the cursor. Only List-dependent
+repository filters, List summaries, and memberships additionally require
+`listCoverage='complete'`; non-List repository filters work for final
+unavailable/omitted coverage. List summaries never materialize members.
+Membership order is the opposite-side stable ID in SQLite `BINARY` order.
+
+Lease acquire uses one targeted
+`INSERT ... ON CONFLICT(name) DO UPDATE ... WHERE leases.expires_at<=@now`;
+there is deliberately no same-owner exception. Thus every active reacquire,
+including the same owner ID, returns null. `renewLease` is a separate targeted
+`UPDATE ... WHERE name=@name AND owner_id=@ownerId AND expires_at>@now` and
+preserves `acquired_at`. Every input is canonical and requires
+`expiresAt>now`. Wrong-owner renew/release raises `PRECONDITION_FAILED`, and
+missing lease raises `NOT_FOUND`.
+
+`prepareStateDirectory(path, platform)` requires an absolute local path. It
+uses non-following `lstat` checks before and after creation/open, rejects
+symlinks, reparse points, non-regular database/WAL/SHM files, Windows UNC
+paths, and POSIX state owned by another UID. POSIX directories/files are
+hardened to existing owner permissions only with no group/world bits
+(`0700`/`0600` for new paths); existing missing owner permissions are not
+invented. WAL/SHM are rechecked after SQLite creates them. Windows relies on
+the user's inherited ACL and `--doctor` reports that limitation explicitly.
+
+- [ ] **Step 4: Verify rollback, exact set publication, foreign keys, queries, and lease ownership**
+Run `npm test -- test/integration/storage/snapshot.test.ts test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect all pass, including migration gaps/drift/newer-schema rejection, concurrent migration/key initialization, SQLite capability/pragma checks, orphan/composite-FK rejection, cross-account login/account-ID splice rejection, metadata collision and monotonic-pointer checks, mid-save rollback, exact reordered verification sets, every added/removed/changed verification element, active/same-owner/expired lease acquisition and takeover, lease-aware recovery, every List coverage state, two-direction membership pagination, duplicate-free cursor pages, authenticated-tamper rejection, WAL readers during one writer, secure-path rejection, and cursor continuity after database reopen.
 
 - [ ] **Step 5: Commit**
 
@@ -886,8 +1585,23 @@ import { expect, test } from "vitest";
 import { SQLiteStore } from "../../../src/storage/sqlite-store.js";
 import { changePlanFixture, changeRunFixture, runningOperationFixture, snapshotBatchFixture, snapshotDraftFixture } from "../../fixtures/domain.js";
 const seedSnapshot = (store:SQLiteStore) => {
-  const snapshot=store.createSnapshot(snapshotDraftFixture); store.appendSnapshotBatch(snapshot.id,snapshotBatchFixture);
-  store.completeSnapshot({id:snapshot.id,completedAt:"2026-07-16T01:00:00Z",counts:{repositories:1,stars:1,lists:1,memberships:1},warningCount:0,sourceRateLimit:null});
+  store.acquireLease({name:"sync:fixture",ownerId:"seed",now:"2026-07-16T00:00:00.000Z",expiresAt:"2026-07-16T00:10:00.000Z"});
+  const lease={name:"sync:fixture",ownerId:"seed",now:"2026-07-16T00:01:00.000Z"} as const;
+  const snapshot=store.createSnapshot({draft:snapshotDraftFixture,lease});
+  store.appendSnapshotBatch({id:snapshot.id,batch:snapshotBatchFixture,lease});
+  store.beginSnapshotVerification({id:snapshot.id,listCoverage:"complete",lease});
+  store.appendSnapshotVerificationBatch({
+    id:snapshot.id,
+    batch:{
+      stars:snapshotBatchFixture.stars,
+      lists:snapshotBatchFixture.lists,
+      memberships:snapshotBatchFixture.memberships,
+    },
+    lease,
+  });
+  store.finishSnapshotVerification({id:snapshot.id,lease});
+  store.completeSnapshot({id:snapshot.id,completedAt:"2026-07-16T00:02:00.000Z",listCoverage:"complete",counts:{repositories:1,stars:1,lists:1,memberships:1},warningCount:0,sourceRateLimit:null,lease});
+  store.releaseLease({name:lease.name,ownerId:lease.ownerId});
 };
 test("plans are immutable and claims compare-and-set", () => {
   const store=new SQLiteStore(":memory:"); store.migrate();
@@ -900,22 +1614,33 @@ test("plans are immutable and claims compare-and-set", () => {
 test("running audit records recover as unresolved", () => {
   const store=new SQLiteStore(":memory:"); store.migrate();
   seedSnapshot(store); store.savePlan(changePlanFixture);
-  store.createRun(changeRunFixture);
-  store.createRunOperation({...runningOperationFixture,status:"pending",attempts:0,startedAt:null});
-  store.startRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,startedAt:"2026-07-16T02:59:00Z"});
-  expect(store.recoverInterruptedRuns("2026-07-16T03:00:00Z")).toEqual([changeRunFixture.id]);
+  store.acquireLease({name:"apply:fixture",ownerId:"p1",now:"2026-07-16T02:55:00.000Z",expiresAt:"2026-07-16T03:05:00.000Z"});
+  const lease={name:"apply:fixture",ownerId:"p1",now:"2026-07-16T02:59:00.000Z"} as const;
+  store.withTransaction((tx)=>{tx.assertLease(lease);tx.compareAndSetPlanState({planId:changePlanFixture.id,expected:["ready"],next:"applying"});});
+  store.createRun({run:changeRunFixture,lease});
+  store.compareAndSetRunState({runId:changeRunFixture.id,expected:["pending"],next:"running",finishedAt:null,lease});
+  store.createRunOperation({operation:{...runningOperationFixture,status:"pending",attempts:0,startedAt:null},lease});
+  store.startRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,startedAt:"2026-07-16T02:59:00.000Z",lease});
+  expect(store.recoverInterruptedRuns("2026-07-16T03:00:00.000Z")).toEqual([]);
+  store.acquireLease({name:"apply:fixture",ownerId:"p2",now:"2026-07-16T03:06:00.000Z",expiresAt:"2026-07-16T03:16:00.000Z"});
+  const resumed={name:"apply:fixture",ownerId:"p2",now:"2026-07-16T03:06:30.000Z"} as const;
+  expect(store.recoverAbandonedRuns({binding:changeRunFixture.binding,lease:resumed})).toEqual([changeRunFixture.id]);
   expect(store.getRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId})?.status).toBe("unresolved");
-  expect(store.recoverInterruptedRuns("2026-07-16T03:01:00Z")).toEqual([]);
+  expect(store.listRunOperationAttemptsPage({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,afterAttempt:null,pageSize:10}).items[0]?.status).toBe("unresolved");
+  expect(store.recoverInterruptedRuns("2026-07-16T03:07:00.000Z")).toEqual([]);
+  store.compareAndSetPlanState({planId:changePlanFixture.id,expected:["partial"],next:"applying"});
+  store.compareAndSetRunState({runId:changeRunFixture.id,expected:["partial"],next:"running",finishedAt:null,lease:{...resumed,now:"2026-07-16T03:07:00.000Z"}});
   store.reconcileRunOperation({
     runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,
     status:"failed",reconciliation:"confirmed_not_applied",
-    externalRequestId:null,after:null,
+    after:null,lease:{...resumed,now:"2026-07-16T03:08:00.000Z"},
     error:{code:"RECONCILIATION_REQUIRED",message:"confirmed not applied",retryable:true,details:{}},
-    finishedAt:"2026-07-16T03:01:30Z",
+    observedAt:"2026-07-16T03:08:30.000Z",
   });
-  const queued=store.retryRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId});
+  expect(store.listRunOperationReconciliationsPage({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,afterEventSequence:null,pageSize:10}).items).toHaveLength(1);
+  const queued=store.retryRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,maxAttempts:3,lease:{...resumed,now:"2026-07-16T03:08:45.000Z"}});
   expect([queued.status,queued.attempts]).toEqual(["pending",1]);
-  const retried=store.startRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,startedAt:"2026-07-16T03:03:00Z"});
+  const retried=store.startRunOperation({runId:changeRunFixture.id,operationId:runningOperationFixture.operationId,startedAt:"2026-07-16T03:09:00.000Z",lease:{...resumed,now:"2026-07-16T03:09:00.000Z"}});
   expect([retried.status,retried.attempts]).toEqual(["running",2]); store.close();
 });
 ```
@@ -928,7 +1653,10 @@ Run `npm test -- test/integration/storage/plan-run.test.ts`; expect FAIL resolvi
 `savePlan` writes the plan plus normalized operation/dependency rows in one
 transaction and derives `summary_json`; it first requires a complete source
 snapshot and exact equality between snapshot binding and executable binding.
-`createRun` likewise requires exact run-binding equality with the stored plan.
+If any executable operation uses a List precondition/target, the source
+snapshot must also have `listCoverage:"complete"`. `createRun` likewise
+requires exact run-binding equality with the stored plan, an active exact
+account lease, and no existing run for that plan.
 Repeated identical ID/content is idempotent, while any differing field raises
 `STORAGE_ERROR: plan_id is immutable`. Reads validate JSON through domain
 schemas and return frozen copies. State claims use:
@@ -939,32 +1667,49 @@ WHERE plan_id=@planId AND state IN(SELECT value FROM json_each(@expectedJson))
 RETURNING *;
 ```
 
-No row means `NOT_FOUND` for missing ID or `PRECONDITION_FAILED` for stale
-state. Runs use the same rule. `createRun` persists its immutable, redacted
+Before executing SQL, every claim validates the requested transition through
+the domain transition function. No row means `NOT_FOUND` for missing ID or
+`PRECONDITION_FAILED` for stale state. Runs use the same rule and enforce
+finished-time invariants; partial resume atomically replaces the stored run
+lease binding with the newly validated guard. `createRun` persists its immutable, redacted
 warning strings in `runs.warnings_json`; every load and resume returns the same
-warnings. `createRunOperation` inserts a `pending`,
-attempt-zero write-ahead row before waiting in the mutation pacer and accepts
-a duplicate only when every byte matches. `startRunOperation` is the only
-`pending→running` CAS; it sets `startedAt` and increments attempts immediately
-before transport dispatch. `retryRunOperation` accepts only an `unresolved`
-row reconciled as confirmed-not-applied or a `failed` row with
-`error.retryable=true`, changes it to `pending`, and clears finish/error fields
-without incrementing attempts. Succeeded/skipped rows never change.
-`finishRunOperation` accepts only pending/running records, preserves
-before-state, and stores only `SerializedDomainError`.
+warnings. `createRunOperation` validates the plan operation/sequence and
+inserts a `pending`, attempt-zero write-ahead row before waiting in the
+mutation pacer; an identical duplicate is idempotent only while its lifecycle
+is still initial.
+
+`startRunOperation` is the sole active-lease `pending→running` CAS. In the same
+transaction it proves the run/plan are running/applying, increments attempts,
+and inserts the corresponding running `run_operation_attempts` row immediately
+before transport dispatch. `finishRunOperation` never accepts caller
+before/attempts; it applies the discriminated legal outcome and finalizes the
+current attempt plus projection atomically. Pending-before-dispatch
+skipped/failed rows create no attempt.
 `reconcileRunOperation` is a separate CAS accepting only an `unresolved`
 record and writing `succeeded`/`confirmed_applied`,
 `failed`/`confirmed_not_applied`, or `unresolved`/`unknown`; it preserves
-attempts, original before/start time, and never makes a succeeded row mutable.
+attempts, original before/start/request ID and the unresolved attempt's
+original finish time, appends a reconciliation event, updates the projection
+atomically, and never makes a succeeded row mutable.
+`retryRunOperation` accepts only
+`failed/confirmed_not_applied/error.retryable` within `maxAttempts`; it never
+accepts unresolved/unknown, never deletes attempts or reconciliation events,
+and resets only the projection fields defined by Task 6.
 
-Crash recovery is one `BEGIN IMMEDIATE` transaction:
+Crash recovery takes `BEGIN IMMEDIATE`, first materializes only pending/running
+runs for which no lease row matches the stored name/owner with
+`expires_at>@now`, and then updates only that fixed set. Pending operation rows
+become retryable failed/confirmed-not-applied without an attempt; running
+attempts and projections become unresolved/unknown; affected runs and owning
+applying plans become partial. Recovery finalizes a running attempt once at
+the recovery time but does not invent a reconciliation event. Another
+process's active exact-owner run is left untouched.
 
-```sql
-UPDATE run_operations SET status='failed',reconciliation='confirmed_not_applied',error_json=@retryableRecoveryError,finished_at=@now WHERE status='pending';
-UPDATE run_operations SET status='unresolved',reconciliation='unknown',finished_at=@now WHERE status='running';
-UPDATE runs SET state='partial',finished_at=@now WHERE state IN('pending','running');
-UPDATE plans SET state='partial' WHERE state='applying' AND EXISTS(SELECT 1 FROM runs r WHERE r.plan_id=plans.plan_id AND r.state='partial');
-```
+`recoverAbandonedRuns({binding,lease})` uses the same transaction after first
+asserting the caller's newly acquired active apply lease and restricting the
+fixed candidate set to that binding. `recoverAbandonedSnapshots` does the
+equivalent under the new sync lease. Global startup methods use no caller lease
+but retain the exact-owner-active exclusion.
 
 The pending recovery error is `INTERNAL_ERROR`, retryable, and states that no
 dispatch occurred; running rows remain ambiguous and must reconcile before
@@ -972,15 +1717,31 @@ retry. Recovery covers an interrupted run even when it has zero operation
 rows, transitions its owning applying plan to partial, returns affected branded
 run IDs in lexical order, and is idempotent. Tests simulate a crash before
 dispatch, during dispatch, and after a successful response but before audit
-completion. `recoverIncompleteSnapshots` similarly changes every building
-snapshot to failed once. `listRunOperationsPage` validates size 1–100, orders
-by sequence, fetches one extra, and emits `nextSequence` only when more rows
-exist.
+completion. `recoverIncompleteSnapshots` similarly changes each abandoned
+building snapshot once while skipping an exact-owner unexpired lease. All
+operation/attempt/reconciliation page methods validate size 1–100, order by
+their fixed sequence, fetch one extra, and emit a next boundary only when more
+rows exist.
 
-`SQLiteStore` delegates every port method, owns one connection, makes `close` idempotent, and implements `withTransaction` with `db.transaction(fn).immediate()`. If the callback returns a Promise, roll back and throw `STORAGE_ERROR`; no transaction crosses `await`.
+`SQLiteStore` owns one connection and is unusable until `migrate()` completes
+this exact composition:
+
+```text
+secure state path -> open/verify SQLite -> migrate under BEGIN IMMEDIATE
+-> get/create cursor key under BEGIN IMMEDIATE -> exclusive key copy
+-> createCursorCodec -> wipe temporary buffers -> construct repositories
+-> mark ready
+```
+
+It delegates every port method, makes `close` idempotent, and implements
+`withTransaction` through an immediate transaction plus the same
+thenable-detection and revocable-facade semantics as the memory store. Nested
+transactions and root-store reentry (including migrate/close) are rejected
+while the callback is active. Callback writes roll back before an async result
+can escape; no transaction crosses `await`.
 
 - [ ] **Step 4: Run complete foundation and reopen verification**
-Run `npm test -- test/unit test/integration/storage && npm run test:coverage && npm run format:check && npm run lint && npm run typecheck && npm run build && git diff --check`; expect full success, coverage gates, and a reopen test proving one-time recovery without hash/before-state changes.
+Run `npm test -- test/unit test/integration/storage && npm run test:coverage && npm run format:check && npm run lint && npm run typecheck && npm run build && git diff --check`; expect full success, coverage gates, and reopen tests proving one-time lease-aware recovery, one run per plan, attempt-history continuity, cursor continuity, transactional thenable rollback, no hash/before-state changes, timestamp-order CHECK rejection, initial-projection INSERT rejection, current-attempt-only reconciliation, matching-event projection updates, and append-only reconciliation events through raw SQL negative cases.
 
 - [ ] **Step 5: Commit**
 
@@ -1001,4 +1762,4 @@ npm pack --dry-run
 git status --short
 ```
 
-Expected: shrinkwrap is unchanged; verification passes; schema smoke exits 0; tarball excludes source, tests, databases, tokens, and environment files; working tree is clean. The Plan 04 startup composition must call `migrate()`, `recoverIncompleteSnapshots(now)`, then `recoverInterruptedRuns(now)` before accepting MCP calls. Specification coverage is explicit across Tasks 1–8: toolchain, IDs, records, snapshots, errors, redaction, config, filters, SQL/cursors, canonical hash, plan/run graph and state, `StoragePort`, WAL/foreign keys/migrations, leases, immutable plans, write-ahead audit, and crash recovery.
+Expected: shrinkwrap is unchanged; verification passes; schema smoke exits 0; tarball excludes source, tests, databases, tokens, and environment files; working tree is clean. The Plan 04 startup composition must call `migrate()` (which also initializes the private cursor codec), `recoverIncompleteSnapshots(now)`, then `recoverInterruptedRuns(now)` before accepting MCP calls; both recovery calls skip exact-owner active leases. Specification coverage is explicit across Tasks 1–8: toolchain, IDs, records, List coverage and bounded memberships, errors, redaction, config, filters, authenticated SQL/cursors, canonical hash, plan/run graph and state, synchronous/revocable `StoragePort`, strict/checksummed migrations, secure state files, atomic leases, immutable plans, per-dispatch attempts, and lease-aware crash recovery.

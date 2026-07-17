@@ -147,12 +147,12 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 
 - **SYNC-01:** A full sync shall enumerate every repository starred by the authenticated user through REST `GET /user/starred`. It shall not use GraphQL `starredRepositories` as the authority because that connection can report `isOverLimit`.
 - **SYNC-02:** A sync shall collect the star timestamp, repository identifiers, owner/name, description, URL, star count, fork state, archived state, visibility, primary language, topics, license, `pushed_at`, and `updated_at` when GitHub supplies them.
-- **SYNC-03:** A sync shall enumerate every User List and its complete membership when the capability exists. The adapter shall isolate this public-preview schema from the domain layer.
-- **SYNC-04:** The server shall write one immutable snapshot only after it receives all required pages.
+- **SYNC-03:** A sync shall enumerate every User List and its complete membership when the capability exists. Every snapshot shall record List coverage as `collecting`, `complete`, `unavailable`, or `omitted`; `collecting` may publish only as `complete`, while `unavailable` and `omitted` shall contain zero List rows and shall never be represented as an empty complete collection. An unsupported union member or mid-collection capability failure shall fail the snapshot rather than publish partial coverage. The adapter shall isolate this public-preview schema from the domain layer.
+- **SYNC-04:** The server shall write one immutable snapshot only after it receives all required pages and database-backed, order-independent exact set comparison of a second complete enumeration proves that the Star set and, when collected, every normalized List metadata field and membership did not change during collection. Final Star verification shall occur after all List work.
 - **SYNC-05:** An interrupted sync shall remain incomplete and shall never become the latest usable snapshot.
 - **SYNC-06:** Incremental mode shall enumerate the current Star set but may reuse repository metadata that remains fresh.
 - **SYNC-07:** The result shall include counts, warnings, API rate-limit state, duration, and the snapshot ID.
-- **SYNC-08:** A database lease shall prevent two local server processes from publishing overlapping sync snapshots.
+- **SYNC-08:** A database lease with periodic heartbeat shall prevent two local server processes from publishing overlapping sync snapshots. Snapshot creation and publication shall bind the lease owner to the snapshot, and final count verification, active-lease verification using a fresh time, and `building -> complete` publication shall occur in one write transaction. Losing the lease shall stop new remote work. Startup recovery shall not fail work whose stored lease is still active.
 - **SYNC-09:** The server shall store and return GitHub numeric IDs as decimal strings and GraphQL node IDs as strings.
 
 ### 7.3 Query and evidence
@@ -160,16 +160,16 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 - **QUERY-01:** The server shall query an explicit snapshot or the latest complete snapshot.
 - **QUERY-02:** Filters shall use a validated expression tree with `all`, `any`, and `not` groups.
 - **QUERY-03:** Supported comparisons shall include equality, inequality, set membership, substring, numeric range, timestamp before/after, null checks, and Boolean values. Set filters shall be bounded and compiled through a constant-number-of-bind-variables representation rather than one SQLite variable per member.
-- **QUERY-04:** Query results shall support stable sorts, cursor pagination, a maximum page size, totals, and aggregate counts. Cursors shall be opaque, authenticated with an installation-local secret, bound to their resource, snapshot, normalized selection/filter, and normalized sort, and remain valid across process restarts. Any canonical re-encoding or boundary modification without a valid authenticator shall fail closed.
+- **QUERY-04:** Query results shall support stable sorts, cursor pagination, a maximum page size, totals, and aggregate counts. List metadata pages shall return bounded summaries and List membership IDs shall use a separate bounded page mode; no query shall return an unbounded membership array. Cursors shall be opaque, authenticated with an installation-local secret, bound to their resource, snapshot, normalized selection/filter, normalized sort, and List ID when applicable, and remain valid across process restarts. Any canonical re-encoding or boundary modification without a valid authenticator shall fail closed.
 - **QUERY-05:** The server shall distinguish `pushed_at` from `updated_at`. Rules about code inactivity shall use `pushed_at` unless the caller names another field.
-- **QUERY-06:** The server shall support List membership, language, topic, owner, fork, archive, visibility, star count, license, and age filters.
+- **QUERY-06:** The server shall support List membership, language, topic, owner, fork, archive, visibility, star count, license, and age filters. List-dependent filters and planning shall require `complete` List coverage and fail closed for `collecting`, `unavailable`, or `omitted`; non-List filters remain available.
 - **QUERY-07:** An evidence request may fetch a bounded number of README files for AI review.
 - **QUERY-08:** README text and repository descriptions shall remain untrusted data. The server shall never interpret their contents as instructions.
 - **QUERY-09:** The server shall truncate and label external text before returning it to an MCP client.
 
 ### 7.4 Star Lists
 
-- **LIST-01:** The server shall read List ID, name, slug, description, privacy, timestamps, and memberships.
+- **LIST-01:** The server shall read List ID, name, slug, description, privacy, timestamps, and memberships through bounded, independently paginated List-summary and membership views.
 - **LIST-02:** A plan may create a List with a name, description, and privacy setting.
 - **LIST-03:** A plan may update a List's name, description, or privacy setting.
 - **LIST-04:** A plan may delete one List or a resolved set of Lists.
@@ -195,16 +195,16 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 ### 7.6 Apply
 
 - **APPLY-01:** Apply shall require both `plan_id` and `expected_hash`.
-- **APPLY-02:** Apply shall reject an expired plan, account mismatch, host mismatch, hash mismatch, or previously superseded plan.
-- **APPLY-03:** The server shall write a pending run and pending operation record before each external mutation.
+- **APPLY-02:** Admission to a first or resumed dispatch shall reject an expired plan, account mismatch, host mismatch, hash mismatch, or previously superseded plan. After hash and current account binding are reverified, a plan already applied shall return its unique completed run idempotently even if its original execution TTL has since elapsed.
+- **APPLY-03:** The server shall write a pending run and pending operation record before each external mutation. It shall finish live precondition reads before dispatch; an already-satisfied or rejected precondition shall finish without an attempt. Starting an actual dispatch shall append an immutable attempt record immediately before the network call. The dispatch outcome shall finalize that attempt once; every later reconciliation observation shall append a separate immutable event, and retry shall never erase earlier attempts or events.
 - **APPLY-04:** The server shall check operation preconditions immediately before the mutation.
 - **APPLY-05:** The server shall treat repeated apply calls for the same completed plan as idempotent and return the original run.
-- **APPLY-06:** The server shall execute GitHub mutations serially and wait at least one second between mutative requests, following GitHub's API best-practice guidance.
+- **APPLY-06:** The server shall execute GitHub mutations serially and wait at least one second between mutative requests, following GitHub's API best-practice guidance. Every apply call shall use a unique lease-scope owner so concurrent calls in the same process cannot enter together. A periodic account-lease heartbeat shall run for the whole apply/pacing window; losing the lease shall stop new dispatches, and an in-flight outcome that cannot be owner-safely persisted shall remain for recovery and reconciliation.
 - **APPLY-07:** The caller may choose `stop` or `continue` failure mode. The default shall be `stop`.
 - **APPLY-08:** A partial failure shall retain successful operations and mark unresolved operations for reconciliation.
 - **APPLY-09:** The server shall reconcile an ambiguous network failure by reading current GitHub state before retrying a mutation.
 - **APPLY-10:** The run result shall include succeeded, skipped, failed, and unresolved counts plus a paginated error summary.
-- **APPLY-11:** Re-applying a plan whose latest run is partial shall resume that same run after reconciliation. It shall never repeat an operation already proved successful and shall schedule only unresolved or explicitly retryable operations.
+- **APPLY-11:** Re-applying a plan whose latest run is partial shall resume that same run after reconciliation. After taking over an expired account lease, the server shall recover abandoned work for that account immediately rather than wait for process restart. It shall never repeat an operation already proved successful. An unresolved or unknown operation shall be reconciled before any retry, and only an operation proved `confirmed_not_applied` with a retryable error may be queued for another audited attempt.
 
 ### 7.7 Rollback
 
@@ -231,7 +231,7 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 - **OPS-02:** `--stdio` shall be the default and shall reserve stdout for MCP JSON-RPC.
 - **OPS-03:** Diagnostics and logs shall use stderr or MCP logging notifications.
 - **OPS-04:** `--doctor` shall check runtime, database, `gh`, credentials, network access, and GitHub capabilities without changing GitHub.
-- **OPS-05:** The server shall run database migrations before accepting MCP calls.
+- **OPS-05:** The server shall run database migrations, initialize the installation-local cursor key under a write lock, and perform lease-aware crash recovery before accepting MCP calls. Every storage method other than migration/version/close shall fail before initialization completes. Graceful shutdown shall stop new calls, abort cancellable work, drain active lease scopes and final audit/pacing cleanup, and only then close transport and storage.
 - **OPS-06:** Version 1 shall collect no telemetry.
 
 ### 7.10 Codex plugin
@@ -271,7 +271,7 @@ Every successful tool shall return this logical shape through `structuredContent
   "warnings": [],
   "rate_limit": {
     "remaining": 4999,
-    "reset_at": "2026-07-16T08:00:00Z"
+    "reset_at": "2026-07-16T08:00:00.000Z"
   },
   "next_cursor": null
 }
@@ -292,6 +292,13 @@ Every failed tool shall set MCP `isError: true` and return:
   }
 }
 ```
+
+The MCP SDK 1.29 advertised `outputSchema` for each tool shall be the strict
+root-object schema for its successful envelope. Failure structured content
+shall be validated by the server's shared strict failure schema and
+`isError:true`; it is not unioned into the advertised schema because the SDK
+only serializes object-root output schemas and deliberately skips output
+validation for error results.
 
 The text content shall summarize the result in a few lines. It shall never duplicate a large structured payload.
 
@@ -365,7 +372,7 @@ The MCP schema will model filters as a recursive expression tree:
 {
   "all": [
     { "field": "stargazers_count", "op": "lt", "value": 10000 },
-    { "field": "pushed_at", "op": "before", "value": "2023-07-16T00:00:00Z" },
+    { "field": "pushed_at", "op": "before", "value": "2023-07-16T00:00:00.000Z" },
     {
       "not": {
         "field": "repository_id",
@@ -502,14 +509,26 @@ SQLite will use foreign keys, WAL mode, prepared statements, and explicit transa
 - `snapshot_stars`: repository membership and `starred_at` for one snapshot.
 - `user_lists`: List metadata for one snapshot.
 - `list_memberships`: repository/List relationships for one snapshot.
+- `snapshot_verifications` plus private verification Star/List/membership
+  tables: bounded second-pass staging and exact order-independent set proof,
+  cleared atomically on completion/failure.
 - `repository_evidence`: bounded cached README evidence with source commit/ETag and expiry.
 - `plans`: account, snapshot, state, expiry, canonical hash, and summary.
 - `plan_operations`: ordered resolved operations, preconditions, before state, inverse metadata, and risk.
 - `plan_operation_dependencies`: prerequisite operation relationships within an immutable plan.
 - `runs`: apply lifecycle, plan binding, timing, totals, and reconciliation state.
 - `run_operations`: external request ID, status, attempts, before/after state, and sanitized error.
+- `run_operation_attempts`: immutable per-dispatch intent, timing, request ID, outcome, reconciliation, before/after state, and sanitized error.
+- `run_operation_reconciliations`: append-only readback observations for an ambiguous attempt, including observation time, classified outcome, after state, and sanitized error.
 
 All GitHub numeric IDs shall use decimal text columns. GraphQL node IDs shall use text columns. This prevents JavaScript safe-integer loss and keeps REST and GraphQL identities distinct.
+
+Snapshot rows shall include List coverage plus the lease name and owner that
+created them. Run rows shall be unique by plan, include the account-lease name
+and owner that claimed them, and derive totals from operation rows rather than
+persisting independently mutable summary JSON. Repository identity rows shall
+point to immutable metadata versions through a composite foreign key, and the
+current pointer shall advance monotonically by `(observed_at, version_hash)`.
 
 ### 13.2 State machines
 
@@ -549,18 +568,36 @@ Reconciliation is recorded per operation. Resuming a partial run reuses its run 
 
 The database may contain metadata for private starred repositories. Documentation shall state this fact. The server shall not store repository source code.
 
+SQLite connections shall require SQLite 3.38 or newer, UTF-8, JSON1,
+`foreign_keys=ON`, `trusted_schema=OFF`, `mmap_size=0`, `busy_timeout=5000`,
+WAL for file databases, and `synchronous=FULL`. Migrations shall take
+`BEGIN IMMEDIATE` before re-reading the schema ledger, accept only a contiguous
+known prefix whose LF-normalized names and checksums match the binary, and
+reject gaps, drift, or a database newer than the binary. Initial cursor-secret
+creation shall use the same write-lock discipline so concurrent first starts
+converge on exactly one 32-byte key.
+
+The state path shall be an absolute local path. Before opening it, the server
+shall use non-following file inspection to reject symlinks, reparse points,
+non-regular files, and Windows UNC paths; on POSIX it shall reject state owned
+by another UID. Database, WAL, and SHM files shall be rechecked and hardened
+after SQLite creates them. `--doctor` shall report the Windows inherited-ACL
+limitation without claiming an ACL guarantee it cannot verify.
+
 ## 14. Data flows
 
 ### 14.1 Full sync
 
 1. Resolve credentials and verify the account.
-2. Acquire the sync lease and create a `building` snapshot.
-3. Enumerate Stars with 100 items per page.
-4. Normalize repository metadata and write it in database transactions.
-5. Re-read the newest Star page when activity changed during a long scan and reconcile duplicates by node ID.
-6. Enumerate List metadata, then paginate each List's memberships when supported.
-7. Verify page counts and foreign-key integrity.
-8. Mark the snapshot `complete`, make it the latest snapshot, and release the lease.
+2. Acquire the account-scoped sync lease and create a lease-bound `building` snapshot.
+3. Enumerate Stars with 100 items per page and write bounded normalized batches.
+4. Enumerate List metadata, then paginate each List's memberships when supported; otherwise record `unavailable` or `omitted`.
+5. Begin a private database-backed verification set. When Lists were collected, perform a second complete List/membership enumeration into bounded verification batches.
+6. After all List work, perform the second complete Star enumeration into bounded verification batches so Star churn during List collection is observable.
+7. Compare Stars, every normalized List metadata field, and memberships by bidirectional SQL set difference; traversal/page order is irrelevant.
+8. Verify foreign keys and derive actual distinct counts from stored rows.
+9. In one `BEGIN IMMEDIATE` transaction, prove exact set equality, prove the same lease owner is still active, prove actual counts and coverage, and publish `building -> complete`.
+10. Release the lease. A consistency mismatch fails the draft and retries with a new snapshot ID, within a bounded attempt count.
 
 ### 14.2 AI-assisted cleanup
 
@@ -577,13 +614,14 @@ The server will never label a repository "valuable" on its own. The host AI make
 ### 14.3 Apply and reconciliation
 
 1. Validate plan identity, hash, account, state, and expiry.
-2. Create a run.
-3. Write each operation as pending before the network call.
-4. Check the GitHub precondition.
-5. Execute the allowlisted mutation.
-6. Record the response or sanitized error.
-7. Re-read state after ambiguous failures.
-8. Finish the run with a complete, partial, failed, or reconciled state.
+2. Create or resume the plan's single run under the account lease.
+3. Write each operation as pending before pacing or network work.
+4. Check the GitHub precondition. Finish an already-satisfied or rejected operation without an attempt.
+5. For a prepared mutation, append a new running attempt immediately before the exactly-once allowlisted mutation dispatch, with no intervening await.
+6. Record the response or sanitized error on that attempt and update the operation summary atomically.
+7. Re-read state after ambiguous failures and append each reconciliation observation; unknown outcomes stay unresolved and cannot retry.
+8. Retry only a retryable, `confirmed_not_applied` outcome, preserving all earlier attempts.
+9. Finish the run with a complete, partial, failed, or reconciled state.
 
 ### 14.4 Rollback
 
@@ -817,9 +855,12 @@ Source files shall stay focused. A module that mixes MCP schemas, GitHub calls, 
 - Migrations from an empty database.
 - Foreign keys and transaction rollback.
 - Complete and failed snapshots.
+- Atomic lease-guarded publication, expired-owner takeover, and recovery that skips another process's active snapshot/run.
+- List coverage states plus bounded List-summary and membership pagination.
 - Plan hash persistence.
-- Run write-ahead records.
+- Run write-ahead records and immutable per-dispatch attempt history.
 - Database reopen and crash recovery.
+- Concurrent migration/cursor-key initialization and migration drift rejection.
 - Concurrent readers with one writer in WAL mode.
 
 ### 22.3 GitHub adapter contract tests
@@ -937,6 +978,9 @@ Version 1 passes when all statements below are true:
 - The default read-only mode rejects apply until startup configuration enables GitHub writes.
 - A fixture account with more than one REST page produces a complete immutable snapshot.
 - A List fixture with more than one page produces complete List membership.
+- Deep-page Star or List churn, including Star churn during List collection, is detected by complete second-pass verification and publishes no mixed snapshot; stable sets returned in a different order still publish.
+- List-unavailable and List-omitted snapshots remain queryable for non-List fields but reject List filters and planning.
+- List summaries and membership IDs paginate independently without an unbounded output field.
 - A filter for star count and `pushed_at` resolves the expected repositories.
 - Protected repository IDs never enter an unstar operation.
 - Apply rejects a changed hash, expired plan, and different account.
@@ -945,6 +989,7 @@ Version 1 passes when all statements below are true:
 - Mutation contract tests prove serial writes and the minimum one-second interval.
 - The release-candidate live contract report records the observed List-delete/Star and unstar/List-membership behavior for a disposable account.
 - A partial run records each operation and creates a valid rollback plan.
+- Every mutation retry retains each earlier attempt's dispatch intent and outcome, every reconciliation readback is an append-only event, and unknown outcomes cannot retry without reconciliation.
 - Rollback documents the lost original star timestamp and replacement List ID.
 - Security tests prove that repository administration and contents mutations cannot pass the adapter boundary.
 - MCP stdout remains protocol-clean during errors and diagnostics.

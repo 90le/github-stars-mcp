@@ -263,7 +263,7 @@ export const ToolNames = [
   "github_changes_rollback", "github_repositories_discover",
 ] as const;
 
-export const CursorSchema = z.string().min(1).max(2048);
+export const CursorSchema = z.string().min(1).max(4096);
 export const PageSizeSchema = z.number().int().min(1).max(100).default(50);
 export const RepositoryIdSchema = z.string().min(1).max(128);
 export const UserListIdSchema = z.string().min(1).max(128);
@@ -325,8 +325,8 @@ export const ResultEnvelopeSchema = <T extends z.ZodTypeAny>(data: T) => z.objec
 // src/mcp/schemas/read-tools.ts
 import { z } from "zod";
 import {
-  CursorSchema, FieldsSchema, FilterExpressionSchema, PageSizeSchema, SnapshotIdSchema,
-  SortFieldSchema, UserListIdSchema,
+  CursorSchema, FieldsSchema, FilterExpressionSchema, PageSizeSchema,
+  RepositoryIdSchema, SnapshotIdSchema, SortFieldSchema, UserListIdSchema,
 } from "./common.js";
 
 export const StatusInputSchema = z.object({
@@ -350,13 +350,29 @@ export const StarsQueryInputSchema = z.object({
   evidence: z.enum(["none", "summary", "readme"]).default("none"),
   evidence_limit: z.number().int().min(0).max(20).default(0),
 }).strict();
-export const ListsQueryInputSchema = z.object({
+const ListsPageInputSchema = z.object({
+  mode: z.literal("lists"),
   snapshot_id: SnapshotIdSchema.optional(),
-  list_ids: z.array(UserListIdSchema).max(100).optional(),
-  include_memberships: z.boolean().default(true),
   limit: PageSizeSchema,
   cursor: CursorSchema.optional(),
 }).strict();
+const ListMembersInputSchema = z.object({
+  mode: z.literal("memberships"),
+  snapshot_id: SnapshotIdSchema.optional(),
+  list_id: UserListIdSchema,
+  limit: PageSizeSchema,
+  cursor: CursorSchema.optional(),
+}).strict();
+const RepositoryListsInputSchema = z.object({
+  mode: z.literal("memberships"),
+  snapshot_id: SnapshotIdSchema.optional(),
+  repository_id: RepositoryIdSchema,
+  limit: PageSizeSchema,
+  cursor: CursorSchema.optional(),
+}).strict();
+export const ListsQueryInputSchema = z.union([
+  ListsPageInputSchema, ListMembersInputSchema, RepositoryListsInputSchema,
+]);
 export const DiscoverInputSchema = z.object({
   query: z.string().trim().min(1).max(256),
   sort: z.enum(["best-match", "stars", "forks", "help-wanted-issues", "updated"]).default("best-match"),
@@ -431,12 +447,21 @@ export const PlanInputSchema = z.object({
   expires_in_minutes: z.number().int().min(1).max(10_080).optional(),
   caller_note: z.string().max(2_000).optional(),
 }).strict();
-export const InspectInputSchema = z.object({
-  kind: z.enum(["plan", "run"]),
-  id: z.string().min(1).max(128),
-  limit: PageSizeSchema,
-  cursor: CursorSchema.optional(),
-}).strict();
+export const InspectInputSchema = z.union([
+  z.object({
+    kind: z.enum(["plan", "run"]),
+    id: z.string().min(1).max(128),
+    limit: PageSizeSchema,
+    cursor: CursorSchema.optional(),
+  }).strict(),
+  z.object({
+    kind: z.enum(["attempts", "reconciliations"]),
+    id: z.string().min(1).max(128),
+    operation_id: z.string().min(1).max(128),
+    limit: PageSizeSchema,
+    cursor: CursorSchema.optional(),
+  }).strict(),
+]);
 
 export const ApplyInputSchema = z.object({
   plan_id: z.string().min(1),
@@ -478,35 +503,92 @@ const ToolFailureEnvelope = z.object({
   }).strict(),
 }).strict();
 
-const outputEnvelope = <T extends z.ZodTypeAny>(data: T) =>
-  z.discriminatedUnion("ok", [
-    ToolSuccessBase.extend({ data }),
-    ToolFailureEnvelope,
-  ]);
+const successOutput = <T extends z.ZodTypeAny>(data: T) =>
+  ToolSuccessBase.extend({ data }).strict();
+
+const ListsPageOutputDataSchema = z.object({
+  mode: z.literal("lists"),
+  snapshot_id: SnapshotIdSchema,
+  coverage: z.literal("complete"),
+  items: z.array(ListSummaryOutputSchema).max(100),
+  total: z.number().int().nonnegative(),
+}).strict();
+const ListMembersOutputDataSchema = z.object({
+  mode: z.literal("memberships"),
+  snapshot_id: SnapshotIdSchema,
+  coverage: z.literal("complete"),
+  selector: z.object({
+    kind: z.literal("list"),
+    list_id: UserListIdSchema,
+  }).strict(),
+  repository_ids: z.array(RepositoryIdSchema).max(100),
+  total: z.number().int().nonnegative(),
+}).strict();
+const RepositoryListsOutputDataSchema = z.object({
+  mode: z.literal("memberships"),
+  snapshot_id: SnapshotIdSchema,
+  coverage: z.literal("complete"),
+  selector: z.object({
+    kind: z.literal("repository"),
+    repository_id: RepositoryIdSchema,
+  }).strict(),
+  list_ids: z.array(UserListIdSchema).max(100),
+  total: z.number().int().nonnegative(),
+}).strict();
+export const ListsQueryOutputDataSchema = z.union([
+  ListsPageOutputDataSchema,
+  ListMembersOutputDataSchema,
+  RepositoryListsOutputDataSchema,
+]);
 
 export const ToolOutputSchemas = {
-  github_stars_status: outputEnvelope(StatusOutputDataSchema),
-  github_stars_sync: outputEnvelope(SyncOutputDataSchema),
-  github_stars_query: outputEnvelope(StarsQueryOutputDataSchema),
-  github_lists_query: outputEnvelope(ListsQueryOutputDataSchema),
-  github_changes_plan: outputEnvelope(PlanOutputDataSchema),
-  github_changes_inspect: outputEnvelope(InspectOutputDataSchema),
-  github_changes_apply: outputEnvelope(ApplyOutputDataSchema),
-  github_changes_rollback: outputEnvelope(RollbackOutputDataSchema),
-  github_repositories_discover: outputEnvelope(DiscoveryOutputDataSchema),
-} as const satisfies Record<(typeof ToolNames)[number], z.ZodTypeAny>;
+  github_stars_status: successOutput(StatusOutputDataSchema),
+  github_stars_sync: successOutput(SyncOutputDataSchema),
+  github_stars_query: successOutput(StarsQueryOutputDataSchema),
+  github_lists_query: successOutput(ListsQueryOutputDataSchema),
+  github_changes_plan: successOutput(PlanOutputDataSchema),
+  github_changes_inspect: successOutput(InspectOutputDataSchema),
+  github_changes_apply: successOutput(ApplyOutputDataSchema),
+  github_changes_rollback: successOutput(RollbackOutputDataSchema),
+  github_repositories_discover: successOutput(DiscoveryOutputDataSchema),
+} as const satisfies Record<(typeof ToolNames)[number], z.ZodObject>;
+
+export const ToolFailureStructuredContentSchema = ToolFailureEnvelope;
 ```
 
 Each named `*OutputDataSchema` is strict, bounded, and mirrors its application
-result DTO; repository/List arrays use `.max(100)`, evidence uses `.max(20)`,
-and apply error summaries use `.max(100)`. Every schema is a discriminated
-success/failure union, so `ok:false` structured errors are valid advertised
-output too. The common registration helper attaches the complete
+result DTO. Status includes at most 20 incomplete-run summaries plus their
+full total/truncation flag. Repository/List-summary/List-membership/inspection
+arrays use `.max(100)`; List summaries expose `repository_count` but no member
+array. `ListsQueryOutputDataSchema` is the exact three-branch strict union
+above: `mode:"lists"` has `items` and no selector/ID arrays;
+`mode:"memberships" + selector.kind:"list"` has only `repository_ids`; and
+`mode:"memberships" + selector.kind:"repository"` has only `list_ids`.
+Unknown keys mean each branch rejects `items`, `repository_ids`, or `list_ids`
+from either of the other two branches. Both membership arrays are bounded to
+100. Language
+aggregates are ordered `{language,count}` arrays, evidence uses `.max(20)`,
+and apply error summaries use `.max(20)`. Attempt inspection exposes bounded
+per-dispatch rows and reconciliation inspection exposes append-only readback
+events without embedding either in run summaries. Every advertised
+`ToolOutputSchemas` member is deliberately a root `z.object`, because
+`@modelcontextprotocol/sdk` 1.29.0 `normalizeObjectSchema` ignores a root
+union. It advertises and validates the `ok:true` structured result. Failed
+calls still return the strict `ok:false` shape parsed by
+`ToolFailureStructuredContentSchema` and set MCP `isError:true`; the SDK
+intentionally skips advertised output validation for `isError` results.
+The common registration helper attaches the complete
 `outputSchema: ToolOutputSchemas[name]` to every
 `server.registerTool` call. Contract tests list all nine tools, assert both
 `inputSchema` and `outputSchema` are non-empty JSON Schemas, call every tool,
-and validate both successful and forced-error `structuredContent` with the
-matching Zod schema.
+validate successful `structuredContent` with the matching advertised object
+schema, and validate every forced-error `structuredContent` with
+`ToolFailureStructuredContentSchema` plus `isError:true`. A regression test
+registers all nine tools through the real SDK 1.29.0, calls `tools/list`, and
+asserts each serialized `outputSchema.type === "object"` instead of testing
+only the local Zod map. Lists contract cases cover all three valid branches
+and reject every cross-branch field injection, including both membership ID
+arrays together and a selector whose discriminant does not match its ID field.
 
 ```ts
 // src/mcp/mappers.ts
@@ -538,7 +620,9 @@ export function toRollbackInput(input: RollbackInput): CreateRollbackInput {
 }
 
 export function toInspectInput(input: InspectInput): InspectServiceInput {
-  return { kind: input.kind, id: input.id, limit: input.limit, cursor: input.cursor ?? null };
+  return input.kind === "attempts" || input.kind === "reconciliations"
+    ? {kind:input.kind,id:asRunId(input.id),operationId:input.operation_id,limit:input.limit,cursor:input.cursor??null}
+    : {kind:input.kind,id:input.id,limit:input.limit,cursor:input.cursor??null};
 }
 ```
 
@@ -552,7 +636,10 @@ must also map the public names (`name_with_owner`, `stargazers_count`,
 `language`, `license`, `archived`, `disabled`, `fork`, and `is_unclassified`)
 to the closed Plan 01 domain fields or derived predicates, and map `ne` /
 `not_in` to the domain operator names. Add equivalent explicit mappers for
-sync, Stars query, Lists query, and discovery. No public schema contains host,
+sync, Stars query, Lists query, and discovery. The Lists mapper converts the
+three closed public variants into either `mode:"lists"` or the exact
+List/repository membership selector; it never accepts both IDs, a generic
+selector, or `include_memberships`. No public schema contains host,
 login, account ID, or token; services derive identity from the bound
 snapshot/run and the injected GitHub adapter.
 
@@ -781,6 +868,7 @@ git commit -m "feat: expose safe change MCP tools"
 - Create: `src/mcp/create-server.ts`
 - Create: `src/server.ts`
 - Create: `src/cli.ts`
+- Create: `src/app/services/operation-coordinator.ts`
 - Create: `src/logging/stderr-logger.ts`
 - Create: `src/diagnostics/doctor.ts`
 - Modify: `tsconfig.build.json`
@@ -819,6 +907,8 @@ it("recovers interrupted runs before accepting the first MCP request", async () 
   const session = await startStdioCliWithStore({
     buildingSnapshot: "snap_interrupted",
     interruptedRun: "run_interrupted",
+    activeBuildingSnapshot: "snap_other_process",
+    activeInterruptedRun: "run_other_process",
     env: { GITHUB_STARS_MCP_READ_ONLY: "true" },
   });
   await session.initialize();
@@ -830,6 +920,8 @@ it("recovers interrupted runs before accepting the first MCP request", async () 
   ]);
   expect(session.snapshot("snap_interrupted").status).toBe("failed");
   expect(session.run("run_interrupted").state).toBe("partial");
+  expect(session.snapshot("snap_other_process").status).toBe("building");
+  expect(session.run("run_other_process").state).toBe("running");
   await session.close();
 });
 
@@ -915,14 +1007,35 @@ and ensure it includes the new CLI sources. Add
 derive the runtime version from the generated/package build metadata so
 `--version` always equals `package.json.version`.
 
-`runStdioCli` must open the database, call `store.migrate()`, then call
-`store.recoverIncompleteSnapshots(clock.now())`, then
+`runStdioCli` must secure the state path, open the database, call
+`store.migrate()` (which atomically verifies migrations, initializes the
+private persistent cursor codec, wipes temporary key buffers, and marks the
+store ready), then call `store.recoverIncompleteSnapshots(clock.now())`, then
 `store.recoverInterruptedRuns(clock.now())` before it builds services or
-connects `StdioServerTransport`. Only after that startup recovery may it accept MCP calls.
-It must install `SIGINT`/`SIGTERM` handlers, stop scheduling work, flush audit
-state, close the store, and emit no direct stdout writes. `--doctor` must return
+connects `StdioServerTransport`. Both recovery calls leave another process's
+exact-owner unexpired lease untouched. Only after that startup recovery may it
+accept MCP calls.
+Every MCP handler registers its Promise and child `AbortController` with an
+`OperationCoordinator`. `SIGINT`/`SIGTERM` first closes the coordinator's
+admission gate so newly entered handlers receive a shutdown error while the
+stdio transport remains connected, then aborts all cancellable
+scheduling/network reads, then awaits `coordinator.drain()`. Drain does not
+bypass each active
+`LeaseScope`'s `finally`, current audit write, or the pacer's non-cancellable
+final safety window. Only after active handlers/scopes reach zero does shutdown
+finish audit state and release leases, close the transport exactly once, and
+then close the store exactly once; no timer or handler may touch SQLite after
+close. Repeated signals share the same shutdown Promise and stdout remains
+protocol-only.
+Integration tests hold an apply request in flight, signal the process, and
+assert event order
+`stopAccepting -> abort -> finishAudit -> waitSafetyWindow -> releaseLease -> closeTransport -> closeStore`.
+
+`--doctor` must return
 exit 0 for all-pass, 2 for degraded optional capabilities, and 1 for unusable
-runtime/auth/database.
+runtime/auth/database. Database diagnostics verify SQLite/JSON1/pragmas and
+report Windows inherited-ACL limitations; symlink/reparse/UNC/non-regular
+state paths are unusable rather than silently followed.
 
 - [ ] **Step 4: Run CLI, stdio, and full type checks**
 
@@ -933,7 +1046,7 @@ Expected: PASS; spawned stdio contains JSON-RPC only.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/mcp/create-server.ts src/server.ts src/cli.ts src/logging src/diagnostics tsconfig.build.json package.json src/version.ts test/contract/mcp/stdio.test.ts test/integration/cli.test.ts
+git add src/mcp/create-server.ts src/server.ts src/cli.ts src/app/services/operation-coordinator.ts src/logging src/diagnostics tsconfig.build.json package.json src/version.ts test/contract/mcp/stdio.test.ts test/integration/cli.test.ts
 git commit -m "feat: add stdio server and diagnostics"
 ```
 
