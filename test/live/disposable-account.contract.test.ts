@@ -19,7 +19,10 @@ import { createOctokitTransport } from "../../src/github/octokit-client.js";
 import { OctokitGitHubAdapter } from "../../src/github/octokit-github-adapter.js";
 import { RateGate } from "../../src/github/rate-gate.js";
 import { PACKAGE_VERSION } from "../../src/version.js";
-import { loadLiveContractConfig } from "../fixtures/live-contract.js";
+import {
+  loadLiveContractConfig,
+  verifyCreatedUserListReadback,
+} from "../fixtures/live-contract.js";
 
 type CleanupRecord = Readonly<{
   action: string;
@@ -232,21 +235,21 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
         }
 
         createdListName = `github-stars-mcp-live-${Date.now()}-${randomUUID().slice(0, 8)}`;
+        const createdListInput = Object.freeze({
+          name: createdListName,
+          description: "Disposable github-stars-mcp live contract fixture",
+          isPrivate: true,
+        });
         const created = await github.createUserList(
-          {
-            name: createdListName,
-            description: "Disposable github-stars-mcp live contract fixture",
-            isPrivate: true,
-          },
+          createdListInput,
           newOperationId(),
         );
         createdList = created.list;
-        if (
-          createdList.name !== createdListName ||
-          createdList.isPrivate !== true
-        ) {
-          throw contractFailure("Disposable User List creation was not exact");
-        }
+        await verifyCreatedUserListReadback(
+          github,
+          createdList.listId,
+          createdListInput,
+        );
 
         const membershipUnderTest = withList(
           originalListIds,

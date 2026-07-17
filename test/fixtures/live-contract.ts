@@ -1,4 +1,10 @@
+import type {
+  CreateUserListInput,
+  GitHubPort,
+  GitHubUserList,
+} from "../../src/app/ports/github-port.js";
 import { AppError } from "../../src/domain/errors.js";
+import type { UserListId } from "../../src/domain/ids.js";
 
 export type LiveContractConfig = Readonly<{
   login: string;
@@ -8,6 +14,28 @@ export type LiveContractConfig = Readonly<{
 
 const LOGIN = /^(?!-)(?!.*-$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/u;
 const FIXTURE_SUFFIX = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,69})$/u;
+
+export async function verifyCreatedUserListReadback(
+  github: Pick<GitHubPort, "getUserList">,
+  listId: UserListId,
+  expected: CreateUserListInput,
+): Promise<GitHubUserList> {
+  const observed = await github.getUserList(listId);
+  if (
+    observed === null ||
+    observed.listId !== listId ||
+    observed.name !== expected.name ||
+    observed.description !== expected.description ||
+    observed.isPrivate !== expected.isPrivate
+  ) {
+    throw new AppError(
+      "PRECONDITION_FAILED",
+      "Disposable User List creation readback was not exact",
+      { retryable: false },
+    );
+  }
+  return observed;
+}
 
 function invalidGuard(guard: string): AppError {
   return new AppError(
