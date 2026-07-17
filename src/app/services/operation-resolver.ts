@@ -311,7 +311,11 @@ function repositoryMemberships(
       pageSize: PAGE_SIZE,
       cursor,
     });
-    if (page.selector.kind !== "repository" || !("listIds" in page)) {
+    if (
+      page.selector.kind !== "repository" ||
+      !("listIds" in page) ||
+      page.selector.repositoryId !== repositoryId
+    ) {
       storageFailure("membership query returned the wrong selector");
     }
     result.push(...page.listIds);
@@ -340,7 +344,11 @@ function listMembers(
       pageSize: PAGE_SIZE,
       cursor,
     });
-    if (page.selector.kind !== "list" || !("repositoryIds" in page)) {
+    if (
+      page.selector.kind !== "list" ||
+      !("repositoryIds" in page) ||
+      page.selector.listId !== listId
+    ) {
       storageFailure("membership query returned the wrong selector");
     }
     result.push(...page.repositoryIds);
@@ -909,18 +917,21 @@ export function resolveOperationRequests(
       invalid(`List ${listId} cannot be updated and deleted in one plan`);
     }
     for (const membership of memberships.values()) {
-      if (membership.mentionedExisting.has(listId)) {
+      if (
+        membership.mentionedExisting.has(listId) ||
+        membership.expectedListIds.includes(listId)
+      ) {
         invalid(
-          `List ${listId} cannot be deleted and explicitly targeted by membership changes`,
+          `List ${listId} cannot be deleted and combined with membership changes`,
         );
       }
     }
   }
-  for (const membership of memberships.values()) {
-    for (const target of [
-      ...(membership.setTargets?.values() ?? []),
-      ...membership.additions.values(),
-    ]) {
+  for (const action of uniqueActions) {
+    if (!("lists" in action) || action.kind === "list_membership_remove") {
+      continue;
+    }
+    for (const target of action.lists) {
       if (target.kind === "created" && !creates.has(target.clientRef)) {
         invalid(
           `Created List reference ${target.clientRef} has no matching create action`,

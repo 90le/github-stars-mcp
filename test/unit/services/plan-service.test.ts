@@ -276,6 +276,46 @@ describe("PlanService", () => {
     ).toBe(true);
   });
 
+  it.each(["repository", "list"] as const)(
+    "rejects a membership page that echoes the wrong %s selector ID",
+    async (direction) => {
+      const fixture = plannerFixture({
+        membershipSelectorMismatch: direction,
+      });
+      const actions: PlanRequest["actions"] =
+        direction === "repository"
+          ? [
+              {
+                kind: "list_membership_add",
+                repositories: {
+                  kind: "ids",
+                  repositoryIds: [fixture.ids.removeRepository],
+                },
+                lists: [{ kind: "existing", listId: fixture.ids.addList }],
+              },
+            ]
+          : [
+              {
+                kind: "list_delete",
+                listIds: [fixture.ids.addList],
+              },
+            ];
+
+      await rejection(
+        fixture.service.create({
+          snapshotId: fixture.snapshot.id,
+          actions,
+          protectedRepositoryIds: [],
+          protectedListIds: [],
+        }),
+        "STORAGE_ERROR",
+      );
+      expect(fixture.tracking.membershipQueries.length).toBeGreaterThan(0);
+      expect(fixture.tracking.savedPlans).toEqual([]);
+      expect(fixture.tracking.transactionCalls).toBe(0);
+    },
+  );
+
   it.each(["unavailable", "omitted"] as const)(
     "rejects List work on %s coverage before saving",
     async (listCoverage) => {
@@ -491,18 +531,28 @@ describe("PlanService", () => {
       description: "old",
       isPrivate: true,
     });
-    const member = repositoryFixture({
+    const deleteMember = repositoryFixture({
       repositoryId: asRepositoryId("R_delete_member"),
       repositoryDatabaseId: asRepositoryDatabaseId("7001"),
       name: "delete-member",
       fullName: "acme/delete-member",
       url: "https://github.com/acme/delete-member",
     });
+    const membershipTarget = repositoryFixture({
+      repositoryId: asRepositoryId("R_membership_target"),
+      repositoryDatabaseId: asRepositoryDatabaseId("7002"),
+      name: "membership-target",
+      fullName: "acme/membership-target",
+      url: "https://github.com/acme/membership-target",
+    });
     const fixture = plannerFixture({
-      repositories: [member],
+      repositories: [deleteMember, membershipTarget],
       lists: [deleteList],
       memberships: [
-        { listId: deleteList.listId, repositoryId: member.repositoryId },
+        {
+          listId: deleteList.listId,
+          repositoryId: deleteMember.repositoryId,
+        },
       ],
     });
 
@@ -513,7 +563,7 @@ describe("PlanService", () => {
           kind: "list_membership_set",
           repositories: {
             kind: "ids",
-            repositoryIds: [member.repositoryId],
+            repositoryIds: [membershipTarget.repositoryId],
           },
           lists: [{ kind: "created", clientRef: "future" }],
         },
@@ -554,7 +604,7 @@ describe("PlanService", () => {
         updatedAt: deleteList.updatedAt,
         lastAddedAt: deleteList.lastAddedAt,
       },
-      repositoryIds: [member.repositoryId],
+      repositoryIds: [deleteMember.repositoryId],
     });
     expect(membership).toMatchObject({
       dependsOn: [create.operationId],
@@ -632,6 +682,89 @@ describe("PlanService", () => {
     expect(missing.tracking.savedPlans).toEqual([]);
     expect(duplicate.tracking.savedPlans).toEqual([]);
     expect(updateDelete.tracking.savedPlans).toEqual([]);
+  });
+
+  it("rejects List deletion when a complete membership set implicitly removes that List", async () => {
+    const fixture = plannerFixture();
+
+    await rejection(
+      fixture.service.create({
+        snapshotId: fixture.snapshot.id,
+        actions: [
+          {
+            kind: "list_delete",
+            listIds: [fixture.ids.existingList],
+          },
+          {
+            kind: "list_membership_set",
+            repositories: {
+              kind: "ids",
+              repositoryIds: [fixture.ids.removeRepository],
+            },
+            lists: [],
+          },
+        ],
+        protectedRepositoryIds: [],
+        protectedListIds: [],
+      }),
+      "VALIDATION_ERROR",
+    );
+    expect(fixture.tracking.savedPlans).toEqual([]);
+    expect(fixture.tracking.transactionCalls).toBe(0);
+  });
+
+  it("rejects missing created List references when a selector matches no repositories", async () => {
+    const fixture = plannerFixture();
+
+    await rejection(
+      fixture.service.create({
+        snapshotId: fixture.snapshot.id,
+        actions: [
+          {
+            kind: "list_membership_set",
+            repositories: {
+              kind: "filter",
+              filter: {
+                field: "stargazer_count",
+                op: "gt",
+                value: 1_000_000,
+              },
+            },
+            lists: [{ kind: "created", clientRef: "missing" }],
+          },
+        ],
+        protectedRepositoryIds: [],
+        protectedListIds: [],
+      }),
+      "VALIDATION_ERROR",
+    );
+    expect(fixture.tracking.savedPlans).toEqual([]);
+    expect(fixture.tracking.transactionCalls).toBe(0);
+  });
+
+  it("rejects missing created List references when all repositories are protected", async () => {
+    const fixture = plannerFixture();
+
+    await rejection(
+      fixture.service.create({
+        snapshotId: fixture.snapshot.id,
+        actions: [
+          {
+            kind: "list_membership_add",
+            repositories: {
+              kind: "ids",
+              repositoryIds: [fixture.ids.removeRepository],
+            },
+            lists: [{ kind: "created", clientRef: "missing" }],
+          },
+        ],
+        protectedRepositoryIds: [fixture.ids.removeRepository],
+        protectedListIds: [],
+      }),
+      "VALIDATION_ERROR",
+    );
+    expect(fixture.tracking.savedPlans).toEqual([]);
+    expect(fixture.tracking.transactionCalls).toBe(0);
   });
 
   it("enforces configured TTL and operation ceilings with non-retryable errors", async () => {

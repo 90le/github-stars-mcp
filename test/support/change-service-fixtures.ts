@@ -306,6 +306,7 @@ function trackedStorage(
   storage: StoragePort,
   tracking: StorageTracking,
   failSave: boolean,
+  membershipSelectorMismatch: "repository" | "list" | undefined,
 ): StoragePort {
   const facade: StoragePort = {
     ...storage,
@@ -319,7 +320,40 @@ function trackedStorage(
     },
     queryListMemberships(input: ListMembershipQuery) {
       tracking.membershipQueries.push(input);
-      return storage.queryListMemberships(input);
+      const page = storage.queryListMemberships(input);
+      if (
+        input.cursor !== null ||
+        membershipSelectorMismatch !== input.selector.kind
+      ) {
+        return page;
+      }
+      if (
+        membershipSelectorMismatch === "repository" &&
+        page.selector.kind === "repository" &&
+        "listIds" in page
+      ) {
+        return Object.freeze({
+          ...page,
+          selector: Object.freeze({
+            kind: "repository" as const,
+            repositoryId: asRepositoryId("R_wrong_echo"),
+          }),
+        });
+      }
+      if (
+        membershipSelectorMismatch === "list" &&
+        page.selector.kind === "list" &&
+        "repositoryIds" in page
+      ) {
+        return Object.freeze({
+          ...page,
+          selector: Object.freeze({
+            kind: "list" as const,
+            listId: asUserListId("UL_wrong_echo"),
+          }),
+        });
+      }
+      return page;
     },
     withTransaction<T>(callback: (transaction: StorageTransaction) => T): T {
       tracking.transactionCalls += 1;
@@ -359,6 +393,7 @@ export function plannerFixture(
     starredRepositoryIds?: readonly RepositoryId[];
     failSave?: boolean;
     cyclicResolver?: boolean;
+    membershipSelectorMismatch?: "repository" | "list";
   }> = {},
 ) {
   const ids = Object.freeze({
@@ -420,6 +455,7 @@ export function plannerFixture(
     memoryStorage,
     tracking,
     options.failSave ?? false,
+    options.membershipSelectorMismatch,
   );
   const runtime = fixtureRuntime();
   const config = Object.freeze({
