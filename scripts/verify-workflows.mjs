@@ -40,8 +40,10 @@ const TOKEN_LITERAL =
 const SECRETS_CONTEXT = /\bsecrets\b/iu;
 const GITHUB_TOKEN_CONTEXT = /\bgithub\s*\.\s*token\b/iu;
 const GITHUB_INDEX_CONTEXT = /\bgithub\s*\[/iu;
+const GITHUB_OBJECT_FILTER_CONTEXT = /\bgithub\s*\.\s*\*/iu;
 const COMPLETE_GITHUB_CONTEXT = /\bgithub\b(?!\s*(?:\.|\[))/iu;
-const RELEASE_SHELL_CONTROL = /[\r\n;&|<>`]|\$\(/u;
+const RELEASE_COMMAND =
+  'gh release create "${{ github.ref_name }}" --verify-tag';
 const RELEASE_STEP_KEYS = new Set(["name", "env", "run"]);
 const RELEASE_ROOT_PERMISSIONS = Object.freeze({
   attestations: "write",
@@ -189,6 +191,7 @@ function hasCredentialReference(value) {
       SECRETS_CONTEXT.test(expression) ||
       GITHUB_TOKEN_CONTEXT.test(expression) ||
       GITHUB_INDEX_CONTEXT.test(expression) ||
+      GITHUB_OBJECT_FILTER_CONTEXT.test(expression) ||
       COMPLETE_GITHUB_CONTEXT.test(expression)
     ) {
       return true;
@@ -533,6 +536,10 @@ function validatePackageSmoke(context) {
   );
 
   const steps = stepMaps(context, "package-smoke");
+  const job = nodeAt(context.root, ["jobs", "package-smoke"]);
+  if (hasMapKey(job, "if") || hasMapKey(job, "continue-on-error")) {
+    issueAt(context, job, "PACKAGE_EXECUTION_POLICY");
+  }
   expectStepValues(
     context,
     steps,
@@ -547,6 +554,22 @@ function validatePackageSmoke(context) {
     ["npm ci", "npm run build", "npm run package:verify"],
     "PACKAGE_COMMANDS",
   );
+  const requiredActions = new Set([PINS.checkout, PINS.setupNode]);
+  const requiredCommands = new Set([
+    "npm ci",
+    "npm run build",
+    "npm run package:verify",
+  ]);
+  for (const step of steps) {
+    const action = scalarText(pairAt(step, "uses")?.value);
+    const command = scalarText(pairAt(step, "run")?.value);
+    if (
+      (requiredActions.has(action) || requiredCommands.has(command)) &&
+      (hasMapKey(step, "if") || hasMapKey(step, "continue-on-error"))
+    ) {
+      issueAt(context, step, "PACKAGE_EXECUTION_POLICY");
+    }
+  }
   const probeStep = steps.find(
     (step) =>
       scalarText(pairAt(step, "run")?.value) === "npm run package:verify",
@@ -623,22 +646,7 @@ function isGhReleaseStep(step) {
   }
 
   const command = scalarText(pairAt(step, "run")?.value);
-  if (
-    command === undefined ||
-    command.trim() !== command ||
-    RELEASE_SHELL_CONTROL.test(command)
-  ) {
-    return false;
-  }
-  const tokens = command.split(" ");
-  return (
-    tokens.length >= 5 &&
-    tokens.every((token) => token.length > 0) &&
-    tokens[0] === "gh" &&
-    tokens[1] === "release" &&
-    tokens[2] === "create" &&
-    tokens.at(-1) === "--verify-tag"
-  );
+  return command === RELEASE_COMMAND;
 }
 
 function allowedReleaseTokenNodes(context) {
@@ -677,6 +685,14 @@ function validateReleaseJob(
       context,
       pairAt(job, "environment")?.value ?? job,
       "RELEASE_ENVIRONMENT",
+    );
+  }
+
+  if (name === "release" && hasMapKey(job, "defaults")) {
+    issueAt(
+      context,
+      pairAt(job, "defaults")?.key ?? job,
+      "RELEASE_SHELL_POLICY",
     );
   }
 

