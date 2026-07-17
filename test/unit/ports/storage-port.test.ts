@@ -1,3 +1,6 @@
+import { Buffer } from "node:buffer";
+import { Hash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import { describe, expect, test } from "vitest";
 import type {
   LeaseGuard,
@@ -56,6 +59,43 @@ function openStore(): StoragePort {
   const store = createMemoryStorage({ cursorKey: new Uint8Array(32).fill(7) });
   store.migrate();
   return store;
+}
+
+const definePropertyForTest = Object.defineProperty;
+const deletePropertyForTest = Reflect.deleteProperty;
+const getOwnPropertyDescriptorForTest = Object.getOwnPropertyDescriptor;
+
+function defineTemporaryOwnPropertyForTest(
+  target: object,
+  property: PropertyKey,
+  descriptor: PropertyDescriptor,
+): () => void {
+  const previous = getOwnPropertyDescriptorForTest(target, property);
+  definePropertyForTest(target, property, descriptor);
+  return () => {
+    if (previous === undefined) {
+      deletePropertyForTest(target, property);
+    } else {
+      definePropertyForTest(target, property, previous);
+    }
+  };
+}
+
+function replaceOwnPropertyForTest(
+  target: object,
+  property: PropertyKey,
+  value: unknown,
+): () => void {
+  const descriptor = getOwnPropertyDescriptorForTest(target, property);
+  if (descriptor === undefined || !("value" in descriptor)) {
+    throw new Error(`Expected mutable data property ${String(property)}`);
+  }
+  return defineTemporaryOwnPropertyForTest(target, property, {
+    configurable: descriptor.configurable === true,
+    enumerable: descriptor.enumerable === true,
+    value,
+    writable: descriptor.writable === true,
+  });
 }
 
 function acquireSync(store: StoragePort): void {
@@ -470,6 +510,78 @@ describe("synchronous revocable transactions", () => {
     expect(proxyTrapCalls).toBe(0);
   });
 
+  test("captures exotic brand predicates before callbacks can replace them", () => {
+    const originalIsProxy = utilTypes.isProxy;
+    const originalIsMap = utilTypes.isMap;
+    const proxyStore = openStore();
+    const mapStore = openStore();
+    let proxyTrapCalls = 0;
+    const disguisedProxy = new Proxy(
+      {},
+      {
+        getOwnPropertyDescriptor() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getPrototypeOf() {
+          proxyTrapCalls += 1;
+          return null;
+        },
+        ownKeys() {
+          proxyTrapCalls += 1;
+          return [];
+        },
+      },
+    );
+    const disguisedMap = new Map<unknown, unknown>([
+      ["hidden", Promise.resolve("hidden")],
+    ]);
+    Object.setPrototypeOf(disguisedMap, null);
+    let proxyError: unknown;
+    let mapError: unknown;
+    let restoreIsProxy: (() => void) | undefined;
+    let restoreIsMap: (() => void) | undefined;
+
+    try {
+      proxyStore.withTransaction((tx) => {
+        tx.savePlan(changePlanFixture);
+        restoreIsProxy = replaceOwnPropertyForTest(
+          utilTypes,
+          "isProxy",
+          () => false,
+        );
+        return disguisedProxy;
+      });
+    } catch (error) {
+      proxyError = error;
+    } finally {
+      restoreIsProxy?.();
+    }
+    try {
+      mapStore.withTransaction((tx) => {
+        tx.savePlan(changePlanFixture);
+        restoreIsMap = replaceOwnPropertyForTest(
+          utilTypes,
+          "isMap",
+          () => false,
+        );
+        return disguisedMap;
+      });
+    } catch (error) {
+      mapError = error;
+    } finally {
+      restoreIsMap?.();
+    }
+
+    expect(utilTypes.isProxy).toBe(originalIsProxy);
+    expect(utilTypes.isMap).toBe(originalIsMap);
+    expect(proxyError).toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(mapError).toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(proxyTrapCalls).toBe(0);
+    expect(proxyStore.getPlan(changePlanFixture.id)).toBeNull();
+    expect(mapStore.getPlan(changePlanFixture.id)).toBeNull();
+  });
+
   test("discards undetectable private slots and returns only a frozen detached clone", () => {
     let proxyTrapCalls = 0;
     const hiddenProxy = new Proxy(
@@ -587,6 +699,263 @@ describe("synchronous revocable transactions", () => {
     });
     expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
   });
+
+  test("captures JSON clone and recursive-freeze intrinsics before callbacks can replace them", () => {
+    const originalJsonParse = JSON.parse;
+    const originalObjectFreeze = Object.freeze;
+    const originalObjectKeys = Object.keys;
+    const source = {
+      nested: { status: "committed" },
+      rows: [{ value: 1 }],
+    };
+    const store = openStore();
+    let returned: typeof source | undefined;
+    let caught: unknown;
+    let restoreJsonParse: (() => void) | undefined;
+    let restoreObjectFreeze: (() => void) | undefined;
+    let restoreObjectKeys: (() => void) | undefined;
+
+    try {
+      try {
+        returned = store.withTransaction((tx) => {
+          tx.savePlan(changePlanFixture);
+          restoreJsonParse = replaceOwnPropertyForTest(
+            JSON,
+            "parse",
+            () => source,
+          );
+          restoreObjectFreeze = replaceOwnPropertyForTest(
+            Object,
+            "freeze",
+            <T>(value: T): T => value,
+          );
+          restoreObjectKeys = replaceOwnPropertyForTest(
+            Object,
+            "keys",
+            () => [],
+          );
+          return source;
+        });
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      restoreObjectKeys?.();
+      restoreObjectFreeze?.();
+      restoreJsonParse?.();
+    }
+
+    expect(JSON.parse).toBe(originalJsonParse);
+    expect(Object.freeze).toBe(originalObjectFreeze);
+    expect(Object.keys).toBe(originalObjectKeys);
+    expect(caught).toBeUndefined();
+    expect(returned).toEqual(source);
+    expect(returned).not.toBe(source);
+    expect(returned?.nested).not.toBe(source.nested);
+    expect(returned?.rows).not.toBe(source.rows);
+    expect(Object.isFrozen(returned)).toBe(true);
+    expect(Object.isFrozen(returned?.nested)).toBe(true);
+    expect(Object.isFrozen(returned?.rows)).toBe(true);
+    expect(Object.isFrozen(returned?.rows[0])).toBe(true);
+    source.nested.status = "mutated";
+    source.rows[0] = { value: 2 };
+    expect(returned).toEqual({
+      nested: { status: "committed" },
+      rows: [{ value: 1 }],
+    });
+    expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+  });
+
+  /* eslint-disable @typescript-eslint/unbound-method -- This regression test records and compares method identities without invoking them unbound. */
+  test("captures every mutable canonical and hash operation used after callback entry", () => {
+    const originals = {
+      jsonStringify: JSON.stringify,
+      objectFreeze: Object.freeze,
+      objectHasOwn: Object.hasOwn,
+      objectIs: Object.is,
+      objectKeys: Object.keys,
+      reflectApply: Reflect.apply,
+      reflectDefineProperty: Reflect.defineProperty,
+      reflectGetOwnPropertyDescriptor: Reflect.getOwnPropertyDescriptor,
+      reflectGetPrototypeOf: Reflect.getPrototypeOf,
+      reflectOwnKeys: Reflect.ownKeys,
+      reflectSetPrototypeOf: Reflect.setPrototypeOf,
+      arrayIsArray: Array.isArray,
+      arrayIterator: Array.prototype[Symbol.iterator],
+      arrayJoin: Array.prototype.join,
+      arrayPush: Array.prototype.push,
+      arraySort: Array.prototype.sort,
+      arrayZeroDescriptor: getOwnPropertyDescriptorForTest(
+        Array.prototype,
+        "0",
+      ),
+      numberIsFinite: Number.isFinite,
+      numberIsSafeInteger: Number.isSafeInteger,
+      bufferByteLength: Buffer.byteLength,
+      setConstructor: globalThis.Set,
+      stringConstructor: globalThis.String,
+      setAdd: Set.prototype.add,
+      setDelete: Set.prototype.delete,
+      setHas: Set.prototype.has,
+      hashUpdate: Hash.prototype.update,
+      hashDigest: Hash.prototype.digest,
+    };
+    const restorers: Array<() => void> = [];
+    function patch(
+      target: object,
+      property: PropertyKey,
+      value: unknown,
+    ): void {
+      restorers[restorers.length] = replaceOwnPropertyForTest(
+        target,
+        property,
+        value,
+      );
+    }
+
+    const store = openStore();
+    let returned:
+      | {
+          canonical: string;
+          hash: string;
+          payload: { z: number; a: readonly [boolean, null]; n: number };
+        }
+      | undefined;
+    let caught: unknown;
+    let arrayPrototypeSetterCalls = 0;
+
+    try {
+      try {
+        returned = store.withTransaction((tx) => {
+          tx.savePlan(changePlanFixture);
+          patch(JSON, "stringify", () => '"tampered"');
+          patch(Object, "freeze", <T>(value: T): T => value);
+          patch(Object, "hasOwn", () => false);
+          patch(Object, "is", () => false);
+          patch(Object, "keys", () => []);
+          patch(Reflect, "apply", () => {
+            throw new Error("mutable Reflect.apply must not run");
+          });
+          patch(Reflect, "defineProperty", () => false);
+          patch(Reflect, "getOwnPropertyDescriptor", () => undefined);
+          patch(Reflect, "getPrototypeOf", () => null);
+          patch(Reflect, "ownKeys", () => []);
+          patch(Reflect, "setPrototypeOf", () => false);
+          patch(Array, "isArray", () => false);
+          patch(Number, "isFinite", () => false);
+          patch(Number, "isSafeInteger", () => false);
+          patch(Buffer, "byteLength", () => 0);
+          patch(
+            Set.prototype,
+            "add",
+            function poisonedSetAdd(this: Set<unknown>) {
+              return this;
+            },
+          );
+          patch(Set.prototype, "delete", () => false);
+          patch(Set.prototype, "has", () => false);
+          patch(
+            Hash.prototype,
+            "update",
+            function poisonedHashUpdate(this: Hash) {
+              return this;
+            },
+          );
+          patch(Hash.prototype, "digest", () => "tampered");
+          patch(
+            globalThis,
+            "Set",
+            class PoisonedSet {
+              readonly poisoned = true;
+            },
+          );
+          patch(globalThis, "String", () => "tampered");
+          patch(
+            Array.prototype,
+            "sort",
+            function poisonedSort(this: unknown[]) {
+              return this;
+            },
+          );
+          patch(Array.prototype, Symbol.iterator, () => {
+            throw new Error("mutable Array iterator must not run");
+          });
+          patch(Array.prototype, "join", () => "tampered");
+          patch(Array.prototype, "push", () => 0);
+          restorers[restorers.length] = defineTemporaryOwnPropertyForTest(
+            Array.prototype,
+            "0",
+            {
+              configurable: true,
+              set() {
+                arrayPrototypeSetterCalls += 1;
+              },
+            },
+          );
+          const payload = {
+            z: 1,
+            a: [true, null] as const,
+            n: -0,
+          };
+          return {
+            canonical: canonicalJson(payload),
+            hash: sha256Hex("abc"),
+            payload,
+          };
+        });
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      for (let index = restorers.length - 1; index >= 0; index -= 1) {
+        restorers[index]?.();
+      }
+    }
+
+    expect(JSON.stringify).toBe(originals.jsonStringify);
+    expect(Object.freeze).toBe(originals.objectFreeze);
+    expect(Object.hasOwn).toBe(originals.objectHasOwn);
+    expect(Object.is).toBe(originals.objectIs);
+    expect(Object.keys).toBe(originals.objectKeys);
+    expect(Reflect.apply).toBe(originals.reflectApply);
+    expect(Reflect.defineProperty).toBe(originals.reflectDefineProperty);
+    expect(Reflect.getOwnPropertyDescriptor).toBe(
+      originals.reflectGetOwnPropertyDescriptor,
+    );
+    expect(Reflect.getPrototypeOf).toBe(originals.reflectGetPrototypeOf);
+    expect(Reflect.ownKeys).toBe(originals.reflectOwnKeys);
+    expect(Reflect.setPrototypeOf).toBe(originals.reflectSetPrototypeOf);
+    expect(Array.isArray).toBe(originals.arrayIsArray);
+    expect(Array.prototype[Symbol.iterator]).toBe(originals.arrayIterator);
+    expect(Array.prototype.join).toBe(originals.arrayJoin);
+    expect(Array.prototype.push).toBe(originals.arrayPush);
+    expect(Array.prototype.sort).toBe(originals.arraySort);
+    expect(Number.isFinite).toBe(originals.numberIsFinite);
+    expect(Number.isSafeInteger).toBe(originals.numberIsSafeInteger);
+    expect(Buffer.byteLength).toBe(originals.bufferByteLength);
+    expect(globalThis.Set).toBe(originals.setConstructor);
+    expect(globalThis.String).toBe(originals.stringConstructor);
+    expect(Set.prototype.add).toBe(originals.setAdd);
+    expect(Set.prototype.delete).toBe(originals.setDelete);
+    expect(Set.prototype.has).toBe(originals.setHas);
+    expect(Hash.prototype.update).toBe(originals.hashUpdate);
+    expect(Hash.prototype.digest).toBe(originals.hashDigest);
+    expect(getOwnPropertyDescriptorForTest(Array.prototype, "0")).toEqual(
+      originals.arrayZeroDescriptor,
+    );
+    expect(arrayPrototypeSetterCalls).toBe(0);
+    expect(caught).toBeUndefined();
+    expect(returned).toEqual({
+      canonical: '{"a":[true,null],"n":0,"z":1}',
+      hash: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+      payload: { z: 1, a: [true, null], n: 0 },
+    });
+    expect(Object.isFrozen(returned)).toBe(true);
+    expect(Object.isFrozen(returned?.payload)).toBe(true);
+    expect(Object.isFrozen(returned?.payload.a)).toBe(true);
+    expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+  });
+  /* eslint-enable @typescript-eslint/unbound-method */
 
   test("poisons caught root reentry and nested transactions", () => {
     const store = openStore();

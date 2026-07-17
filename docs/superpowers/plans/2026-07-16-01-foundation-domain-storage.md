@@ -1003,10 +1003,17 @@ identity, prototype, class identity, and private/internal slots are not
 preserved. A prototype-erased object whose hidden brand cannot be recognized
 may canonicalize to only its enumerable data (often `{}`), but the original
 object never escapes. This does not claim that every disguised class is
-detectable. Validation and cloning run before a final poison-state check, so a
-caught reentry during validation cannot commit. Any rejection rolls back every
-Map/index/lease/attempt mutation. The facade is revoked before commit/rollback
-returns, so a captured
+detectable. Every mutable realm operation in the canonical
+serialize/clone/freeze/hash pipeline—including native-brand predicates,
+JSON/Object/Reflect/Array/Set operations, byte measurement, and hash
+update/digest methods—is captured at module initialization in a private frozen
+intrinsic table. A callback therefore cannot weaken this boundary by replacing
+globals or prototype properties, and the implementation does not freeze or
+modify global prototypes. Internal work arrays have null prototypes so
+inherited numeric setters cannot run. Validation and cloning run before a final poison-state
+check, so a caught reentry during validation cannot commit. Any rejection
+rolls back every Map/index/lease/attempt mutation. The facade is revoked before
+commit/rollback returns, so a captured
 `tx` cannot mutate later. It exposes no raw SQL, generic query, `execute`, or
 async transaction.
 
@@ -1018,7 +1025,9 @@ Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.te
   rejected recognizable prototype-erased exotics and
   Promise/Proxy/function/class/container/accessor/symbol/sparse/cyclic results
   with zero getter/trap calls; safe enumerable-only canonicalization of
-  undetectable prototype-erased private-slot instances; nested transaction;
+  undetectable prototype-erased private-slot instances; callback replacement
+  of representative util.types, JSON, Object, Reflect, Array, Number, Buffer,
+  Set, and Hash operations with full realm restoration; nested transaction;
   root-store reentry; and leaked facade calls after commit and rollback;
 - detached/deep-frozen reads after caller mutation, hostile
   accessor/proxy/symbol/sparse/custom-prototype input, and inert
@@ -1767,10 +1776,11 @@ secure state path -> open/verify SQLite -> migrate under BEGIN IMMEDIATE
 It delegates every port method, makes `close` idempotent, and implements
 `withTransaction` through an immediate transaction plus the same
 recognizable-exotic rejection, detached recursively frozen canonical return
-channel, final poison check, and revocable-facade semantics as the memory
-store. Nested transactions and root-store reentry (including migrate/close)
-are rejected while the callback is active. Callback writes roll back before
-an async result can escape; no transaction crosses `await`.
+channel backed by the same module-load-captured intrinsic table, final poison
+check, and revocable-facade semantics as the memory store. Nested transactions
+and root-store reentry (including migrate/close) are rejected while the
+callback is active. Callback writes roll back before an async result can
+escape; no transaction crosses `await`.
 
 - [ ] **Step 4: Run complete foundation and reopen verification**
 Run `npm test -- test/unit test/integration/storage && npm run test:coverage && npm run format:check && npm run lint && npm run typecheck && npm run build && git diff --check`; expect full success, coverage gates, and reopen tests proving one-time lease-aware recovery, one run per plan, attempt-history continuity, cursor continuity, transactional thenable rollback, no hash/before-state changes, timestamp-order CHECK rejection, initial-projection INSERT rejection, current-attempt-only reconciliation, matching-event projection updates, and append-only reconciliation events through raw SQL negative cases.

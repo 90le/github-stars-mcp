@@ -1,5 +1,5 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, Hash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 import { AppError } from "./errors.js";
 import type { JsonValue } from "./json.js";
@@ -8,6 +8,58 @@ const MAX_DEPTH = 64;
 const MAX_NODES = 1_000_000;
 const MAX_STRING_CODE_UNITS = 1_048_576;
 const MAX_CANONICAL_BYTES = 64 * 1_024 * 1_024;
+
+const freezeIntrinsicRecord = Object.freeze;
+/* eslint-disable @typescript-eslint/unbound-method -- Method intrinsics are deliberately captured and invoked only through captured Reflect.apply. */
+const INTRINSICS = freezeIntrinsicRecord({
+  arrayIsArray: Array.isArray,
+  arrayJoin: Array.prototype.join,
+  arrayPrototype: Array.prototype,
+  arraySort: Array.prototype.sort,
+  bufferByteLength: Buffer.byteLength,
+  createHash,
+  hashDigest: Hash.prototype.digest,
+  hashUpdate: Hash.prototype.update,
+  jsonParse: JSON.parse,
+  jsonStringify: JSON.stringify,
+  numberIsFinite: Number.isFinite,
+  numberIsSafeInteger: Number.isSafeInteger,
+  objectFreeze: freezeIntrinsicRecord,
+  objectHasOwn: Object.hasOwn,
+  objectIs: Object.is,
+  objectKeys: Object.keys,
+  objectPrototype: Object.prototype,
+  reflectApply: Reflect.apply,
+  reflectDefineProperty: Reflect.defineProperty,
+  reflectGetOwnPropertyDescriptor: Reflect.getOwnPropertyDescriptor,
+  reflectGetPrototypeOf: Reflect.getPrototypeOf,
+  reflectOwnKeys: Reflect.ownKeys,
+  reflectSetPrototypeOf: Reflect.setPrototypeOf,
+  setAdd: Set.prototype.add,
+  setConstructor: Set,
+  setDelete: Set.prototype.delete,
+  setHas: Set.prototype.has,
+  stringFromValue: String,
+  utilIsAnyArrayBuffer: utilTypes.isAnyArrayBuffer,
+  utilIsArgumentsObject: utilTypes.isArgumentsObject,
+  utilIsArrayBufferView: utilTypes.isArrayBufferView,
+  utilIsBoxedPrimitive: utilTypes.isBoxedPrimitive,
+  utilIsDate: utilTypes.isDate,
+  utilIsExternal: utilTypes.isExternal,
+  utilIsGeneratorObject: utilTypes.isGeneratorObject,
+  utilIsMap: utilTypes.isMap,
+  utilIsMapIterator: utilTypes.isMapIterator,
+  utilIsModuleNamespaceObject: utilTypes.isModuleNamespaceObject,
+  utilIsNativeError: utilTypes.isNativeError,
+  utilIsPromise: utilTypes.isPromise,
+  utilIsProxy: utilTypes.isProxy,
+  utilIsRegExp: utilTypes.isRegExp,
+  utilIsSet: utilTypes.isSet,
+  utilIsSetIterator: utilTypes.isSetIterator,
+  utilIsWeakMap: utilTypes.isWeakMap,
+  utilIsWeakSet: utilTypes.isWeakSet,
+});
+/* eslint-enable @typescript-eslint/unbound-method */
 
 class CanonicalJsonFailure extends Error {}
 
@@ -20,27 +72,52 @@ function failCanonicalJson(): never {
   throw new CanonicalJsonFailure();
 }
 
+function createInternalArray<T>(): T[] {
+  const value: T[] = [];
+  if (!INTRINSICS.reflectSetPrototypeOf(value, null)) {
+    return failCanonicalJson();
+  }
+  return value;
+}
+
+function appendInternalArray<T>(target: T[], value: T): void {
+  if (
+    !INTRINSICS.reflectDefineProperty(
+      target,
+      INTRINSICS.stringFromValue(target.length),
+      {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+      },
+    )
+  ) {
+    failCanonicalJson();
+  }
+}
+
 function isRecognizableExotic(value: object): boolean {
   try {
     return (
-      utilTypes.isProxy(value) ||
-      utilTypes.isPromise(value) ||
-      utilTypes.isMap(value) ||
-      utilTypes.isSet(value) ||
-      utilTypes.isWeakMap(value) ||
-      utilTypes.isWeakSet(value) ||
-      utilTypes.isDate(value) ||
-      utilTypes.isRegExp(value) ||
-      utilTypes.isNativeError(value) ||
-      utilTypes.isAnyArrayBuffer(value) ||
-      utilTypes.isArrayBufferView(value) ||
-      utilTypes.isArgumentsObject(value) ||
-      utilTypes.isBoxedPrimitive(value) ||
-      utilTypes.isMapIterator(value) ||
-      utilTypes.isSetIterator(value) ||
-      utilTypes.isGeneratorObject(value) ||
-      utilTypes.isModuleNamespaceObject(value) ||
-      utilTypes.isExternal(value)
+      INTRINSICS.utilIsProxy(value) ||
+      INTRINSICS.utilIsPromise(value) ||
+      INTRINSICS.utilIsMap(value) ||
+      INTRINSICS.utilIsSet(value) ||
+      INTRINSICS.utilIsWeakMap(value) ||
+      INTRINSICS.utilIsWeakSet(value) ||
+      INTRINSICS.utilIsDate(value) ||
+      INTRINSICS.utilIsRegExp(value) ||
+      INTRINSICS.utilIsNativeError(value) ||
+      INTRINSICS.utilIsAnyArrayBuffer(value) ||
+      INTRINSICS.utilIsArrayBufferView(value) ||
+      INTRINSICS.utilIsArgumentsObject(value) ||
+      INTRINSICS.utilIsBoxedPrimitive(value) ||
+      INTRINSICS.utilIsMapIterator(value) ||
+      INTRINSICS.utilIsSetIterator(value) ||
+      INTRINSICS.utilIsGeneratorObject(value) ||
+      INTRINSICS.utilIsModuleNamespaceObject(value) ||
+      INTRINSICS.utilIsExternal(value)
     );
   } catch {
     return true;
@@ -56,40 +133,45 @@ function inspectPlainObject(
   value: object,
   budget: SerializationBudget,
 ): readonly InspectedProperty[] {
-  if (utilTypes.isProxy(value) || Array.isArray(value)) {
+  if (INTRINSICS.utilIsProxy(value) || INTRINSICS.arrayIsArray(value)) {
     return failCanonicalJson();
   }
-  const prototype = Reflect.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) {
+  const prototype = INTRINSICS.reflectGetPrototypeOf(value);
+  if (prototype !== INTRINSICS.objectPrototype && prototype !== null) {
     return failCanonicalJson();
   }
 
-  const keys = Reflect.ownKeys(value);
+  const keys = INTRINSICS.reflectOwnKeys(value);
   if (
     keys.length > MAX_NODES - budget.nodes ||
     keys.length * 5 > budget.remainingBytes
   ) {
     return failCanonicalJson();
   }
-  const result: InspectedProperty[] = [];
+  const result = createInternalArray<InspectedProperty>();
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index];
     if (typeof key !== "string" || key.length > MAX_STRING_CODE_UNITS) {
       return failCanonicalJson();
     }
-    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
+    const descriptor = INTRINSICS.reflectGetOwnPropertyDescriptor(value, key);
     if (
       descriptor === undefined ||
-      !Object.hasOwn(descriptor, "value") ||
+      !INTRINSICS.objectHasOwn(descriptor, "value") ||
       descriptor.enumerable !== true
     ) {
       return failCanonicalJson();
     }
-    result.push({ key, value: descriptor.value as unknown });
+    appendInternalArray(result, {
+      key,
+      value: descriptor.value as unknown,
+    });
   }
-  return result.sort((left, right) =>
-    left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
-  );
+  INTRINSICS.reflectApply(INTRINSICS.arraySort, result, [
+    (left: InspectedProperty, right: InspectedProperty) =>
+      left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+  ]);
+  return result;
 }
 
 function inspectDenseArray(
@@ -97,19 +179,22 @@ function inspectDenseArray(
   budget: SerializationBudget,
 ): readonly unknown[] {
   if (
-    utilTypes.isProxy(value) ||
-    !Array.isArray(value) ||
-    Reflect.getPrototypeOf(value) !== Array.prototype
+    INTRINSICS.utilIsProxy(value) ||
+    !INTRINSICS.arrayIsArray(value) ||
+    INTRINSICS.reflectGetPrototypeOf(value) !== INTRINSICS.arrayPrototype
   ) {
     return failCanonicalJson();
   }
 
-  const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, "length");
+  const lengthDescriptor = INTRINSICS.reflectGetOwnPropertyDescriptor(
+    value,
+    "length",
+  );
   if (
     lengthDescriptor === undefined ||
-    !Object.hasOwn(lengthDescriptor, "value") ||
+    !INTRINSICS.objectHasOwn(lengthDescriptor, "value") ||
     typeof lengthDescriptor.value !== "number" ||
-    !Number.isSafeInteger(lengthDescriptor.value) ||
+    !INTRINSICS.numberIsSafeInteger(lengthDescriptor.value) ||
     lengthDescriptor.value < 0
   ) {
     return failCanonicalJson();
@@ -118,32 +203,35 @@ function inspectDenseArray(
   if (length > MAX_NODES - budget.nodes || length * 2 > budget.remainingBytes) {
     return failCanonicalJson();
   }
-  const keys = Reflect.ownKeys(value);
-  if (
-    keys.length !== length + 1 ||
-    keys.some((key) => typeof key !== "string")
-  ) {
+  const keys = INTRINSICS.reflectOwnKeys(value);
+  if (keys.length !== length + 1) {
     return failCanonicalJson();
   }
+  for (let index = 0; index < keys.length; index += 1) {
+    if (typeof keys[index] !== "string") return failCanonicalJson();
+  }
 
-  const result: unknown[] = [];
+  const result = createInternalArray<unknown>();
   for (let index = 0; index < length; index += 1) {
-    const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
+    const descriptor = INTRINSICS.reflectGetOwnPropertyDescriptor(
+      value,
+      INTRINSICS.stringFromValue(index),
+    );
     if (
       descriptor === undefined ||
-      !Object.hasOwn(descriptor, "value") ||
+      !INTRINSICS.objectHasOwn(descriptor, "value") ||
       descriptor.enumerable !== true
     ) {
       return failCanonicalJson();
     }
-    result.push(descriptor.value);
+    appendInternalArray(result, descriptor.value);
   }
   return result;
 }
 
 function consumeBytes(budget: SerializationBudget, count: number): void {
   if (
-    !Number.isSafeInteger(count) ||
+    !INTRINSICS.numberIsSafeInteger(count) ||
     count < 0 ||
     count > budget.remainingBytes
   ) {
@@ -157,8 +245,8 @@ function appendText(
   fragments: string[],
   text: string,
 ): void {
-  consumeBytes(budget, Buffer.byteLength(text, "utf8"));
-  fragments.push(text);
+  consumeBytes(budget, INTRINSICS.bufferByteLength(text, "utf8"));
+  appendInternalArray(fragments, text);
 }
 
 function serialize(
@@ -183,25 +271,27 @@ function serialize(
   }
   if (typeof value === "string") {
     if (value.length > MAX_STRING_CODE_UNITS) return failCanonicalJson();
-    appendText(budget, fragments, JSON.stringify(value));
+    appendText(budget, fragments, INTRINSICS.jsonStringify(value));
     return;
   }
   if (typeof value === "number") {
-    if (!Number.isFinite(value)) return failCanonicalJson();
+    if (!INTRINSICS.numberIsFinite(value)) return failCanonicalJson();
     appendText(
       budget,
       fragments,
-      Object.is(value, -0) ? "0" : JSON.stringify(value),
+      INTRINSICS.objectIs(value, -0) ? "0" : INTRINSICS.jsonStringify(value),
     );
     return;
   }
   if (typeof value !== "object") return failCanonicalJson();
-  if (ancestors.has(value)) return failCanonicalJson();
+  if (INTRINSICS.reflectApply(INTRINSICS.setHas, ancestors, [value])) {
+    return failCanonicalJson();
+  }
   if (isRecognizableExotic(value)) return failCanonicalJson();
 
-  ancestors.add(value);
+  INTRINSICS.reflectApply(INTRINSICS.setAdd, ancestors, [value]);
   try {
-    if (Array.isArray(value)) {
+    if (INTRINSICS.arrayIsArray(value)) {
       appendText(budget, fragments, "[");
       const array = inspectDenseArray(value, budget);
       for (let index = 0; index < array.length; index += 1) {
@@ -218,19 +308,20 @@ function serialize(
       const property = properties[index];
       if (property === undefined) return failCanonicalJson();
       if (index > 0) appendText(budget, fragments, ",");
-      appendText(budget, fragments, JSON.stringify(property.key));
+      appendText(budget, fragments, INTRINSICS.jsonStringify(property.key));
       appendText(budget, fragments, ":");
       serialize(property.value, ancestors, depth + 1, budget, fragments);
     }
     appendText(budget, fragments, "}");
   } finally {
-    ancestors.delete(value);
+    INTRINSICS.reflectApply(INTRINSICS.setDelete, ancestors, [value]);
   }
 }
 
 /**
  * Produces deterministic JSON without consulting user-defined getters,
- * iterators, prototypes, or toJSON hooks.
+ * iterators, prototypes, or toJSON hooks. Every mutable realm operation used
+ * by this module is captured before callers can run.
  */
 export function canonicalJson(value: unknown): string {
   try {
@@ -238,11 +329,19 @@ export function canonicalJson(value: unknown): string {
       nodes: 0,
       remainingBytes: MAX_CANONICAL_BYTES,
     };
-    const fragments: string[] = [];
-    serialize(value, new Set<object>(), 0, budget, fragments);
-    const result = fragments.join("");
+    const fragments = createInternalArray<string>();
+    serialize(
+      value,
+      new INTRINSICS.setConstructor<object>(),
+      0,
+      budget,
+      fragments,
+    );
+    const result = INTRINSICS.reflectApply(INTRINSICS.arrayJoin, fragments, [
+      "",
+    ]);
     if (
-      Buffer.byteLength(result, "utf8") !==
+      INTRINSICS.bufferByteLength(result, "utf8") !==
       MAX_CANONICAL_BYTES - budget.remainingBytes
     ) {
       return failCanonicalJson();
@@ -260,7 +359,9 @@ export function sha256Hex(text: string): string {
   if (typeof text !== "string") {
     throw new AppError("VALIDATION_ERROR", "SHA-256 input must be text");
   }
-  return createHash("sha256").update(text, "utf8").digest("hex");
+  const hash = INTRINSICS.createHash("sha256");
+  INTRINSICS.reflectApply(INTRINSICS.hashUpdate, hash, [text, "utf8"]);
+  return INTRINSICS.reflectApply(INTRINSICS.hashDigest, hash, ["hex"]);
 }
 
 /**
@@ -270,7 +371,7 @@ export function sha256Hex(text: string): string {
 export function canonicalJsonClone(value: unknown): JsonValue {
   const text = canonicalJson(value);
   try {
-    return JSON.parse(text) as JsonValue;
+    return INTRINSICS.jsonParse(text) as JsonValue;
   } catch {
     throw new AppError(
       "VALIDATION_ERROR",
@@ -281,16 +382,19 @@ export function canonicalJsonClone(value: unknown): JsonValue {
 
 export function freezeJsonValue(value: JsonValue): JsonValue {
   if (value === null || typeof value !== "object") return value;
-  if (Array.isArray(value)) {
+  if (INTRINSICS.arrayIsArray(value)) {
     const entries = value as readonly JsonValue[];
     for (let index = 0; index < entries.length; index += 1) {
       freezeJsonValue(entries[index] as JsonValue);
     }
-    return Object.freeze(entries);
+    return INTRINSICS.objectFreeze(entries);
   }
   const object = value as { readonly [key: string]: JsonValue };
-  for (const key of Object.keys(object)) {
+  const keys = INTRINSICS.objectKeys(object);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined) return failCanonicalJson();
     freezeJsonValue(object[key] as JsonValue);
   }
-  return Object.freeze(object);
+  return INTRINSICS.objectFreeze(object);
 }
