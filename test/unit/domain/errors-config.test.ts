@@ -114,9 +114,8 @@ describe("domain errors and redaction", () => {
     });
   });
 
-  test("snapshots a valid non-enumerable registry without indexing or iterating the caller", () => {
+  test("snapshots a valid non-enumerable non-Proxy registry", () => {
     const arbitrarySecret = "descriptor-only-secret";
-    let callerReads = 0;
     const registryTarget: string[] = [];
     Object.defineProperty(registryTarget, "0", {
       configurable: true,
@@ -124,24 +123,17 @@ describe("domain errors and redaction", () => {
       value: arbitrarySecret,
       writable: true,
     });
-    const registry = new Proxy(registryTarget, {
-      get(target, property, receiver) {
-        callerReads += 1;
-        return Reflect.get(target, property, receiver) as unknown;
-      },
-    });
 
     const error = new AppError("AUTH_REQUIRED", `bad ${arbitrarySecret}`, {
       details: { stdout: arbitrarySecret },
-      secrets: registry,
+      secrets: registryTarget,
     });
     Object.defineProperty(registryTarget, "0", {
       value: "caller-mutated-secret",
     });
 
-    expect(callerReads).toBe(0);
     expect(error.secrets).toEqual([arbitrarySecret]);
-    expect(error.secrets).not.toBe(registry);
+    expect(error.secrets).not.toBe(registryTarget);
     expect(Array.isArray(error.secrets)).toBe(true);
     expect(Object.isFrozen(error.secrets)).toBe(true);
     expect(JSON.stringify(serializeError(error))).not.toContain(
@@ -472,6 +464,175 @@ describe("domain errors and redaction", () => {
 
     expect(iteratorCalls).toBe(0);
     expect(redacted).toEqual({ message: "visible [REDACTED]" });
+  });
+
+  test("rejects Proxy secret registries before invoking any Proxy trap", () => {
+    const secret = "proxy-registry-secret";
+    let trapCalls = 0;
+    const target = [secret];
+    const proxySecrets = new Proxy(target, {
+      getPrototypeOf: (value) => {
+        trapCalls += 1;
+        return Reflect.getPrototypeOf(value);
+      },
+      ownKeys: (value) => {
+        trapCalls += 1;
+        return Reflect.ownKeys(value);
+      },
+      getOwnPropertyDescriptor: (value, key) => {
+        trapCalls += 1;
+        return Reflect.getOwnPropertyDescriptor(value, key);
+      },
+    });
+
+    const redacted = redactSecrets(`leaked ${secret}`, proxySecrets);
+
+    expect(redacted).toBe("[REDACTED]");
+    expect(trapCalls).toBe(0);
+  });
+
+  test("does not consult mutable Array or RegExp prototype hooks", () => {
+    const pushDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "push",
+    );
+    const testDescriptor = Object.getOwnPropertyDescriptor(
+      RegExp.prototype,
+      "test",
+    );
+    const globalDescriptor = Object.getOwnPropertyDescriptor(
+      RegExp.prototype,
+      "global",
+    );
+    const unicodeDescriptor = Object.getOwnPropertyDescriptor(
+      RegExp.prototype,
+      "unicode",
+    );
+    if (
+      pushDescriptor === undefined ||
+      !("value" in pushDescriptor) ||
+      testDescriptor === undefined ||
+      !("value" in testDescriptor) ||
+      globalDescriptor === undefined ||
+      unicodeDescriptor === undefined
+    ) {
+      throw new Error("prototype descriptors are required");
+    }
+    const originalPush = pushDescriptor.value as (
+      this: unknown[],
+      ...values: unknown[]
+    ) => number;
+    const originalTest = testDescriptor.value as (
+      this: RegExp,
+      value: string,
+    ) => boolean;
+    const token = `ghp_${"D".repeat(36)}`;
+    let prototypeHookCalls = 0;
+    let redacted: ReturnType<typeof redactSecrets> | undefined;
+
+    try {
+      Object.defineProperty(Array.prototype, "push", {
+        configurable: true,
+        enumerable: false,
+        value: function poisonedPush(
+          this: unknown[],
+          ...values: unknown[]
+        ): number {
+          prototypeHookCalls += 1;
+          return Reflect.apply(originalPush, this, values);
+        },
+        writable: true,
+      });
+      Object.defineProperty(RegExp.prototype, "test", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          prototypeHookCalls += 1;
+          return originalTest;
+        },
+      });
+      Object.defineProperty(RegExp.prototype, "global", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          prototypeHookCalls += 1;
+          return true;
+        },
+      });
+      Object.defineProperty(RegExp.prototype, "unicode", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          prototypeHookCalls += 1;
+          return true;
+        },
+      });
+      redacted = redactSecrets({ message: `${token} registered-secret` }, [
+        "registered-secret",
+      ]);
+    } finally {
+      Object.defineProperty(Array.prototype, "push", pushDescriptor);
+      Object.defineProperty(RegExp.prototype, "test", testDescriptor);
+      Object.defineProperty(RegExp.prototype, "global", globalDescriptor);
+      Object.defineProperty(RegExp.prototype, "unicode", unicodeDescriptor);
+    }
+
+    expect(prototypeHookCalls).toBe(0);
+    expect(redacted).toEqual({
+      message: "[REDACTED] [REDACTED]",
+    });
+  });
+
+  test("does not consult poisoned Object prototype indices for sparse arrays or registries", () => {
+    const numericDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      "1",
+    );
+    const secret = "sparse-registry-secret";
+    const sparseSecrets = new Array<string>(2);
+    Object.defineProperty(sparseSecrets, "0", {
+      configurable: true,
+      enumerable: true,
+      value: secret,
+      writable: true,
+    });
+    const sparseValue: unknown[] = ["visible"];
+    sparseValue.length = 2;
+    let inheritedAccessorCalls = 0;
+    let registryResult: ReturnType<typeof redactSecrets> | undefined;
+    let arrayResult: ReturnType<typeof redactSecrets> | undefined;
+
+    try {
+      Object.defineProperty(Object.prototype, "1", {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          inheritedAccessorCalls += 1;
+          return undefined;
+        },
+        set: function setNumericProperty(value: unknown): void {
+          inheritedAccessorCalls += 1;
+          Object.defineProperty(this, "1", {
+            configurable: true,
+            enumerable: true,
+            value,
+            writable: true,
+          });
+        },
+      });
+      registryResult = redactSecrets(`leaked ${secret}`, sparseSecrets);
+      arrayResult = redactSecrets(sparseValue);
+    } finally {
+      if (numericDescriptor === undefined) {
+        Reflect.deleteProperty(Object.prototype, "1");
+      } else {
+        Object.defineProperty(Object.prototype, "1", numericDescriptor);
+      }
+    }
+
+    expect(inheritedAccessorCalls).toBe(0);
+    expect(registryResult).toBe("[REDACTED]");
+    expect(arrayResult).toEqual(["visible", "[Unsupported array item]"]);
   });
 
   test("bounds recursive traversal, handles cycles, and stringifies unsupported values", () => {

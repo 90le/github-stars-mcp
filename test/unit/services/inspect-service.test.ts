@@ -1077,6 +1077,81 @@ describe("InspectService", () => {
     }
   });
 
+  it("fully consumes glued GitHub tokens and Bearer credentials longer than 4,096 characters", async () => {
+    const classicToken = `ghp_${"A".repeat(36)}`;
+    const fineGrainedToken = `github_pat_${"B".repeat(82)}`;
+    const longBearerCredential = "C".repeat(5_000);
+    const runId = "run_complete_credential_redaction";
+    const operationId = "op_complete_credential_redaction";
+    const details = (marker: string) =>
+      Object.freeze({
+        queryUrl: `https://github.com/octocat/tool?token=queryPrefix${fineGrainedToken}querySuffix&marker=${marker}`,
+        userinfoUrl: `https://userPrefix${classicToken}userinfoSuffix@github.com/octocat/tool`,
+        message: `messagePrefix${classicToken}messageSuffix`,
+        description: `remote response used Bearer ${longBearerCredential}`,
+        [`keyPrefix${fineGrainedToken}keySuffix`]:
+          "credential-bearing object key",
+        nested: Object.freeze({
+          arbitrary: `nestedPrefix${fineGrainedToken}nestedSuffix`,
+          bearer: `Bearer ${longBearerCredential}`,
+        }),
+        headers: Object.freeze({
+          authorization: `Bearer ${longBearerCredential}`,
+        }),
+      });
+    const run = Object.freeze({
+      ...runFixture(runId),
+      warnings: Object.freeze([
+        `warningPrefix${classicToken}warningSuffix`,
+        `warningPrefix${fineGrainedToken}warningSuffix`,
+      ]),
+    }) as ChangeRun;
+    const operation = runOperationFixture(runId, 0, details("run"));
+    const attempt = attemptFixture(runId, operationId, 1, details("attempt"));
+    const reconciliation = reconciliationFixture(
+      runId,
+      operationId,
+      1,
+      details("reconciliation"),
+    );
+    const { storage } = storageFixture({
+      runs: [run],
+      runOperations: { [runId]: Object.freeze([operation]) },
+      attempts: {
+        [`${runId}\u0000${operationId}`]: Object.freeze([attempt]),
+      },
+      reconciliations: {
+        [`${runId}\u0000${operationId}`]: Object.freeze([reconciliation]),
+      },
+    });
+    const service = new InspectService(storage);
+
+    const results = [
+      await service.inspect({ kind: "run", id: runId }),
+      await service.inspect({
+        kind: "attempts",
+        id: asRunId(runId),
+        operationId,
+      }),
+      await service.inspect({
+        kind: "reconciliations",
+        id: asRunId(runId),
+        operationId,
+      }),
+    ];
+
+    for (const result of results) {
+      const serialized = JSON.stringify(result);
+      expect(serialized).toContain("[REDACTED]");
+      expect(serialized).not.toContain("ghp_");
+      expect(serialized).not.toContain("github_pat_");
+      expect(serialized).not.toContain(classicToken);
+      expect(serialized).not.toContain(fineGrainedToken);
+      expect(serialized).not.toContain("C".repeat(128));
+      expect(serialized).not.toContain(longBearerCredential);
+    }
+  });
+
   it("redacts, detaches, and deeply freezes history presentations", async () => {
     const secret = "history-presentation-secret";
     const details = {
