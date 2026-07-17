@@ -38,7 +38,7 @@ function migrated() {
   return database;
 }
 
-describe("Migration 001 constraints", () => {
+describe("migrated schema constraints", () => {
   test("creates exactly the 25 approved STRICT tables", () => {
     const database = migrated();
     const rows = database
@@ -88,7 +88,7 @@ describe("Migration 001 constraints", () => {
       "reconciled_projection_requires_latest_event",
       "reconciliation_events_are_append_only_delete",
       "reconciliation_events_are_append_only_update",
-      "reconciliation_requires_current_unresolved_attempt",
+      "reconciliation_requires_current_reconcilable_attempt",
       "run_operation_attempt_requires_current_projection",
       "run_operation_insert_requires_initial_projection",
     ]);

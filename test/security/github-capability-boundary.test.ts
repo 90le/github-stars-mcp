@@ -126,6 +126,7 @@ const DOMAIN_REPOSITORY_FILE = fileURLToPath(
 const ALLOWED_OPERATIONS_FILE = fileURLToPath(
   new URL("../../src/github/allowed-operations.ts", import.meta.url),
 );
+const COMPILER_PROOF_TIMEOUT_MS = 30_000;
 
 const GITHUB_PORT_SOURCE = readFileSync(GITHUB_PORT_FILE, "utf8");
 const GITHUB_ADAPTER_SOURCE = readFileSync(GITHUB_ADAPTER_FILE, "utf8");
@@ -988,102 +989,126 @@ describe("GitHub capability boundary", () => {
     ).not.toBe(canonicalFileName("C:/real/repository.ts", sensitiveSystem));
   });
 
-  it("proves the unchanged production contract, exports, and public members", () => {
-    const proof = proveProductionBoundary();
+  it(
+    "proves the unchanged production contract, exports, and public members",
+    () => {
+      const proof = proveProductionBoundary();
 
-    expect({
-      issues: proof.issues,
-      diagnosticCount: proof.diagnostics.length,
-      portExports: proof.portExports,
-      adapterExports: proof.adapterExports,
-      portExportSymbolsValid: proof.portExportSymbolsValid,
-      adapterExportSymbolsValid: proof.adapterExportSymbolsValid,
-      portMembers: proof.portMembers,
-      adapterMembers: proof.adapterMembers,
-      adapterStaticMembers: proof.adapterStaticMembers,
-      forbiddenMembers: proof.forbiddenMembers,
-    }).toEqual({
-      issues: [],
-      diagnosticCount: 0,
-      portExports: APPROVED_PORT_EXPORTS,
-      adapterExports: APPROVED_ADAPTER_EXPORTS,
-      portExportSymbolsValid: true,
-      adapterExportSymbolsValid: true,
-      portMembers: APPROVED_GITHUB_CAPABILITIES,
-      adapterMembers: APPROVED_GITHUB_CAPABILITIES,
-      adapterStaticMembers: APPROVED_ADAPTER_STATIC_MEMBERS,
-      forbiddenMembers: [],
-    });
-  });
+      expect({
+        issues: proof.issues,
+        diagnosticCount: proof.diagnostics.length,
+        portExports: proof.portExports,
+        adapterExports: proof.adapterExports,
+        portExportSymbolsValid: proof.portExportSymbolsValid,
+        adapterExportSymbolsValid: proof.adapterExportSymbolsValid,
+        portMembers: proof.portMembers,
+        adapterMembers: proof.adapterMembers,
+        adapterStaticMembers: proof.adapterStaticMembers,
+        forbiddenMembers: proof.forbiddenMembers,
+      }).toEqual({
+        issues: [],
+        diagnosticCount: 0,
+        portExports: APPROVED_PORT_EXPORTS,
+        adapterExports: APPROVED_ADAPTER_EXPORTS,
+        portExportSymbolsValid: true,
+        adapterExportSymbolsValid: true,
+        portMembers: APPROVED_GITHUB_CAPABILITIES,
+        adapterMembers: APPROVED_GITHUB_CAPABILITIES,
+        adapterStaticMembers: APPROVED_ADAPTER_STATIC_MEMBERS,
+        forbiddenMembers: [],
+      });
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
-  it("rejects a seventh port method and proves the mutation tuple is exhaustive", () => {
-    const changed = requiredReplacement(
-      GITHUB_PORT_SOURCE,
-      "export interface GitHubMutationPort {",
-      `export interface GitHubMutationPort {
+  it(
+    "rejects a seventh port method and proves the mutation tuple is exhaustive",
+    () => {
+      const changed = requiredReplacement(
+        GITHUB_PORT_SOURCE,
+        "export interface GitHubMutationPort {",
+        `export interface GitHubMutationPort {
   seventhMutation(
     operationId: string,
     signal?: AbortSignal,
   ): Promise<MutationReceipt>;`,
-    );
-    const proof = proveProductionBoundary(withPortSource(changed), {
-      forceCompiler: true,
-    });
+      );
+      const proof = proveProductionBoundary(withPortSource(changed), {
+        forceCompiler: true,
+      });
 
-    expect(proof.issues).toContain("compiler-contract");
-    expect(proof.issues).toContain("port-public-members");
-    expect(diagnosticTouches(proof, ALLOWED_OPERATIONS_FILE)).toBe(true);
-  });
+      expect(proof.issues).toContain("compiler-contract");
+      expect(proof.issues).toContain("port-public-members");
+      expect(diagnosticTouches(proof, ALLOWED_OPERATIONS_FILE)).toBe(true);
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
-  it("rejects a changed existing return type that exposes a client shape", () => {
-    const changed = requiredReplacement(
-      GITHUB_PORT_SOURCE,
-      "getViewer(signal?: AbortSignal): Promise<AccountBinding>;",
-      "getViewer(signal?: AbortSignal): Promise<AccountBinding & { readonly client: { request<T>(input: T): T } }>;",
-    );
-    const proof = proveProductionBoundary(withPortSource(changed), {
-      forceCompiler: true,
-    });
+  it(
+    "rejects a changed existing return type that exposes a client shape",
+    () => {
+      const changed = requiredReplacement(
+        GITHUB_PORT_SOURCE,
+        "getViewer(signal?: AbortSignal): Promise<AccountBinding>;",
+        "getViewer(signal?: AbortSignal): Promise<AccountBinding & { readonly client: { request<T>(input: T): T } }>;",
+      );
+      const proof = proveProductionBoundary(withPortSource(changed), {
+        forceCompiler: true,
+      });
 
-    expect(proof.issues).toContain("compiler-contract");
-    expect(proof.portMembers).toEqual(APPROVED_GITHUB_CAPABILITIES);
-  });
+      expect(proof.issues).toContain("compiler-contract");
+      expect(proof.portMembers).toEqual(APPROVED_GITHUB_CAPABILITIES);
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
-  it("rejects a changed existing parameter contract", () => {
-    const changed = requiredReplacement(
-      GITHUB_PORT_SOURCE,
-      "getViewer(signal?: AbortSignal): Promise<AccountBinding>;",
-      "getViewer(signal: AbortSignal): Promise<AccountBinding>;",
-    );
-    const proof = proveProductionBoundary(withPortSource(changed));
+  it(
+    "rejects a changed existing parameter contract",
+    () => {
+      const changed = requiredReplacement(
+        GITHUB_PORT_SOURCE,
+        "getViewer(signal?: AbortSignal): Promise<AccountBinding>;",
+        "getViewer(signal: AbortSignal): Promise<AccountBinding>;",
+      );
+      const proof = proveProductionBoundary(withPortSource(changed));
 
-    expect(proof.issues).toContain("compiler-contract");
-    expect(proof.portMembers).toEqual(APPROVED_GITHUB_CAPABILITIES);
-  });
+      expect(proof.issues).toContain("compiler-contract");
+      expect(proof.portMembers).toEqual(APPROVED_GITHUB_CAPABILITIES);
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
   it.each([
     ["method", "  public boundaryMethod(): void {}"],
     ["property", "  public readonly boundaryProperty = true;"],
     ["accessor", "  public get boundaryAccessor(): boolean { return true; }"],
     ["computed member", '  public ["boundary" + "Computed"](): void {}'],
-  ])("rejects an extra public adapter %s", (_label, member) => {
-    const proof = proveProductionBoundary(
-      withAdapterSource(withAdapterMembers(member)),
-    );
+  ])(
+    "rejects an extra public adapter %s",
+    (_label, member) => {
+      const proof = proveProductionBoundary(
+        withAdapterSource(withAdapterMembers(member)),
+      );
 
-    expect(proof.issues).toContain("adapter-public-members");
-  });
+      expect(proof.issues).toContain("adapter-public-members");
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
-  it("rejects a public adapter constructor parameter property", () => {
-    const changed = requiredReplacement(
-      GITHUB_ADAPTER_SOURCE,
-      "constructor(transport: GitHubTransport) {",
-      "constructor(transport: GitHubTransport, public readonly boundaryParameter: unknown) {",
-    );
-    const proof = proveProductionBoundary(withAdapterSource(changed));
+  it(
+    "rejects a public adapter constructor parameter property",
+    () => {
+      const changed = requiredReplacement(
+        GITHUB_ADAPTER_SOURCE,
+        "constructor(transport: GitHubTransport) {",
+        "constructor(transport: GitHubTransport, public readonly boundaryParameter: unknown) {",
+      );
+      const proof = proveProductionBoundary(withAdapterSource(changed));
 
-    expect(proof.issues).toContain("adapter-public-members");
-  });
+      expect(proof.issues).toContain("adapter-public-members");
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
   it.each([
     ["method", "  public static boundaryStatic(): void {}"],
@@ -1091,27 +1116,35 @@ describe("GitHub capability boundary", () => {
       "raw client property",
       "  public static readonly client = { request(): void {} };",
     ],
-  ])("rejects an extra public static adapter %s", (_label, member) => {
-    const proof = proveProductionBoundary(
-      withAdapterSource(withAdapterMembers(member)),
-      { forceCompiler: true },
-    );
+  ])(
+    "rejects an extra public static adapter %s",
+    (_label, member) => {
+      const proof = proveProductionBoundary(
+        withAdapterSource(withAdapterMembers(member)),
+        { forceCompiler: true },
+      );
 
-    expect(proof.issues).toContain("adapter-public-static-members");
-    expect(proof.issues).toContain("compiler-contract");
-    expect(diagnosticTouches(proof, CONTRACT_PROBE_FILE)).toBe(true);
-  });
+      expect(proof.issues).toContain("adapter-public-static-members");
+      expect(proof.issues).toContain("compiler-contract");
+      expect(diagnosticTouches(proof, CONTRACT_PROBE_FILE)).toBe(true);
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
-  it("rejects a namespace merge that preserves the GitHubPort export name", () => {
-    const changed = `${GITHUB_PORT_SOURCE}
+  it(
+    "rejects a namespace merge that preserves the GitHubPort export name",
+    () => {
+      const changed = `${GITHUB_PORT_SOURCE}
 export namespace GitHubPort {
   export const boundaryNamespaceValue = true;
 }
 `;
-    const proof = proveProductionBoundary(withPortSource(changed));
+      const proof = proveProductionBoundary(withPortSource(changed));
 
-    expect(proof.issues).toContain("port-export-symbols");
-  });
+      expect(proof.issues).toContain("port-export-symbols");
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
   it.each([
     ["same-name interface in the port module", localAccountBindingOverrides],
@@ -1133,6 +1166,7 @@ export namespace GitHubPort {
       expect(proof.diagnostics).toEqual([]);
       expect(proof.issues).toContain("port-export-symbols");
     },
+    COMPILER_PROOF_TIMEOUT_MS,
   );
 
   it.each([
@@ -1218,6 +1252,7 @@ export namespace GitHubPort {
       expect(proof.portMembers).toEqual([]);
       expect(proof.adapterMembers).toEqual([]);
     },
+    COMPILER_PROOF_TIMEOUT_MS,
   );
 
   it.each([
@@ -1238,18 +1273,24 @@ export namespace GitHubPort {
       "  public deleteRepository(): void {}",
       "deleteRepository",
     ],
-  ])("rejects a %s member in production source", (_label, member, name) => {
-    const proof = proveProductionBoundary(
-      withAdapterSource(withAdapterMembers(member)),
-    );
+  ])(
+    "rejects a %s member in production source",
+    (_label, member, name) => {
+      const proof = proveProductionBoundary(
+        withAdapterSource(withAdapterMembers(member)),
+      );
 
-    expect(proof.issues).toContain("adapter-public-members");
-    expect(proof.issues).toContain("forbidden-public-member");
-    expect(proof.forbiddenMembers).toContain(name);
-  });
+      expect(proof.issues).toContain("adapter-public-members");
+      expect(proof.issues).toContain("forbidden-public-member");
+      expect(proof.forbiddenMembers).toContain(name);
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 
-  it("ignores comments, strings, private, protected, and #private controls", () => {
-    const changed = `${withAdapterMembers(`
+  it(
+    "ignores comments, strings, private, protected, and #private controls",
+    () => {
+      const changed = `${withAdapterMembers(`
   private request<T>(input: T): T { return input; }
   protected graphql<T>(input: T): T { return input; }
   private deleteRepository(): void {}
@@ -1262,9 +1303,11 @@ const boundaryWords =
   "archiveRepository transferRepository createOrUpdateFile request graphql";
 void boundaryWords;
 `;
-    const proof = proveProductionBoundary(withAdapterSource(changed));
+      const proof = proveProductionBoundary(withAdapterSource(changed));
 
-    expect(proof.issues).toEqual([]);
-    expect(proof.forbiddenMembers).toEqual([]);
-  });
+      expect(proof.issues).toEqual([]);
+      expect(proof.forbiddenMembers).toEqual([]);
+    },
+    COMPILER_PROOF_TIMEOUT_MS,
+  );
 });

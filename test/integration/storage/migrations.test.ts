@@ -133,6 +133,26 @@ describe("SQLite migrations", () => {
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
     ).toBe(1);
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_schema
+           WHERE type='trigger'
+             AND name='reconciliation_requires_current_unresolved_attempt'`,
+        )
+        .pluck()
+        .get(),
+    ).toBe("reconciliation_requires_current_unresolved_attempt");
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_schema
+           WHERE type='trigger'
+             AND name='reconciliation_requires_current_reconcilable_attempt'`,
+        )
+        .pluck()
+        .get(),
+    ).toBeUndefined();
 
     migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z");
     expect(
@@ -148,6 +168,17 @@ describe("SQLite migrations", () => {
         checksum: migrationChecksum(migration),
       })),
     );
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_schema
+           WHERE type='trigger'
+             AND name LIKE 'reconciliation_requires_current_%_attempt'
+           ORDER BY name`,
+        )
+        .pluck()
+        .all(),
+    ).toEqual(["reconciliation_requires_current_reconcilable_attempt"]);
     database.close();
   });
 

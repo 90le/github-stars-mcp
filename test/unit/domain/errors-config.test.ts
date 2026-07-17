@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { loadConfig } from "../../../src/config.js";
+import { canonicalJsonClone } from "../../../src/domain/canonical-json.js";
 import {
   APP_ERROR_CODES,
   AppError,
@@ -88,6 +89,32 @@ describe("domain errors and redaction", () => {
     });
     expect(serialized).not.toHaveProperty("cause");
     expect(serialized).not.toHaveProperty("stack");
+  });
+
+  test("keeps array-valued serialized error details valid canonical JSON", () => {
+    const serialized = serializeError(
+      new AppError(
+        "PRECONDITION_FAILED",
+        "The operation is blocked by an incomplete dependency",
+        {
+          retryable: true,
+          details: {
+            reason: "dependency_blocked",
+            dependsOn: ["op_000001"],
+          },
+        },
+      ),
+    );
+
+    expect(canonicalJsonClone(serialized)).toEqual({
+      code: "PRECONDITION_FAILED",
+      message: "The operation is blocked by an incomplete dependency",
+      retryable: true,
+      details: {
+        reason: "dependency_blocked",
+        dependsOn: ["op_000001"],
+      },
+    });
   });
 
   test("makes direct AppError JSON serialization use the redacted public shape", () => {

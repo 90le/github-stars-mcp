@@ -538,7 +538,9 @@ describe("run attempt and reconciliation triggers", () => {
          'run_1','op_1',1,1,'succeeded','confirmed_applied','{"ok":true}',NULL,?
        )`,
     );
-    expect(() => eventInsert.run(time)).toThrow(/current unresolved attempt/u);
+    expect(() => eventInsert.run(time)).toThrow(
+      /current reconcilable attempt/u,
+    );
     database.exec("BEGIN");
     eventInsert.run("2026-07-16T00:02:00.000Z");
     expect(() =>

@@ -178,11 +178,11 @@ function inspectDenseArray(
   value: object,
   budget: SerializationBudget,
 ): readonly unknown[] {
-  if (
-    INTRINSICS.utilIsProxy(value) ||
-    !INTRINSICS.arrayIsArray(value) ||
-    INTRINSICS.reflectGetPrototypeOf(value) !== INTRINSICS.arrayPrototype
-  ) {
+  if (INTRINSICS.utilIsProxy(value) || !INTRINSICS.arrayIsArray(value)) {
+    return failCanonicalJson();
+  }
+  const prototype = INTRINSICS.reflectGetPrototypeOf(value);
+  if (prototype !== INTRINSICS.arrayPrototype && prototype !== null) {
     return failCanonicalJson();
   }
 

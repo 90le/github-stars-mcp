@@ -206,6 +206,13 @@ test("canonical JSON rejects hostile, exotic, cyclic, and oversized values", () 
       },
     },
   );
+  let arrayProxyPrototypeCalls = 0;
+  const arrayProxy = new Proxy([1], {
+    getPrototypeOf() {
+      arrayProxyPrototypeCalls += 1;
+      return null;
+    },
+  });
 
   const sparse = new Array(2);
   sparse[1] = true;
@@ -225,6 +232,7 @@ test("canonical JSON rejects hostile, exotic, cyclic, and oversized values", () 
     accessor,
     iterable,
     proxy,
+    arrayProxy,
     sparse,
     extraArray,
     cycle,
@@ -246,6 +254,7 @@ test("canonical JSON rejects hostile, exotic, cyclic, and oversized values", () 
   expect(getterCalls).toBe(0);
   expect(iteratorCalls).toBe(0);
   expect(proxyCalls).toBe(0);
+  expect(arrayProxyPrototypeCalls).toBe(0);
   try {
     canonicalJson(accessor);
   } catch (error) {
