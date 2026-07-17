@@ -1,5 +1,5 @@
 import type { JsonValue } from "./json.js";
-import { redactSecrets } from "./redaction.js";
+import { redactSecrets, snapshotSecretRegistry } from "./redaction.js";
 
 export const APP_ERROR_CODES = Object.freeze([
   "AUTH_REQUIRED",
@@ -58,7 +58,7 @@ export class AppError extends Error {
     this.code = code;
     this.retryable = options.retryable ?? false;
     this.details = options.details === undefined ? {} : options.details;
-    this.secrets = Object.freeze([...(options.secrets ?? [])]);
+    this.secrets = snapshotSecretRegistry(options.secrets ?? []);
     Object.defineProperty(this, "secrets", {
       configurable: false,
       enumerable: false,

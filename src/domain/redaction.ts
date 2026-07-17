@@ -13,9 +13,17 @@ const SENSITIVE_KEYS = new Set([
   "cookie",
 ]);
 
-function registeredSecrets(
+const INVALID_SECRET_REGISTRY: readonly string[] = (() => {
+  const sentinel: string[] = [];
+  sentinel.length = 1;
+  return Object.freeze(sentinel);
+})();
+
+function inspectSecretRegistry(
   secrets: readonly string[],
 ): readonly string[] | undefined {
+  if (secrets === INVALID_SECRET_REGISTRY) return undefined;
+
   let descriptors: Record<string, PropertyDescriptor>;
   try {
     if (!Array.isArray(secrets)) return undefined;
@@ -44,7 +52,7 @@ function registeredSecrets(
     if (!Number.isSafeInteger(index) || index >= length) return undefined;
   }
 
-  const unique = new Set<string>();
+  const snapshot: string[] = [];
   for (let index = 0; index < length; index += 1) {
     const descriptor = descriptors[String(index)];
     if (
@@ -52,10 +60,30 @@ function registeredSecrets(
       "value" in descriptor &&
       typeof descriptor.value === "string"
     ) {
-      if (descriptor.value.length > 0) unique.add(descriptor.value);
+      snapshot.push(descriptor.value);
       continue;
     }
     return undefined;
+  }
+  return Object.freeze(snapshot);
+}
+
+export function snapshotSecretRegistry(
+  secrets: readonly string[],
+): readonly string[] {
+  return inspectSecretRegistry(secrets) ?? INVALID_SECRET_REGISTRY;
+}
+
+function registeredSecrets(
+  secrets: readonly string[],
+): readonly string[] | undefined {
+  const snapshot = snapshotSecretRegistry(secrets);
+  if (snapshot === INVALID_SECRET_REGISTRY) return undefined;
+
+  const unique = new Set<string>();
+  for (let index = 0; index < snapshot.length; index += 1) {
+    const secret = snapshot[index];
+    if (secret !== undefined && secret.length > 0) unique.add(secret);
   }
   return [...unique].sort((left, right) => right.length - left.length);
 }

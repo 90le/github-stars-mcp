@@ -114,6 +114,134 @@ describe("domain errors and redaction", () => {
     });
   });
 
+  test("snapshots a valid non-enumerable registry without indexing or iterating the caller", () => {
+    const arbitrarySecret = "descriptor-only-secret";
+    let callerReads = 0;
+    const registryTarget: string[] = [];
+    Object.defineProperty(registryTarget, "0", {
+      configurable: true,
+      enumerable: false,
+      value: arbitrarySecret,
+      writable: true,
+    });
+    const registry = new Proxy(registryTarget, {
+      get(target, property, receiver) {
+        callerReads += 1;
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+    });
+
+    const error = new AppError("AUTH_REQUIRED", `bad ${arbitrarySecret}`, {
+      details: { stdout: arbitrarySecret },
+      secrets: registry,
+    });
+    Object.defineProperty(registryTarget, "0", {
+      value: "caller-mutated-secret",
+    });
+
+    expect(callerReads).toBe(0);
+    expect(error.secrets).toEqual([arbitrarySecret]);
+    expect(error.secrets).not.toBe(registry);
+    expect(Array.isArray(error.secrets)).toBe(true);
+    expect(Object.isFrozen(error.secrets)).toBe(true);
+    expect(JSON.stringify(serializeError(error))).not.toContain(
+      arbitrarySecret,
+    );
+    expect(JSON.stringify(error)).not.toContain(arbitrarySecret);
+  });
+
+  test("keeps every invalid AppError registry fail-closed without invoking getters or iterators", () => {
+    const arbitrarySecret = "invalid-registry-secret";
+    let getterCalls = 0;
+    let iteratorCalls = 0;
+    let indexReads = 0;
+
+    const hole = new Array<string>(1);
+
+    const accessor: string[] = [];
+    Object.defineProperty(accessor, "0", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return arbitrarySecret;
+      },
+    });
+
+    const malformedIndex = [arbitrarySecret];
+    Object.defineProperty(malformedIndex, "01", {
+      configurable: true,
+      value: "malformed-index-secret",
+    });
+
+    const extraKey = [arbitrarySecret];
+    Object.defineProperty(extraKey, "extra", {
+      configurable: true,
+      value: "extra-key-secret",
+    });
+
+    const symbolKey = [arbitrarySecret];
+    Object.defineProperty(symbolKey, Symbol.iterator, {
+      configurable: true,
+      value: () => {
+        iteratorCalls += 1;
+        return [arbitrarySecret][Symbol.iterator]();
+      },
+    });
+
+    const nonString = [arbitrarySecret, 42] as unknown as string[];
+
+    const reflectionFailure = new Proxy([arbitrarySecret], {
+      get(target, property, receiver) {
+        if (property === Symbol.iterator) iteratorCalls += 1;
+        if (
+          typeof property === "string" &&
+          /^(?:0|[1-9]\d*)$/u.test(property)
+        ) {
+          indexReads += 1;
+        }
+        return Reflect.get(target, property, receiver) as unknown;
+      },
+      ownKeys: () => {
+        throw new Error("registry reflection failed");
+      },
+    });
+
+    const errors = [
+      hole,
+      accessor,
+      malformedIndex,
+      extraKey,
+      symbolKey,
+      nonString,
+      reflectionFailure,
+    ].map(
+      (secrets) =>
+        new AppError("AUTH_REQUIRED", `credential ${arbitrarySecret}`, {
+          details: {
+            authorization: `Bearer ${arbitrarySecret}`,
+            stdout: arbitrarySecret,
+          },
+          secrets,
+        }),
+    );
+
+    for (const error of errors) {
+      const serialized = serializeError(error);
+      const directJson = JSON.stringify(error);
+      expect(serialized.message).toBe("[REDACTED]");
+      expect(serialized.details).toBe("[REDACTED]");
+      expect(JSON.stringify(serialized)).not.toContain(arbitrarySecret);
+      expect(directJson).not.toContain(arbitrarySecret);
+      expect(JSON.parse(directJson) as unknown).toEqual(serialized);
+      expect(Object.isFrozen(error.secrets)).toBe(true);
+    }
+    expect(new Set(errors.map((error) => error.secrets)).size).toBe(1);
+    expect(getterCalls).toBe(0);
+    expect(iteratorCalls).toBe(0);
+    expect(indexReads).toBe(0);
+  });
+
   test("recursively redacts registered secrets and secret-bearing fields without invoking getters", () => {
     const arbitrarySecret = "a7$unpatterned/credential?value";
     let getterCalls = 0;
