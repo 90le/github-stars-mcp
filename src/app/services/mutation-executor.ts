@@ -220,10 +220,15 @@ function sameJson(
 }
 
 function validOperationId(value: string): boolean {
+  const prefixLength = value.startsWith("op_")
+    ? 3
+    : value.startsWith("undo_")
+      ? 5
+      : 0;
   if (
-    value.length <= 3 ||
+    prefixLength === 0 ||
+    value.length <= prefixLength ||
     value.length > MAX_OPERATION_ID ||
-    !value.startsWith("op_") ||
     value !== value.trim()
   ) {
     return false;
@@ -512,7 +517,7 @@ function validRepositoryFields(
 function validStarOperation(
   operation: Extract<ResolvedOperation, { kind: "star" | "unstar" }>,
 ): boolean {
-  if (!validRepositoryFields(operation) || operation.dependsOn.length !== 0) {
+  if (!validRepositoryFields(operation)) {
     return false;
   }
   const expected = exactPrecondition(operation, "star_state");
@@ -554,7 +559,6 @@ function validCreateOperation(
   );
   const before = exactObject(operation.before, ["listIds"]);
   return (
-    operation.dependsOn.length === 0 &&
     boundedText(operation.clientRef, MAX_REFERENCE) &&
     expected !== null &&
     stableIdArray(expected.listIds) &&
@@ -598,7 +602,6 @@ function validUpdateOperation(
     isPrivate: inverseIsPrivate,
   };
   return (
-    operation.dependsOn.length === 0 &&
     stableId(operation.listId) &&
     expected !== null &&
     validMetadata(expected) &&
@@ -624,7 +627,6 @@ function validDeleteOperation(
     "repositoryIds",
   ]);
   return (
-    operation.dependsOn.length === 0 &&
     stableId(operation.listId) &&
     expected !== null &&
     validCompleteList(expected) &&

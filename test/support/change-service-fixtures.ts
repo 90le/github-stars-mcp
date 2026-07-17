@@ -11,7 +11,15 @@ import {
   type RunId,
   type UserListId,
 } from "../../src/domain/ids.js";
-import type { ChangePlan, PlanRequest } from "../../src/domain/plan.js";
+import {
+  hashPlanExecutable,
+  parseChangePlan,
+  parsePlanExecutable,
+  type ChangePlan,
+  type PlanExecutableContent,
+  type PlanRequest,
+  type ResolvedOperation,
+} from "../../src/domain/plan.js";
 import type {
   ListMembershipQuery,
   ListQuery,
@@ -58,7 +66,14 @@ import {
   ApplyService,
   type ApplyInput,
 } from "../../src/app/services/apply-service.js";
-import type { FailureMode } from "../../src/domain/run.js";
+import {
+  parseChangeRun,
+  parseRunOperation,
+  type ChangeRun,
+  type FailureMode,
+  type RunOperation,
+  type RunOperationStatus,
+} from "../../src/domain/run.js";
 import { createMemoryStorage } from "../fixtures/memory-storage.js";
 
 const T0 = "2026-07-16T00:00:00.000Z";
@@ -1207,7 +1222,662 @@ export async function applyFixture(options: ApplyFixtureOptions = {}) {
   };
 }
 
-export const rollbackFixture = plannerFixture;
+const ROLLBACK_CREATED_AT = "2026-07-16T02:00:00.000Z";
+const ROLLBACK_FINISHED_AT = "2026-07-16T02:30:00.000Z";
+const ROLLBACK_PLAN_NOW = "2026-07-16T03:00:00.000Z";
+
+export const rollbackSourceOperationIds = Object.freeze({
+  star: "op_000001_star",
+  unstar: "op_000002_unstar",
+  create: "op_000003_create",
+  createdMembership: "op_000004_created_membership",
+  update: "op_000005_update",
+  delete: "op_000006_delete",
+  membership: "op_000007_membership",
+});
+
+function rollbackCompleteList(list: UserList) {
+  return Object.freeze({
+    listId: list.listId,
+    name: list.name,
+    slug: list.slug,
+    description: list.description,
+    isPrivate: list.isPrivate,
+    createdAt: list.createdAt,
+    updatedAt: list.updatedAt,
+    lastAddedAt: list.lastAddedAt,
+  });
+}
+
+function rollbackSourceOperations(input: {
+  readonly repositories: Readonly<{
+    star: RepositoryView;
+    unstar: RepositoryView;
+    createdMember: RepositoryView;
+    member: RepositoryView;
+  }>;
+  readonly lists: Readonly<{
+    existing: UserList;
+    add: UserList;
+    deleted: UserList;
+    createdActual: UserList;
+  }>;
+}): readonly ResolvedOperation[] {
+  const { repositories, lists } = input;
+  const snapshotListIds = Object.freeze(
+    [lists.add.listId, lists.deleted.listId, lists.existing.listId].sort(),
+  );
+  const unstarListIds = Object.freeze(
+    [lists.deleted.listId, lists.existing.listId].sort(),
+  );
+  const existingListIds = Object.freeze([lists.existing.listId]);
+  const addListIds = Object.freeze([lists.add.listId]);
+  const createdMembershipTargets = Object.freeze([
+    Object.freeze({
+      kind: "existing" as const,
+      listId: lists.existing.listId,
+    }),
+    Object.freeze({
+      kind: "created" as const,
+      createOperationId: rollbackSourceOperationIds.create,
+    }),
+  ]);
+
+  return Object.freeze([
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.star,
+      kind: "star" as const,
+      repositoryId: repositories.star.repositoryId,
+      repositoryDatabaseId: repositories.star.repositoryDatabaseId,
+      coordinates: Object.freeze({
+        owner: repositories.star.owner,
+        name: repositories.star.name,
+      }),
+      dependsOn: Object.freeze([]),
+      preconditions: Object.freeze([
+        Object.freeze({ kind: "star_state", expected: false }),
+      ]),
+      before: Object.freeze({ starred: false }),
+      after: Object.freeze({ starred: true }),
+      inverse: Object.freeze({ kind: "unstar" }),
+      risk: "normal" as const,
+    }),
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.unstar,
+      kind: "unstar" as const,
+      repositoryId: repositories.unstar.repositoryId,
+      repositoryDatabaseId: repositories.unstar.repositoryDatabaseId,
+      coordinates: Object.freeze({
+        owner: repositories.unstar.owner,
+        name: repositories.unstar.name,
+      }),
+      dependsOn: Object.freeze([]),
+      preconditions: Object.freeze([
+        Object.freeze({ kind: "star_state", expected: true }),
+      ]),
+      before: Object.freeze({
+        starred: true,
+        starredAt: repositories.unstar.starredAt,
+        listIds: unstarListIds,
+      }),
+      after: Object.freeze({ starred: false }),
+      inverse: Object.freeze({
+        kind: "star",
+        listIds: unstarListIds,
+      }),
+      risk: "non_reversible" as const,
+    }),
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.create,
+      kind: "list_create" as const,
+      clientRef: "source-created",
+      dependsOn: Object.freeze([]),
+      preconditions: Object.freeze([
+        Object.freeze({
+          kind: "list_id_baseline",
+          expected: Object.freeze({ listIds: snapshotListIds }),
+        }),
+      ]),
+      before: Object.freeze({ listIds: snapshotListIds }),
+      after: Object.freeze({
+        name: lists.createdActual.name,
+        description: lists.createdActual.description,
+        isPrivate: lists.createdActual.isPrivate,
+      }),
+      inverse: Object.freeze({ kind: "list_delete" }),
+      risk: "normal" as const,
+    }),
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.createdMembership,
+      kind: "list_membership_set" as const,
+      repositoryId: repositories.createdMember.repositoryId,
+      repositoryDatabaseId: repositories.createdMember.repositoryDatabaseId,
+      coordinates: Object.freeze({
+        owner: repositories.createdMember.owner,
+        name: repositories.createdMember.name,
+      }),
+      expectedListIds: existingListIds,
+      targetLists: createdMembershipTargets,
+      dependsOn: Object.freeze([rollbackSourceOperationIds.create]),
+      preconditions: Object.freeze([
+        Object.freeze({
+          kind: "list_memberships",
+          expected: Object.freeze({ listIds: existingListIds }),
+        }),
+      ]),
+      before: Object.freeze({ listIds: existingListIds }),
+      after: Object.freeze({
+        listIds: Object.freeze([
+          lists.existing.listId,
+          Object.freeze({
+            createOperationId: rollbackSourceOperationIds.create,
+          }),
+        ]),
+      }),
+      inverse: Object.freeze({
+        kind: "list_membership_set",
+        listIds: existingListIds,
+      }),
+      risk: "normal" as const,
+    }),
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.update,
+      kind: "list_update" as const,
+      listId: lists.existing.listId,
+      dependsOn: Object.freeze([]),
+      preconditions: Object.freeze([
+        Object.freeze({
+          kind: "list_metadata",
+          expected: Object.freeze({
+            name: lists.existing.name,
+            description: lists.existing.description,
+            isPrivate: lists.existing.isPrivate,
+          }),
+        }),
+      ]),
+      before: Object.freeze({
+        name: lists.existing.name,
+        description: lists.existing.description,
+        isPrivate: lists.existing.isPrivate,
+      }),
+      after: Object.freeze({
+        name: "Updated",
+        description: "After",
+        isPrivate: true,
+      }),
+      inverse: Object.freeze({
+        kind: "list_update",
+        name: lists.existing.name,
+        description: lists.existing.description,
+        isPrivate: lists.existing.isPrivate,
+      }),
+      risk: "normal" as const,
+    }),
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.delete,
+      kind: "list_delete" as const,
+      listId: lists.deleted.listId,
+      dependsOn: Object.freeze([]),
+      preconditions: Object.freeze([
+        Object.freeze({
+          kind: "list_metadata",
+          expected: rollbackCompleteList(lists.deleted),
+        }),
+      ]),
+      before: Object.freeze({
+        list: rollbackCompleteList(lists.deleted),
+        repositoryIds: Object.freeze([repositories.unstar.repositoryId]),
+      }),
+      after: Object.freeze({ exists: false }),
+      inverse: Object.freeze({
+        kind: "list_create",
+        list: rollbackCompleteList(lists.deleted),
+        repositoryIds: Object.freeze([repositories.unstar.repositoryId]),
+      }),
+      risk: "destructive" as const,
+    }),
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.membership,
+      kind: "list_membership_set" as const,
+      repositoryId: repositories.member.repositoryId,
+      repositoryDatabaseId: repositories.member.repositoryDatabaseId,
+      coordinates: Object.freeze({
+        owner: repositories.member.owner,
+        name: repositories.member.name,
+      }),
+      expectedListIds: existingListIds,
+      targetLists: Object.freeze([
+        Object.freeze({ kind: "existing" as const, listId: lists.add.listId }),
+      ]),
+      dependsOn: Object.freeze([]),
+      preconditions: Object.freeze([
+        Object.freeze({
+          kind: "list_memberships",
+          expected: Object.freeze({ listIds: existingListIds }),
+        }),
+      ]),
+      before: Object.freeze({ listIds: existingListIds }),
+      after: Object.freeze({ listIds: addListIds }),
+      inverse: Object.freeze({
+        kind: "list_membership_set",
+        listIds: existingListIds,
+      }),
+      risk: "normal" as const,
+    }),
+  ]);
+}
+
+function rollbackAuditAfter(
+  operation: ResolvedOperation,
+  lists: Readonly<{ createdActual: UserList; existing: UserList }>,
+) {
+  switch (operation.kind) {
+    case "star":
+      return Object.freeze({ starred: true });
+    case "unstar":
+      return Object.freeze({ starred: false });
+    case "list_create":
+      return rollbackCompleteList(lists.createdActual);
+    case "list_update":
+      return Object.freeze({
+        listId: operation.listId,
+        name: "Updated",
+        description: "After",
+        isPrivate: true,
+      });
+    case "list_delete":
+      return Object.freeze({ exists: false });
+    case "list_membership_set":
+      return operation.operationId ===
+        rollbackSourceOperationIds.createdMembership
+        ? Object.freeze({
+            listIds: Object.freeze(
+              [lists.createdActual.listId, lists.existing.listId].sort(),
+            ),
+          })
+        : Object.freeze({ listIds: Object.freeze(["UL_add"]) });
+  }
+}
+
+function rollbackRunRow(
+  runId: RunId,
+  operation: ResolvedOperation,
+  sequence: number,
+  status: RunOperationStatus,
+  lists: Readonly<{ createdActual: UserList; existing: UserList }>,
+): RunOperation {
+  const startedAt = new Date(
+    Date.parse(ROLLBACK_CREATED_AT) + (sequence + 1) * 1_000,
+  ).toISOString();
+  const finishedAt = new Date(
+    Date.parse(ROLLBACK_CREATED_AT) + (sequence + 1) * 1_000 + 500,
+  ).toISOString();
+  const common = {
+    runId,
+    operationId: operation.operationId,
+    sequence,
+    before: operation.before,
+  };
+  if (status === "pending") {
+    return parseRunOperation({
+      ...common,
+      status,
+      reconciliation: "not_required",
+      attempts: 0,
+      after: null,
+      externalRequestId: null,
+      error: null,
+      startedAt: null,
+      finishedAt: null,
+    });
+  }
+  if (status === "running") {
+    return parseRunOperation({
+      ...common,
+      status,
+      reconciliation: "pending",
+      attempts: 1,
+      after: null,
+      externalRequestId: null,
+      error: null,
+      startedAt,
+      finishedAt: null,
+    });
+  }
+  if (status === "skipped") {
+    return parseRunOperation({
+      ...common,
+      status,
+      reconciliation: "not_required",
+      attempts: 0,
+      after: null,
+      externalRequestId: null,
+      error: null,
+      startedAt: null,
+      finishedAt,
+    });
+  }
+  if (status === "failed") {
+    return parseRunOperation({
+      ...common,
+      status,
+      reconciliation: "confirmed_not_applied",
+      attempts: 0,
+      after: null,
+      externalRequestId: null,
+      error: {
+        code: "GITHUB_UNAVAILABLE",
+        message: "fixture failure",
+        retryable: true,
+        details: {},
+      },
+      startedAt: null,
+      finishedAt,
+    });
+  }
+  if (status === "unresolved") {
+    return parseRunOperation({
+      ...common,
+      status,
+      reconciliation: "unknown",
+      attempts: 1,
+      after: rollbackAuditAfter(operation, lists),
+      externalRequestId: `REQ-${String(sequence + 1)}`,
+      error: {
+        code: "RECONCILIATION_REQUIRED",
+        message: "fixture unresolved",
+        retryable: false,
+        details: {},
+      },
+      startedAt,
+      finishedAt,
+    });
+  }
+  return parseRunOperation({
+    ...common,
+    status: "succeeded",
+    reconciliation: "not_required",
+    attempts: 1,
+    after: rollbackAuditAfter(operation, lists),
+    externalRequestId: `REQ-${String(sequence + 1)}`,
+    error: null,
+    startedAt,
+    finishedAt,
+  });
+}
+
+export interface RollbackFixtureOptions {
+  readonly runState?: ChangeRun["state"];
+  readonly rowStatuses?: Readonly<Record<string, RunOperationStatus>>;
+  readonly maxPlanActions?: number;
+  readonly planTtlMinutes?: number;
+  readonly failSave?: boolean;
+  readonly sourceSnapshotAvailable?: boolean;
+  readonly transformPlan?: (plan: ChangePlan) => unknown;
+  readonly transformRun?: (run: ChangeRun) => unknown;
+  readonly transformRows?: (rows: readonly RunOperation[]) => unknown;
+}
+
+export function rollbackFixture(options: RollbackFixtureOptions = {}) {
+  const ids = Object.freeze({
+    starRepository: asRepositoryId("R_star"),
+    unstarRepository: asRepositoryId("R_unstar"),
+    createdMemberRepository: asRepositoryId("R_created_member"),
+    memberRepository: asRepositoryId("R_member"),
+    existingList: asUserListId("UL_existing"),
+    addList: asUserListId("UL_add"),
+    deletedList: asUserListId("UL_deleted"),
+    createdActualList: asUserListId("UL_created_actual"),
+  });
+  const repositories = Object.freeze({
+    star: repositoryFixture({
+      repositoryId: ids.starRepository,
+      repositoryDatabaseId: asRepositoryDatabaseId("201"),
+      name: "star",
+    }),
+    unstar: repositoryFixture({
+      repositoryId: ids.unstarRepository,
+      repositoryDatabaseId: asRepositoryDatabaseId("202"),
+      name: "unstar",
+    }),
+    createdMember: repositoryFixture({
+      repositoryId: ids.createdMemberRepository,
+      repositoryDatabaseId: asRepositoryDatabaseId("203"),
+      name: "created-member",
+    }),
+    member: repositoryFixture({
+      repositoryId: ids.memberRepository,
+      repositoryDatabaseId: asRepositoryDatabaseId("204"),
+      name: "member",
+    }),
+  });
+  const lists = Object.freeze({
+    existing: userListFixture({
+      listId: ids.existingList,
+      name: "Existing",
+      slug: "existing",
+      description: "Before",
+    }),
+    add: userListFixture({
+      listId: ids.addList,
+      name: "Add",
+      slug: "add",
+    }),
+    deleted: userListFixture({
+      listId: ids.deletedList,
+      name: "Deleted",
+      slug: "deleted",
+      description: "Restore me",
+      isPrivate: true,
+    }),
+    createdActual: userListFixture({
+      listId: ids.createdActualList,
+      name: "Source Created",
+      slug: "source-created",
+      description: "Created by source run",
+    }),
+  });
+  const rawStorage = createMemoryStorage();
+  const snapshot = seedCompleteSnapshot(rawStorage, {
+    id: "snap_rollback",
+    repositories: Object.freeze(Object.values(repositories)),
+    lists: Object.freeze([lists.add, lists.deleted, lists.existing]),
+    memberships: Object.freeze([
+      Object.freeze({
+        repositoryId: repositories.unstar.repositoryId,
+        listId: lists.deleted.listId,
+      }),
+      Object.freeze({
+        repositoryId: repositories.unstar.repositoryId,
+        listId: lists.existing.listId,
+      }),
+      Object.freeze({
+        repositoryId: repositories.createdMember.repositoryId,
+        listId: lists.existing.listId,
+      }),
+      Object.freeze({
+        repositoryId: repositories.member.repositoryId,
+        listId: lists.existing.listId,
+      }),
+    ]),
+  });
+  const operations = rollbackSourceOperations({ repositories, lists });
+  const dependencies = Object.freeze([
+    Object.freeze({
+      operationId: rollbackSourceOperationIds.createdMembership,
+      dependsOnOperationId: rollbackSourceOperationIds.create,
+    }),
+  ]);
+  const executable: PlanExecutableContent = parsePlanExecutable({
+    schemaVersion: 1,
+    policyVersion: "1",
+    binding: snapshot.binding,
+    snapshotId: snapshot.id,
+    protectedRepositoryIds: [],
+    protectedListIds: [],
+    operations,
+    dependencies,
+  });
+  const sourcePlan = parseChangePlan({
+    id: asPlanId("plan_rollback_source"),
+    hash: hashPlanExecutable(executable),
+    state: options.runState === "partial" ? "partial" : "applied",
+    createdAt: "2026-07-16T01:00:00.000Z",
+    expiresAt: "2026-07-17T01:00:00.000Z",
+    callerNote: "source plan",
+    executable,
+    operations: executable.operations,
+    dependencies: executable.dependencies,
+    warnings: [],
+  });
+  const runId = asRunId("run_rollback_source");
+  const runState = options.runState ?? "completed";
+  const sourceRun = parseChangeRun({
+    id: runId,
+    planId: sourcePlan.id,
+    binding: snapshot.binding,
+    state: runState,
+    failureMode: "continue",
+    warnings: [],
+    startedAt: ROLLBACK_CREATED_AT,
+    finishedAt:
+      runState === "pending" || runState === "running"
+        ? null
+        : ROLLBACK_FINISHED_AT,
+  });
+  const sourceRows = Object.freeze(
+    operations.map((operation, sequence) =>
+      rollbackRunRow(
+        runId,
+        operation,
+        sequence,
+        options.rowStatuses?.[operation.operationId] ?? "succeeded",
+        lists,
+      ),
+    ),
+  );
+  const tracking = {
+    getRun: 0,
+    getPlan: 0,
+    listRunOperations: 0,
+    getCompleteSnapshot: 0,
+    snapshotRepositoryReads: 0,
+    snapshotListReads: 0,
+    membershipQueries: 0,
+    transactionCalls: 0,
+    savedPlans: [] as ChangePlan[],
+  };
+  const storage = Object.freeze({
+    ...rawStorage,
+    getRun(id: RunId): ChangeRun | null {
+      tracking.getRun += 1;
+      if (id !== sourceRun.id) return null;
+      const value =
+        options.transformRun === undefined
+          ? sourceRun
+          : options.transformRun(sourceRun);
+      return value as ChangeRun | null;
+    },
+    getPlan(id: PlanId): ChangePlan | null {
+      tracking.getPlan += 1;
+      if (id !== sourcePlan.id) return null;
+      const value =
+        options.transformPlan === undefined
+          ? sourcePlan
+          : options.transformPlan(sourcePlan);
+      return value as ChangePlan | null;
+    },
+    listRunOperations(id: RunId): readonly RunOperation[] {
+      tracking.listRunOperations += 1;
+      if (id !== sourceRun.id) return Object.freeze([]);
+      const value =
+        options.transformRows === undefined
+          ? sourceRows
+          : options.transformRows(sourceRows);
+      return value as readonly RunOperation[];
+    },
+    getCompleteSnapshot(id: Parameters<StoragePort["getCompleteSnapshot"]>[0]) {
+      tracking.getCompleteSnapshot += 1;
+      if (id === snapshot.id && options.sourceSnapshotAvailable === false) {
+        return null;
+      }
+      return rawStorage.getCompleteSnapshot(id);
+    },
+    getSnapshotRepository(
+      snapshotId: Parameters<StoragePort["getSnapshotRepository"]>[0],
+      repositoryId: Parameters<StoragePort["getSnapshotRepository"]>[1],
+    ) {
+      tracking.snapshotRepositoryReads += 1;
+      return rawStorage.getSnapshotRepository(snapshotId, repositoryId);
+    },
+    getSnapshotListSummary(
+      snapshotId: Parameters<StoragePort["getSnapshotListSummary"]>[0],
+      listId: Parameters<StoragePort["getSnapshotListSummary"]>[1],
+    ) {
+      tracking.snapshotListReads += 1;
+      return rawStorage.getSnapshotListSummary(snapshotId, listId);
+    },
+    queryListMemberships(input: ListMembershipQuery) {
+      tracking.membershipQueries += 1;
+      return rawStorage.queryListMemberships(input);
+    },
+    withTransaction<T>(callback: (transaction: StorageTransaction) => T): T {
+      tracking.transactionCalls += 1;
+      const pending: ChangePlan[] = [];
+      const result = rawStorage.withTransaction((transaction) =>
+        callback({
+          ...transaction,
+          savePlan(plan: ChangePlan) {
+            if (options.failSave === true) {
+              throw new AppError("STORAGE_ERROR", "rollback save failure", {
+                retryable: false,
+              });
+            }
+            transaction.savePlan(plan);
+            pending.push(plan);
+          },
+        }),
+      );
+      tracking.savedPlans.push(...pending);
+      return result;
+    },
+  }) satisfies StoragePort;
+  let planSequence = 0;
+  const runtime = Object.freeze({
+    now: () => ROLLBACK_PLAN_NOW,
+    planId: () => {
+      planSequence += 1;
+      return asPlanId(`plan_rollback_${String(planSequence)}`);
+    },
+  });
+  const config = Object.freeze({
+    maxPlanActions: options.maxPlanActions ?? 5_000,
+    planTtlMinutes: options.planTtlMinutes ?? 1_440,
+  }) satisfies Pick<AppConfig, "maxPlanActions" | "planTtlMinutes">;
+  const validInput = Object.freeze({
+    runId: sourceRun.id,
+    protectedRepositoryIds: Object.freeze([]),
+    protectedListIds: Object.freeze([]),
+    callerNote: "rollback fixture",
+  });
+
+  return {
+    storage,
+    rawStorage,
+    runtime,
+    config,
+    validInput,
+    sourcePlan,
+    sourceRun,
+    sourceRows,
+    snapshot,
+    repositories,
+    lists,
+    ids,
+    tracking,
+  };
+}
+
 export const inspectFixture = plannerFixture;
 
 export function fakeGitHub<T extends object>(overrides: T): Readonly<T> {

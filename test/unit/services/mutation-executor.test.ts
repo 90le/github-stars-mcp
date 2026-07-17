@@ -19,11 +19,15 @@ import { AppError } from "../../../src/domain/errors.js";
 import {
   asRepositoryDatabaseId,
   asRepositoryId,
+  asSnapshotId,
   asUserListId,
   type RepositoryId,
   type UserListId,
 } from "../../../src/domain/ids.js";
-import type { ResolvedOperation } from "../../../src/domain/plan.js";
+import {
+  parsePlanExecutable,
+  type ResolvedOperation,
+} from "../../../src/domain/plan.js";
 import type {
   RepositoryCoordinates,
   UserList,
@@ -644,6 +648,101 @@ describe("MutationExecutor live preconditions", () => {
     expect(github.mutations).toEqual([]);
   });
 
+  it.each(["undo_op_star", `undo_${"x".repeat(123)}`])(
+    "accepts the bounded rollback operation ID %s",
+    async (operationId) => {
+      const github = new StatefulGitHub();
+      const result = await executor(github).prepare(
+        Object.freeze({
+          ...starOperation(),
+          operationId,
+        }),
+        emptyExecutionContext(),
+      );
+
+      expect(result.kind).toBe("dispatch");
+      expect(github.reads).toEqual(["getRepositoryIdentity", "checkStar"]);
+      expect(github.mutations).toEqual([]);
+    },
+  );
+
+  it.each([
+    ["self dependency", Object.freeze(["op_star"])],
+    ["unsorted dependencies", Object.freeze(["op_z", "op_a"])],
+    ["duplicate dependencies", Object.freeze(["op_a", "op_a"])],
+  ])("rejects %s before any live read", async (_scenario, dependsOn) => {
+    const github = new StatefulGitHub();
+    await expect(
+      executor(github).prepare(
+        Object.freeze({
+          ...starOperation(),
+          dependsOn,
+        }),
+        emptyExecutionContext(),
+      ),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR", retryable: false });
+    expect(github.reads).toEqual([]);
+    expect(github.mutations).toEqual([]);
+  });
+
+  it("keeps unknown endpoints and cycles rejected by the global executable graph", () => {
+    const executable = {
+      schemaVersion: 1,
+      policyVersion: "1",
+      binding: {
+        host: "github.com",
+        login: "executor",
+        accountId: "U_executor",
+      },
+      snapshotId: asSnapshotId("snap_executor"),
+      protectedRepositoryIds: [],
+      protectedListIds: [],
+    } as const;
+    const unknown = Object.freeze({
+      ...starOperation(),
+      dependsOn: Object.freeze(["op_missing"]),
+    });
+    expect(() =>
+      parsePlanExecutable({
+        ...executable,
+        operations: [unknown],
+        dependencies: [
+          {
+            operationId: unknown.operationId,
+            dependsOnOperationId: "op_missing",
+          },
+        ],
+      }),
+    ).toThrowError(AppError);
+
+    const first = Object.freeze({
+      ...starOperation(),
+      operationId: "op_cycle_a",
+      dependsOn: Object.freeze(["op_cycle_b"]),
+    });
+    const second = Object.freeze({
+      ...starOperation(),
+      operationId: "op_cycle_b",
+      dependsOn: Object.freeze(["op_cycle_a"]),
+    });
+    expect(() =>
+      parsePlanExecutable({
+        ...executable,
+        operations: [first, second],
+        dependencies: [
+          {
+            operationId: "op_cycle_a",
+            dependsOnOperationId: "op_cycle_b",
+          },
+          {
+            operationId: "op_cycle_b",
+            dependsOnOperationId: "op_cycle_a",
+          },
+        ],
+      }),
+    ).toThrowError(AppError);
+  });
+
   it("rejects incomplete, unsupported, and unsafe operation fields with zero hooks or live reads", async () => {
     const requiredFields = [
       "operationId",
@@ -704,8 +803,11 @@ describe("MutationExecutor live preconditions", () => {
       "github_pat_executor-secret",
       "not-an-operation-id",
       "op_",
+      "undo_",
       "op_control\u0085value",
+      "undo_control\u0085value",
       `op_${"x".repeat(126)}`,
+      `undo_${"x".repeat(124)}`,
     ];
     for (const operationId of unsafeOperationIds) {
       const github = new StatefulGitHub();
