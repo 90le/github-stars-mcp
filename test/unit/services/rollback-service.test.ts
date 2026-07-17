@@ -215,6 +215,53 @@ function renameRows(
   );
 }
 
+function replaceCreatedAuditListId(
+  rows: readonly RunOperation[],
+  listId: UserListId,
+): readonly RunOperation[] {
+  const createRow = rows.find(
+    (row) => row.operationId === rollbackSourceOperationIds.create,
+  );
+  const createAfter = createRow?.after as
+    | Readonly<Record<string, JsonValue>>
+    | undefined;
+  if (typeof createAfter?.listId !== "string") {
+    throw new Error("Expected complete source List creation audit");
+  }
+  const previousListId = createAfter.listId;
+  return Object.freeze(
+    rows.map((row) => {
+      if (row.operationId === rollbackSourceOperationIds.create) {
+        return parseRunOperation({
+          ...row,
+          after: {
+            ...(row.after as Readonly<Record<string, JsonValue>>),
+            listId,
+          },
+        });
+      }
+      if (row.operationId !== rollbackSourceOperationIds.createdMembership) {
+        return row;
+      }
+      const after = row.after as Readonly<Record<string, JsonValue>>;
+      if (!Array.isArray(after.listIds)) {
+        throw new Error("Expected created-List membership audit");
+      }
+      const listIds = after.listIds as readonly JsonValue[];
+      return parseRunOperation({
+        ...row,
+        after: {
+          listIds: listIds
+            .map((candidate) =>
+              candidate === previousListId ? listId : candidate,
+            )
+            .sort(),
+        },
+      });
+    }),
+  );
+}
+
 function assertNoDanglingDependencies(
   operations: readonly ResolvedOperation[],
 ): void {
@@ -606,6 +653,231 @@ describe("RollbackService", () => {
         service(fixture).createRollback(fixture.validInput),
         "PRECONDITION_FAILED",
       );
+      expectNoSave(fixture);
+    }
+  });
+
+  it("accepts an exact stop-partial audit prefix and warns about the unscheduled gap", async () => {
+    const fixture = rollbackFixture({
+      runState: "partial",
+      failureMode: "stop",
+      rowStatuses: {
+        [rollbackSourceOperationIds.create]: "failed",
+      },
+      transformRows: (rows) => Object.freeze(rows.slice(0, 3)),
+    });
+
+    const { plan } = await service(fixture).createRollback(fixture.validInput);
+
+    expect(
+      plan.operations.some((operation) =>
+        operation.operationId.includes(rollbackSourceOperationIds.star),
+      ),
+    ).toBe(true);
+    expect(
+      plan.operations.some((operation) =>
+        operation.operationId.includes(rollbackSourceOperationIds.unstar),
+      ),
+    ).toBe(true);
+    for (const unscheduledId of [
+      rollbackSourceOperationIds.createdMembership,
+      rollbackSourceOperationIds.update,
+      rollbackSourceOperationIds.delete,
+      rollbackSourceOperationIds.membership,
+    ]) {
+      expect(
+        plan.operations.some((operation) =>
+          operation.operationId.includes(unscheduledId),
+        ),
+      ).toBe(false);
+    }
+    expect(plan.warnings).toContain(
+      `Source run ${fixture.sourceRun.id} has 4 unscheduled operations without audit rows; they are not included.`,
+    );
+    expect(plan.warnings).toContain(
+      `Source operation ${rollbackSourceOperationIds.create} was non-succeeded (failed) and is not included.`,
+    );
+    expect(fixture.tracking.transactionCalls).toBe(1);
+    expect(fixture.tracking.savedPlans).toEqual([plan]);
+  });
+
+  it("keeps stop-partial audit prefixes closed against gaps, post-stop rows, and other lifecycle modes", async () => {
+    const cases = [
+      rollbackFixture({
+        runState: "partial",
+        failureMode: "stop",
+        rowStatuses: {
+          [rollbackSourceOperationIds.unstar]: "failed",
+        },
+        transformRows: (rows) => Object.freeze([rows[0]!, rows[2]!]),
+      }),
+      rollbackFixture({
+        runState: "partial",
+        failureMode: "stop",
+        rowStatuses: {
+          [rollbackSourceOperationIds.unstar]: "failed",
+        },
+        transformRows: (rows) => Object.freeze(rows.slice(0, 3)),
+      }),
+      rollbackFixture({
+        runState: "partial",
+        failureMode: "continue",
+        rowStatuses: {
+          [rollbackSourceOperationIds.create]: "failed",
+        },
+        transformRows: (rows) => Object.freeze(rows.slice(0, 3)),
+      }),
+      rollbackFixture({
+        runState: "completed",
+        failureMode: "stop",
+        transformRows: (rows) => Object.freeze(rows.slice(0, 6)),
+      }),
+    ];
+
+    for (const fixture of cases) {
+      await rejectsWith(
+        service(fixture).createRollback(fixture.validInput),
+        "PRECONDITION_FAILED",
+      );
+      expectNoSave(fixture);
+    }
+  });
+
+  it("rejects a successful List creation whose actual ID was already in its source baseline", async () => {
+    const collision = asUserListId("UL_source_baseline_collision");
+    let changedPlan: ChangePlan | null = null;
+    const fixture = rollbackFixture({
+      transformPlan: (plan) => {
+        changedPlan = replaceOperation(
+          plan,
+          rollbackSourceOperationIds.create,
+          (operation) => {
+            if (operation.kind !== "list_create") {
+              throw new Error("Expected source List creation");
+            }
+            const before = operation.before as Readonly<{
+              listIds?: unknown;
+            }>;
+            if (!Array.isArray(before.listIds)) {
+              throw new Error("Expected source List baseline");
+            }
+            const listIds = Object.freeze(
+              [...(before.listIds as readonly UserListId[]), collision].sort(),
+            );
+            return parseResolvedOperation({
+              ...operation,
+              preconditions: Object.freeze([
+                Object.freeze({
+                  kind: "list_id_baseline",
+                  expected: Object.freeze({ listIds }),
+                }),
+              ]),
+              before: Object.freeze({ listIds }),
+            });
+          },
+        );
+        return changedPlan;
+      },
+      transformRows: (rows) =>
+        Object.freeze(
+          replaceCreatedAuditListId(rows, collision).map((row) => {
+            if (row.operationId !== rollbackSourceOperationIds.create) {
+              return row;
+            }
+            const sourceCreate = operationById(
+              changedPlan!.operations,
+              rollbackSourceOperationIds.create,
+            );
+            return parseRunOperation({
+              ...row,
+              before: sourceCreate.before,
+            });
+          }),
+        ),
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expectNoSave(fixture);
+  });
+
+  it("exhausts and bounds the complete snapshot List baseline before trusting a created ID", async () => {
+    const additionalLists = Object.freeze(
+      Array.from({ length: 101 }, (_, index) => {
+        const suffix = String(index).padStart(3, "0");
+        return userListFixture({
+          listId: asUserListId(`UL_extra_${suffix}`),
+          name: `Extra ${suffix}`,
+          slug: `extra-${suffix}`,
+        });
+      }),
+    );
+    const collision = additionalLists[100]!.listId;
+    const paged = rollbackFixture({
+      additionalSnapshotLists: additionalLists,
+      transformRows: (rows) => replaceCreatedAuditListId(rows, collision),
+    });
+
+    await rejectsWith(
+      service(paged).createRollback(paged.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expect(paged.tracking.listQueries).toHaveLength(2);
+    expect(paged.tracking.listQueries[0]).toMatchObject({
+      pageSize: 100,
+      cursor: null,
+    });
+    expect(paged.tracking.listQueries[1]!.cursor).not.toBeNull();
+    expectNoSave(paged);
+
+    const overBound = rollbackFixture({
+      transformListPage: (page) =>
+        Object.freeze({
+          ...page,
+          total: 5_001,
+        }),
+    });
+    await rejectsWith(
+      service(overBound).createRollback(overBound.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expect(overBound.tracking.listQueries).toHaveLength(1);
+    expectNoSave(overBound);
+  });
+
+  it("rejects corrupt or key-mismatched snapshot repository records before persistence", async () => {
+    const base = {
+      runState: "partial" as const,
+      rowStatuses: {
+        [rollbackSourceOperationIds.unstar]: "failed" as const,
+      },
+    };
+    const cases = [
+      rollbackFixture({
+        ...base,
+        transformSnapshotRepository: (repository) =>
+          repository === null
+            ? null
+            : {
+                ...repository,
+                repositoryId: asRepositoryId("R_wrong_snapshot_key"),
+              },
+      }),
+      rollbackFixture({
+        ...base,
+        transformSnapshotRepository: (repository) =>
+          repository === null ? null : { ...repository, owner: "" },
+      }),
+    ];
+
+    for (const fixture of cases) {
+      await rejectsWith(
+        service(fixture).createRollback(fixture.validInput),
+        "PRECONDITION_FAILED",
+      );
+      expect(fixture.tracking.snapshotRepositoryReads).toBeGreaterThan(0);
       expectNoSave(fixture);
     }
   });

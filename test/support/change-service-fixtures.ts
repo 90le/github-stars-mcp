@@ -23,6 +23,7 @@ import {
 import type {
   ListMembershipQuery,
   ListQuery,
+  ListQueryPage,
   RepositoryQuery,
 } from "../../src/domain/filter.js";
 import {
@@ -1608,14 +1609,24 @@ function rollbackRunRow(
 
 export interface RollbackFixtureOptions {
   readonly runState?: ChangeRun["state"];
+  readonly failureMode?: FailureMode;
   readonly rowStatuses?: Readonly<Record<string, RunOperationStatus>>;
   readonly maxPlanActions?: number;
   readonly planTtlMinutes?: number;
   readonly failSave?: boolean;
   readonly sourceSnapshotAvailable?: boolean;
+  readonly additionalSnapshotLists?: readonly UserList[];
   readonly transformPlan?: (plan: ChangePlan) => unknown;
   readonly transformRun?: (run: ChangeRun) => unknown;
   readonly transformRows?: (rows: readonly RunOperation[]) => unknown;
+  readonly transformListPage?: (
+    page: ListQueryPage,
+    input: ListQuery,
+  ) => unknown;
+  readonly transformSnapshotRepository?: (
+    repository: RepositoryView | null,
+    repositoryId: RepositoryId,
+  ) => unknown;
 }
 
 export function rollbackFixture(options: RollbackFixtureOptions = {}) {
@@ -1681,7 +1692,12 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
   const snapshot = seedCompleteSnapshot(rawStorage, {
     id: "snap_rollback",
     repositories: Object.freeze(Object.values(repositories)),
-    lists: Object.freeze([lists.add, lists.deleted, lists.existing]),
+    lists: Object.freeze([
+      lists.add,
+      lists.deleted,
+      lists.existing,
+      ...(options.additionalSnapshotLists ?? []),
+    ]),
     memberships: Object.freeze([
       Object.freeze({
         repositoryId: repositories.unstar.repositoryId,
@@ -1737,7 +1753,7 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
     planId: sourcePlan.id,
     binding: snapshot.binding,
     state: runState,
-    failureMode: "continue",
+    failureMode: options.failureMode ?? "continue",
     warnings: [],
     startedAt: ROLLBACK_CREATED_AT,
     finishedAt:
@@ -1763,6 +1779,7 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
     getCompleteSnapshot: 0,
     snapshotRepositoryReads: 0,
     snapshotListReads: 0,
+    listQueries: [] as ListQuery[],
     membershipQueries: 0,
     transactionCalls: 0,
     savedPlans: [] as ChangePlan[],
@@ -1808,7 +1825,15 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
       repositoryId: Parameters<StoragePort["getSnapshotRepository"]>[1],
     ) {
       tracking.snapshotRepositoryReads += 1;
-      return rawStorage.getSnapshotRepository(snapshotId, repositoryId);
+      const repository = rawStorage.getSnapshotRepository(
+        snapshotId,
+        repositoryId,
+      );
+      const value =
+        options.transformSnapshotRepository === undefined
+          ? repository
+          : options.transformSnapshotRepository(repository, repositoryId);
+      return value as RepositoryView | null;
     },
     getSnapshotListSummary(
       snapshotId: Parameters<StoragePort["getSnapshotListSummary"]>[0],
@@ -1816,6 +1841,15 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
     ) {
       tracking.snapshotListReads += 1;
       return rawStorage.getSnapshotListSummary(snapshotId, listId);
+    },
+    queryLists(input: ListQuery) {
+      tracking.listQueries.push(input);
+      const page = rawStorage.queryLists(input);
+      const value =
+        options.transformListPage === undefined
+          ? page
+          : options.transformListPage(page, input);
+      return value as ListQueryPage;
     },
     queryListMemberships(input: ListMembershipQuery) {
       tracking.membershipQueries += 1;

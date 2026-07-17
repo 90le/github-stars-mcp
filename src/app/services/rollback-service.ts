@@ -26,15 +26,17 @@ import {
   type ResolvedListTarget,
   type ResolvedOperation,
 } from "../../domain/plan.js";
-import type {
-  AccountBinding,
-  RepositoryCoordinates,
-  RepositoryView,
-  UserList,
+import {
+  repositoryViewSchema,
+  type AccountBinding,
+  type RepositoryCoordinates,
+  type RepositoryView,
+  type UserList,
 } from "../../domain/repository.js";
 import {
   parseChangeRun,
   parseRunOperation,
+  type ChangeRun,
   type RunOperation,
 } from "../../domain/run.js";
 import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
@@ -446,16 +448,42 @@ function repositoryIdentityFromSnapshot(
   });
 }
 
+function validatedSnapshotRepository(
+  value: unknown,
+  repositoryId: RepositoryId,
+): RepositoryView {
+  try {
+    const parsed = repositoryViewSchema.safeParse(value);
+    if (!parsed.success || parsed.data.repositoryId !== repositoryId) {
+      return precondition(
+        "Source snapshot repository identity is corrupt or key-mismatched",
+      );
+    }
+    return parsed.data;
+  } catch {
+    return precondition(
+      "Source snapshot repository identity is corrupt or key-mismatched",
+    );
+  }
+}
+
 function sameBinding(left: AccountBinding, right: AccountBinding): boolean {
   return sameJson(left, right);
 }
 
 function sourceAudit(
   planOperations: readonly ResolvedOperation[],
+  dependencies: readonly OperationDependency[],
   rows: readonly RunOperation[],
-  runId: RunId,
+  run: ChangeRun,
 ): ReadonlyMap<string, RunOperation> {
-  if (rows.length !== planOperations.length || rows.length > MAX_IDS) {
+  const allowsUnscheduledSuffix =
+    run.state === "partial" && run.failureMode === "stop";
+  if (
+    rows.length > planOperations.length ||
+    rows.length > MAX_IDS ||
+    (!allowsUnscheduledSuffix && rows.length !== planOperations.length)
+  ) {
     return precondition(
       "source run audit rows do not match the source operation set",
     );
@@ -477,7 +505,7 @@ function sourceAudit(
     const source = sourceById.get(row.operationId);
     if (
       source === undefined ||
-      row.runId !== runId ||
+      row.runId !== run.id ||
       row.sequence !== source.sequence ||
       !sameJson(row.before, source.operation.before) ||
       result.has(row.operationId)
@@ -488,8 +516,30 @@ function sourceAudit(
     }
     result.set(row.operationId, row);
   }
-  if (result.size !== planOperations.length) {
+  if (!allowsUnscheduledSuffix && result.size !== planOperations.length) {
     return precondition("source run audit is missing operation rows");
+  }
+  if (allowsUnscheduledSuffix) {
+    const scheduledPrefix = topologicalOperationIds(
+      planOperations,
+      dependencies,
+    ).slice(0, rows.length);
+    if (
+      result.size !== rows.length ||
+      scheduledPrefix.some((operationId) => !result.has(operationId))
+    ) {
+      return precondition(
+        "source stop-mode run audit is not an exact scheduled prefix",
+      );
+    }
+    for (let index = 0; index + 1 < scheduledPrefix.length; index += 1) {
+      const row = result.get(scheduledPrefix[index]!);
+      if (row?.status !== "succeeded" && row?.status !== "skipped") {
+        return precondition(
+          "source stop-mode run audit contains rows after its stop boundary",
+        );
+      }
+    }
   }
   return result;
 }
@@ -517,6 +567,10 @@ function validateSucceededAudit(
           row.after,
           `source operation ${operation.operationId} created List`,
         );
+        const sourceBaseline = listIdsState(
+          operation.before,
+          `source operation ${operation.operationId} List baseline`,
+        );
         if (
           !sameJson(
             Object.freeze({
@@ -532,6 +586,11 @@ function validateSucceededAudit(
         ) {
           return precondition(
             "source List create audit metadata is contradictory",
+          );
+        }
+        if (sourceBaseline.includes(list.listId)) {
+          return precondition(
+            "source List create audit reused an ID from its source baseline",
           );
         }
         if (
@@ -663,14 +722,26 @@ function querySnapshotListIds(
         { retryable: false },
       );
     }
+    const pageItems = page.items;
+    if (pageItems.length > PAGE_SIZE) {
+      return precondition("source snapshot List page is not bounded");
+    }
     if (expectedTotal === null) expectedTotal = page.total;
-    if (expectedTotal !== page.total || page.total > MAX_IDS) {
+    if (
+      !Number.isSafeInteger(page.total) ||
+      page.total < 0 ||
+      expectedTotal !== page.total ||
+      page.total > MAX_IDS
+    ) {
       return precondition("source snapshot List pagination is contradictory");
     }
-    for (const list of page.items) result.push(list.listId);
+    for (const list of pageItems) result.push(list.listId);
+    if (result.length > expectedTotal || result.length > MAX_IDS) {
+      return precondition("source snapshot List pagination exceeded its bound");
+    }
     if (
       page.nextCursor !== null &&
-      (page.nextCursor === cursor || page.items.length === 0)
+      (page.nextCursor === cursor || pageItems.length === 0)
     ) {
       return precondition("source snapshot List pagination did not advance");
     }
@@ -966,7 +1037,12 @@ export class RollbackService {
       if (error instanceof AppError) throw error;
       return precondition("Source run audit could not be read");
     }
-    const rowById = sourceAudit(sourcePlan.operations, rawRows, run.id);
+    const rowById = sourceAudit(
+      sourcePlan.operations,
+      sourcePlan.dependencies,
+      rawRows,
+      run,
+    );
     const successfulOperations = sourcePlan.operations.filter(
       (operation) => rowById.get(operation.operationId)?.status === "succeeded",
     );
@@ -993,12 +1069,19 @@ export class RollbackService {
       );
     }
     for (const operation of sourcePlan.operations) {
-      const row = rowById.get(operation.operationId)!;
+      const row = rowById.get(operation.operationId);
+      if (row === undefined) continue;
       if (row.status !== "succeeded") {
         warnings.add(
           `Source operation ${operation.operationId} was non-succeeded (${row.status}) and is not included.`,
         );
       }
+    }
+    const unscheduledCount = sourcePlan.operations.length - rowById.size;
+    if (unscheduledCount > 0) {
+      warnings.add(
+        `Source run ${run.id} has ${String(unscheduledCount)} unscheduled operations without audit rows; they are not included.`,
+      );
     }
 
     const snapshotListIds = querySnapshotListIds(this.#storage, snapshot.id);
@@ -1039,7 +1122,9 @@ export class RollbackService {
       }
       repositoryIdentities.set(
         repositoryId,
-        repositoryIdentityFromSnapshot(repository),
+        repositoryIdentityFromSnapshot(
+          validatedSnapshotRepository(repository, repositoryId),
+        ),
       );
     }
 
@@ -1054,6 +1139,7 @@ export class RollbackService {
       snapshotMemberships.set(repositoryId, memberships);
       postMemberships.set(repositoryId, memberships);
     }
+    const snapshotListIdSet = new Set<UserListId>(snapshotListIds);
     const postListIds = new Set<UserListId>(snapshotListIds);
     const successfulRows = successfulOperations
       .map((operation) => ({
@@ -1075,6 +1161,14 @@ export class RollbackService {
           );
           if (created === undefined) {
             return precondition("Source List creation audit is missing");
+          }
+          if (
+            snapshotListIdSet.has(created.listId) ||
+            postListIds.has(created.listId)
+          ) {
+            return precondition(
+              "Source List creation audit reused an existing List ID",
+            );
           }
           postListIds.add(created.listId);
           break;
