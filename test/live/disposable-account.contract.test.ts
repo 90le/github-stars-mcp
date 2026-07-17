@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
-import { describe, expect, it } from "vitest";
+import { describe, it } from "vitest";
 import type {
   GitHubPort,
   GitHubUserList,
+  RepositoryIdentity,
 } from "../../src/app/ports/github-port.js";
 import { CredentialProvider } from "../../src/auth/credential-provider.js";
 import {
@@ -95,12 +96,66 @@ function fixtureCoordinates(repository: string): {
   });
 }
 
-function asError(error: unknown): Error {
-  return error instanceof Error
-    ? error
-    : new AppError("INTERNAL_ERROR", "Live contract failed", {
-        retryable: false,
-      });
+function contractFailure(message: string): AppError {
+  return new AppError("PRECONDITION_FAILED", message, {
+    retryable: false,
+  });
+}
+
+function sanitizedError(error: unknown): AppError {
+  const serialized = serializeError(error);
+  return new AppError(serialized.code, serialized.message, {
+    retryable: serialized.retryable,
+    details: serialized.details,
+  });
+}
+
+async function listAllUserLists(
+  github: Pick<GitHubPort, "listUserLists">,
+): Promise<readonly GitHubUserList[]> {
+  const lists: GitHubUserList[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | null = null;
+  for (let pageNumber = 0; pageNumber < 1_000; pageNumber += 1) {
+    const page = await github.listUserLists(cursor);
+    lists.push(...page.items);
+    if (page.nextCursor === null) return Object.freeze(lists);
+    if (seenCursors.has(page.nextCursor)) {
+      throw contractFailure("Live User List pagination repeated a cursor");
+    }
+    seenCursors.add(page.nextCursor);
+    cursor = page.nextCursor;
+  }
+  throw contractFailure("Live User List pagination exceeded its safety bound");
+}
+
+async function deleteUserListAndVerify(
+  github: Pick<GitHubPort, "deleteUserList" | "getUserList">,
+  listId: UserListId,
+): Promise<void> {
+  let deletionError: unknown;
+  try {
+    await github.deleteUserList(listId, newOperationId());
+  } catch (error) {
+    deletionError = error;
+  }
+  if ((await github.getUserList(listId)) !== null) {
+    throw deletionError === undefined
+      ? contractFailure("Cleanup did not delete a disposable User List")
+      : sanitizedError(deletionError);
+  }
+}
+
+function sameIdentity(
+  left: RepositoryIdentity,
+  right: RepositoryIdentity,
+): boolean {
+  return (
+    left.repositoryId === right.repositoryId &&
+    left.repositoryDatabaseId === right.repositoryDatabaseId &&
+    left.coordinates.owner === right.coordinates.owner &&
+    left.coordinates.name === right.coordinates.name
+  );
 }
 
 describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
@@ -108,15 +163,18 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
   () => {
     it("observes Star and User List independence and always restores state", async () => {
       const config = loadLiveContractConfig();
-      const github = await createLiveAdapter();
       const repository = fixtureCoordinates(config.repository);
       const cleanup: CleanupRecord[] = [];
       const cleanupFailures: unknown[] = [];
+      const verifiedDeletedListIds = new Set<string>();
+      let github: GitHubPort | null = null;
+      let identity: RepositoryIdentity | null = null;
+      let baselineLists: readonly GitHubUserList[] | null = null;
       let primaryError: unknown;
       let originalStarred: boolean | null = null;
       let originalListIds: readonly UserListId[] | null = null;
       let createdList: GitHubUserList | null = null;
-      let createdListDeleted = false;
+      let createdListName: string | null = null;
       let listDeletionChangedStarState: boolean | null = null;
       let unstarChangedMembershipState: boolean | null = null;
       let terminalError: Error | null = null;
@@ -146,17 +204,18 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
       };
 
       try {
+        github = await createLiveAdapter();
         const viewer = await github.getViewer();
-        expect(viewer.login).toBe(config.login);
+        if (viewer.login !== config.login) {
+          throw contractFailure("Live viewer does not match the guarded login");
+        }
 
-        const identity = await github.getRepositoryIdentity(repository);
+        identity = await github.getRepositoryIdentity(repository);
         if (identity === null) {
           throw new AppError(
             "NOT_FOUND",
             "Live fixture repository was not found",
-            {
-              retryable: false,
-            },
+            { retryable: false },
           );
         }
 
@@ -164,22 +223,30 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
         originalListIds = await github.getRepositoryListIds(
           identity.repositoryId,
         );
+        baselineLists = await listAllUserLists(github);
         if (!originalStarred) {
           await github.star(repository, newOperationId());
+          if (!(await github.checkStar(repository))) {
+            throw contractFailure("Live fixture Star setup did not apply");
+          }
         }
 
-        const listName = `github-stars-mcp-live-${Date.now()}-${randomUUID().slice(0, 8)}`;
+        createdListName = `github-stars-mcp-live-${Date.now()}-${randomUUID().slice(0, 8)}`;
         const created = await github.createUserList(
           {
-            name: listName,
+            name: createdListName,
             description: "Disposable github-stars-mcp live contract fixture",
             isPrivate: true,
           },
           newOperationId(),
         );
         createdList = created.list;
-        expect(createdList.name).toBe(listName);
-        expect(createdList.isPrivate).toBe(true);
+        if (
+          createdList.name !== createdListName ||
+          createdList.isPrivate !== true
+        ) {
+          throw contractFailure("Disposable User List creation was not exact");
+        }
 
         const membershipUnderTest = withList(
           originalListIds,
@@ -190,8 +257,19 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
           membershipUnderTest,
           newOperationId(),
         );
+        const membershipBeforeUnstar = await github.getRepositoryListIds(
+          identity.repositoryId,
+        );
+        if (!sameIds(membershipBeforeUnstar, membershipUnderTest)) {
+          throw contractFailure(
+            "Disposable User List membership setup did not apply",
+          );
+        }
 
         await github.unstar(repository, newOperationId());
+        if (await github.checkStar(repository)) {
+          throw contractFailure("Live fixture unstar did not apply");
+        }
         const membershipsAfterUnstar = await github.getRepositoryListIds(
           identity.repositoryId,
         );
@@ -201,69 +279,224 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
         );
 
         await github.star(repository, newOperationId());
+        if (!(await github.checkStar(repository))) {
+          throw contractFailure("Live fixture restar did not apply");
+        }
         await github.setRepositoryListIds(
           identity.repositoryId,
           membershipUnderTest,
           newOperationId(),
         );
+        if (
+          !sameIds(
+            await github.getRepositoryListIds(identity.repositoryId),
+            membershipUnderTest,
+          )
+        ) {
+          throw contractFailure(
+            "Disposable membership reset before deletion did not apply",
+          );
+        }
+
         const starBeforeListDeletion = await github.checkStar(repository);
         await github.deleteUserList(createdList.listId, newOperationId());
-        createdListDeleted = true;
+        if ((await github.getUserList(createdList.listId)) !== null) {
+          throw contractFailure("Disposable User List deletion did not apply");
+        }
+        verifiedDeletedListIds.add(String(createdList.listId));
         const starAfterListDeletion = await github.checkStar(repository);
         listDeletionChangedStarState =
           starBeforeListDeletion !== starAfterListDeletion;
-        expect(starAfterListDeletion).toBe(starBeforeListDeletion);
       } catch (error) {
         primaryError = error;
       } finally {
-        const identity = await github
-          .getRepositoryIdentity(repository)
-          .catch((error: unknown) => {
-            cleanupFailures.push(error);
-            return null;
-          });
+        const cleanupGithub = github;
+        const cleanupIdentity = identity;
+        const cleanupOriginalListIds = originalListIds;
+        const cleanupOriginalStarred = originalStarred;
+        const cleanupBaselineLists = baselineLists;
+        const cleanupCreatedListName = createdListName;
 
         await cleanupAction(
-          "ensure fixture is starred for membership restoration",
-          identity !== null && originalListIds !== null,
+          "revalidate fixture repository identity",
+          cleanupGithub !== null && cleanupIdentity !== null,
           async () => {
-            if (!(await github.checkStar(repository))) {
-              await github.star(repository, newOperationId());
+            if (cleanupGithub === null || cleanupIdentity === null) return;
+            const observed =
+              await cleanupGithub.getRepositoryIdentity(repository);
+            if (observed === null || !sameIdentity(observed, cleanupIdentity)) {
+              throw contractFailure(
+                "Fixture repository identity changed during the live contract",
+              );
+            }
+          },
+        );
+        await cleanupAction(
+          "ensure fixture is starred for membership restoration",
+          cleanupGithub !== null &&
+            cleanupIdentity !== null &&
+            cleanupOriginalListIds !== null,
+          async () => {
+            if (cleanupGithub === null) return;
+            if (!(await cleanupGithub.checkStar(repository))) {
+              await cleanupGithub.star(repository, newOperationId());
+            }
+            if (!(await cleanupGithub.checkStar(repository))) {
+              throw contractFailure(
+                "Cleanup could not restore a temporary Star",
+              );
             }
           },
         );
         await cleanupAction(
           "restore original User List memberships",
-          identity !== null && originalListIds !== null,
+          cleanupGithub !== null &&
+            cleanupIdentity !== null &&
+            cleanupOriginalListIds !== null,
           async () => {
-            if (identity === null || originalListIds === null) return;
-            await github.setRepositoryListIds(
-              identity.repositoryId,
-              originalListIds,
+            if (
+              cleanupGithub === null ||
+              cleanupIdentity === null ||
+              cleanupOriginalListIds === null
+            ) {
+              return;
+            }
+            await cleanupGithub.setRepositoryListIds(
+              cleanupIdentity.repositoryId,
+              cleanupOriginalListIds,
               newOperationId(),
             );
+            if (
+              !sameIds(
+                await cleanupGithub.getRepositoryListIds(
+                  cleanupIdentity.repositoryId,
+                ),
+                cleanupOriginalListIds,
+              )
+            ) {
+              throw contractFailure(
+                "Cleanup did not restore original User List memberships",
+              );
+            }
           },
         );
+
+        const cleanupCandidates = new Map<string, GitHubUserList>();
+        if (
+          createdList !== null &&
+          !verifiedDeletedListIds.has(String(createdList.listId))
+        ) {
+          cleanupCandidates.set(String(createdList.listId), createdList);
+        }
         await cleanupAction(
-          "delete the disposable User List",
-          createdList !== null && !createdListDeleted,
+          "enumerate disposable User Lists",
+          cleanupGithub !== null &&
+            cleanupBaselineLists !== null &&
+            cleanupCreatedListName !== null,
           async () => {
-            if (createdList === null) return;
-            await github.deleteUserList(createdList.listId, newOperationId());
-            createdListDeleted = true;
+            if (
+              cleanupGithub === null ||
+              cleanupBaselineLists === null ||
+              cleanupCreatedListName === null
+            ) {
+              return;
+            }
+            const baselineIds = new Set(
+              cleanupBaselineLists.map((list) => String(list.listId)),
+            );
+            for (const list of await listAllUserLists(cleanupGithub)) {
+              if (
+                list.name === cleanupCreatedListName &&
+                !baselineIds.has(String(list.listId))
+              ) {
+                cleanupCandidates.set(String(list.listId), list);
+              }
+            }
+          },
+        );
+        let candidateIndex = 0;
+        for (const candidate of cleanupCandidates.values()) {
+          candidateIndex += 1;
+          await cleanupAction(
+            `delete disposable User List ${candidateIndex}`,
+            !verifiedDeletedListIds.has(String(candidate.listId)),
+            async () => {
+              if (cleanupGithub === null) return;
+              await deleteUserListAndVerify(cleanupGithub, candidate.listId);
+              verifiedDeletedListIds.add(String(candidate.listId));
+            },
+          );
+        }
+        await cleanupAction(
+          "remove and verify any remaining disposable User Lists",
+          cleanupGithub !== null &&
+            cleanupBaselineLists !== null &&
+            cleanupCreatedListName !== null,
+          async () => {
+            if (
+              cleanupGithub === null ||
+              cleanupBaselineLists === null ||
+              cleanupCreatedListName === null
+            ) {
+              return;
+            }
+            const baselineIds = new Set(
+              cleanupBaselineLists.map((list) => String(list.listId)),
+            );
+            const failures: Error[] = [];
+            const remaining = (await listAllUserLists(cleanupGithub)).filter(
+              (list) =>
+                list.name === cleanupCreatedListName &&
+                !baselineIds.has(String(list.listId)),
+            );
+            for (const list of remaining) {
+              try {
+                await deleteUserListAndVerify(cleanupGithub, list.listId);
+                verifiedDeletedListIds.add(String(list.listId));
+              } catch (error) {
+                failures.push(sanitizedError(error));
+              }
+            }
+            const stillPresent = (await listAllUserLists(cleanupGithub)).some(
+              (list) =>
+                list.name === cleanupCreatedListName &&
+                !baselineIds.has(String(list.listId)),
+            );
+            if (failures.length > 0 || stillPresent) {
+              if (failures.length > 0) {
+                throw new AggregateError(
+                  failures,
+                  "Disposable User List cleanup failed",
+                );
+              }
+              throw contractFailure(
+                "A disposable User List remains after cleanup",
+              );
+            }
           },
         );
         await cleanupAction(
           "restore original Star state",
-          originalStarred !== null,
+          cleanupGithub !== null && cleanupOriginalStarred !== null,
           async () => {
-            if (originalStarred === null) return;
-            const current = await github.checkStar(repository);
-            if (current === originalStarred) return;
-            if (originalStarred) {
-              await github.star(repository, newOperationId());
-            } else {
-              await github.unstar(repository, newOperationId());
+            if (cleanupGithub === null || cleanupOriginalStarred === null) {
+              return;
+            }
+            const current = await cleanupGithub.checkStar(repository);
+            if (current !== cleanupOriginalStarred) {
+              if (cleanupOriginalStarred) {
+                await cleanupGithub.star(repository, newOperationId());
+              } else {
+                await cleanupGithub.unstar(repository, newOperationId());
+              }
+            }
+            if (
+              (await cleanupGithub.checkStar(repository)) !==
+              cleanupOriginalStarred
+            ) {
+              throw contractFailure(
+                "Cleanup did not restore the original Star state",
+              );
             }
           },
         );
@@ -298,15 +531,16 @@ describe.skipIf(process.env.GITHUB_STARS_MCP_LIVE !== "1")(
           cleanupFailures.push(error);
         }
 
-        if (cleanupFailures.length > 0) {
+        const sanitizedCleanupFailures = cleanupFailures.map(sanitizedError);
+        if (sanitizedCleanupFailures.length > 0) {
           terminalError = new AggregateError(
             primaryError === undefined
-              ? cleanupFailures.map(asError)
-              : [asError(primaryError), ...cleanupFailures.map(asError)],
+              ? sanitizedCleanupFailures
+              : [sanitizedError(primaryError), ...sanitizedCleanupFailures],
             "Disposable-account live contract or cleanup failed",
           );
         } else if (primaryError !== undefined) {
-          terminalError = asError(primaryError);
+          terminalError = sanitizedError(primaryError);
         }
       }
 
