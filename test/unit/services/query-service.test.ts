@@ -10,7 +10,11 @@ import {
   type QueryStoragePort,
   type StarsQueryInput,
 } from "../../../src/app/services/query-service.js";
-import type { EvidenceRecord } from "../../../src/app/services/evidence-service.js";
+import {
+  EvidenceService,
+  type EvidenceRecord,
+} from "../../../src/app/services/evidence-service.js";
+import type { GitHubEvidenceReadPort } from "../../../src/app/ports/github-port.js";
 import { AppError, serializeError } from "../../../src/domain/errors.js";
 import type {
   ListMembershipQueryPage,
@@ -472,6 +476,25 @@ describe("QueryService", () => {
       expect(result.evidence).toEqual(records);
     },
   );
+
+  it("integrates the real EvidenceService with RepositoryView snapshot rows", async () => {
+    const storage = fakeStorage();
+    const getReadme = vi.fn(() => Promise.resolve(null));
+    const github = { getReadme } satisfies GitHubEvidenceReadPort;
+    const actualEvidence = new EvidenceService(github, 1);
+
+    const result = await queryService(storage.port, actualEvidence).query(
+      baseStarsInput({ evidence: "summary", evidenceLimit: 1 }),
+    );
+
+    expect(result.evidence).toHaveLength(1);
+    expect(result.evidence[0]).toMatchObject({
+      repositoryId: "R_1",
+      text: "description 1",
+      missing: false,
+    });
+    expect(getReadme).not.toHaveBeenCalled();
+  });
 
   it("rejects an evidence limit larger than the selected page before enrichment", async () => {
     const storage = fakeStorage();
