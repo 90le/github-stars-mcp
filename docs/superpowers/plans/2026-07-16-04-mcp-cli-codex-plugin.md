@@ -544,7 +544,10 @@ export function toInspectInput(input: InspectInput): InspectServiceInput {
 
 `toPlanAction` must exhaustively switch over the eight public request kinds,
 convert every node ID through its branded constructor, preserve `client_ref`,
-and convert snake-case List properties to domain camel case. The query mapper
+map a `list_update` selector to one domain action with sorted unique
+`listIds`, combine membership `list_ids` as existing targets and `list_refs`
+as request-time `{kind:"created",clientRef}` targets, and convert snake-case
+List properties to domain camel case. The query mapper
 must also map the public names (`name_with_owner`, `stargazers_count`,
 `language`, `license`, `archived`, `disabled`, `fork`, and `is_unclassified`)
 to the closed Plan 01 domain fields or derived predicates, and map `ne` /

@@ -538,6 +538,7 @@ pending -> running -> completed
 pending -> running -> partial
 pending -> running -> failed
 partial -> running
+[startup recovery only] pending|running -> partial
 ```
 
 Reconciliation is recorded per operation. Resuming a partial run reuses its run ID and transitions it back to `running`; succeeded operations remain immutable.

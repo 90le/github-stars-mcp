@@ -482,23 +482,25 @@ git commit -m "feat: add deterministic repository filters"
 
 **Interfaces:**
 - Consumes: IDs, account/coordinates, filters, `JsonValue`, `SerializedDomainError`.
-- Produces: exact immutable plan/run interfaces consumed by plans 03/04.
+- Produces: exact immutable plan/run interfaces, strict runtime parsers, canonical executable hashing, graph validation, and normal/recovery lifecycle transitions consumed by plans 03/04.
 
 - [ ] **Step 1: Write failing canonical, graph, and transition tests**
 
 ```ts
 import { expect, test } from "vitest";
-import { canonicalJson, hashPlanExecutable } from "../../../src/domain/canonical-json.js";
+import { canonicalJson, sha256Hex } from "../../../src/domain/canonical-json.js";
 import { asRepositoryDatabaseId, asRepositoryId, asSnapshotId } from "../../../src/domain/ids.js";
-import { topologicalOperationIds, transitionPlanState, type ResolvedOperation } from "../../../src/domain/plan.js";
-import { transitionRunState } from "../../../src/domain/run.js";
+import { hashPlanExecutable, topologicalOperationIds, transitionPlanState, type ResolvedOperation } from "../../../src/domain/plan.js";
+import { recoverRunState, transitionRunState } from "../../../src/domain/run.js";
 test("canonicalizes, orders dependencies, and guards terminals", () => {
   expect(canonicalJson({ z: 1, a: [true, null] })).toBe('{"a":[true,null],"z":1}');
+  expect(sha256Hex("abc")).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
   const create:ResolvedOperation = { operationId:"create",kind:"list_create",dependsOn:[],preconditions:[],before:null,after:{clientRef:"x"},inverse:{kind:"list_delete"},risk:"normal",clientRef:"x" };
   const assign:ResolvedOperation = { operationId:"assign",kind:"list_membership_set",dependsOn:["create"],preconditions:[],before:{listIds:[]},after:{targets:[{kind:"created",createOperationId:"create"}]},inverse:{listIds:[]},risk:"normal",repositoryId:asRepositoryId("R_1"),repositoryDatabaseId:asRepositoryDatabaseId("1"),coordinates:{owner:"o",name:"r"},expectedListIds:[],targetLists:[{kind:"created",createOperationId:"create"}] };
   expect(topologicalOperationIds([assign, create], [{ operationId:"assign", dependsOnOperationId:"create" }])).toEqual(["create","assign"]);
   expect(transitionPlanState("ready", "applying")).toBe("applying");
   expect(() => transitionRunState("completed", "running")).toThrow(/transition/u);
+  expect(recoverRunState("pending")).toBe("partial");
   expect(hashPlanExecutable({ schemaVersion:1,policyVersion:"1",binding:{host:"github.com",login:"u",accountId:"1"},snapshotId:asSnapshotId("snap_1"),protectedRepositoryIds:[],protectedListIds:[],operations:[],dependencies:[] })).toHaveLength(64);
 });
 ```
@@ -510,15 +512,27 @@ Run `npm test -- test/unit/domain/plan-run.test.ts`; expect FAIL resolving `src/
 
 ```ts
 export type RepositorySelector = { readonly kind:"ids"; readonly repositoryIds:readonly RepositoryId[] } | { readonly kind:"filter"; readonly filter:FilterExpression };
-export type ListTarget = { readonly kind:"existing"; readonly listId:UserListId } | { readonly kind:"created"; readonly createOperationId:string };
+export type ExistingListTarget = { readonly kind:"existing"; readonly listId:UserListId };
+export type RequestedListTarget = ExistingListTarget | { readonly kind:"created"; readonly clientRef:string };
+export type ResolvedListTarget = ExistingListTarget | { readonly kind:"created"; readonly createOperationId:string };
 export type PlanAction =
   | { readonly kind:"star"|"unstar"; readonly repositories:RepositorySelector }
   | { readonly kind:"list_create"; readonly clientRef:string; readonly name:string; readonly description:string|null; readonly isPrivate:boolean }
-  | { readonly kind:"list_update"; readonly listId:UserListId; readonly name?:string; readonly description?:string|null; readonly isPrivate?:boolean }
+  | { readonly kind:"list_update"; readonly listIds:readonly UserListId[]; readonly name?:string; readonly description?:string|null; readonly isPrivate?:boolean }
   | { readonly kind:"list_delete"; readonly listIds:readonly UserListId[] }
-  | { readonly kind:"list_membership_set"|"list_membership_add"|"list_membership_remove"; readonly repositories:RepositorySelector; readonly lists:readonly ListTarget[] };
+  | { readonly kind:"list_membership_set"|"list_membership_add"; readonly repositories:RepositorySelector; readonly lists:readonly RequestedListTarget[] }
+  | { readonly kind:"list_membership_remove"; readonly repositories:RepositorySelector; readonly lists:readonly ExistingListTarget[] };
 export interface PlanRequest { readonly snapshotId:SnapshotId; readonly actions:readonly PlanAction[]; readonly protectedRepositoryIds:readonly RepositoryId[]; readonly protectedListIds:readonly UserListId[]; readonly ttlMinutes?:number; readonly maxOperations?:number; readonly callerNote?:string }
 ```
+
+Request-time created-List references always use `clientRef`; only the resolver
+may translate them into `createOperationId`. One `list_update` request may
+select multiple IDs and deterministically expands to one resolved operation
+per List. Its schema requires at least one metadata field. All IDs and
+references are non-empty and bounded. Request arrays may arrive in any order;
+the planner normalizes them before resolution, while executable protected,
+expected, target, and dependency ID arrays must already be sorted and unique
+rather than being silently reordered by executable parsers.
 
 All operations share `operationId`, `kind`, `dependsOn`, `preconditions`, `before`, `after`, `inverse`, and `risk`. `star`/`unstar` additionally store `repositoryId`, `repositoryDatabaseId`, and `coordinates`. `list_update`/`list_delete` store `listId`; delete before-state stores full List plus member repository IDs. `list_create` stores `clientRef`. `list_membership_set` stores repository IDs/coordinates, `expectedListIds`, and `targetLists`. This routing data is resolved from the snapshot; identity comparisons still use IDs.
 
@@ -529,16 +543,28 @@ export type ResolvedOperation =
   | Readonly<ResolvedOperationBase & {kind:"star"|"unstar";repositoryId:RepositoryId;repositoryDatabaseId:RepositoryDatabaseId;coordinates:RepositoryCoordinates}>
   | Readonly<ResolvedOperationBase & {kind:"list_create";clientRef:string}>
   | Readonly<ResolvedOperationBase & {kind:"list_update"|"list_delete";listId:UserListId}>
-  | Readonly<ResolvedOperationBase & {kind:"list_membership_set";repositoryId:RepositoryId;repositoryDatabaseId:RepositoryDatabaseId;coordinates:RepositoryCoordinates;expectedListIds:readonly UserListId[];targetLists:readonly ListTarget[]}>;
+  | Readonly<ResolvedOperationBase & {kind:"list_membership_set";repositoryId:RepositoryId;repositoryDatabaseId:RepositoryDatabaseId;coordinates:RepositoryCoordinates;expectedListIds:readonly UserListId[];targetLists:readonly ResolvedListTarget[]}>;
 export interface OperationDependency { readonly operationId:string; readonly dependsOnOperationId:string }
 export interface PlanExecutableContent { readonly schemaVersion:1; readonly policyVersion:"1"; readonly binding:AccountBinding; readonly snapshotId:SnapshotId; readonly protectedRepositoryIds:readonly RepositoryId[]; readonly protectedListIds:readonly UserListId[]; readonly operations:readonly ResolvedOperation[]; readonly dependencies:readonly OperationDependency[] }
 export type PlanState = "ready"|"applying"|"applied"|"partial"|"expired"|"failed"|"superseded";
 export interface ChangePlan { readonly id:PlanId; readonly hash:string; readonly state:PlanState; readonly createdAt:string; readonly expiresAt:string; readonly callerNote:string|null; readonly executable:PlanExecutableContent; readonly operations:readonly ResolvedOperation[]; readonly dependencies:readonly OperationDependency[]; readonly warnings:readonly string[] }
+export function parsePlanRequest(input:unknown):PlanRequest;
+export function parsePlanExecutable(input:unknown):PlanExecutableContent;
+export function parseChangePlan(input:unknown):ChangePlan;
+export function hashPlanExecutable(input:unknown):string;
 export function topologicalOperationIds(operations:readonly ResolvedOperation[], dependencies:readonly OperationDependency[]):readonly string[];
 export function reverseDependencyOperationIds(operations:readonly ResolvedOperation[], dependencies:readonly OperationDependency[]):readonly string[];
 ```
 
-Kahn order uses original operation order as tie-breaker and rejects duplicates, unknown IDs, self-edges, mismatched `dependsOn`, and cycles. Plan transitions: `ready→applying|expired|superseded`, `applying→applied|partial|failed`, `partial→applying`.
+Kahn order always chooses the currently available node with the lowest
+original operation index (not FIFO insertion order) and rejects duplicate
+operation IDs, duplicate dependency edges, duplicate embedded `dependsOn`
+IDs, unknown endpoints, self-edges, mismatched dependency sets, and cycles.
+It uses `Map`, never property-key lookup, does not mutate inputs, and returns a
+frozen array. Reverse order is the exact reverse topological result. Plan
+transitions: `ready→applying|expired|superseded`,
+`applying→applied|partial|failed`, `partial→applying`; every other pair,
+including self/unknown states, raises `PRECONDITION_FAILED`.
 
 ```ts
 export type FailureMode="stop"|"continue"; export type RunState="pending"|"running"|"completed"|"partial"|"failed";
@@ -546,12 +572,45 @@ export type RunOperationStatus="pending"|"running"|"succeeded"|"skipped"|"failed
 export type ReconciliationStatus="not_required"|"pending"|"confirmed_applied"|"confirmed_not_applied"|"unknown";
 export interface ChangeRun { readonly id:RunId; readonly planId:PlanId; readonly binding:AccountBinding; readonly state:RunState; readonly failureMode:FailureMode; readonly warnings:readonly string[]; readonly startedAt:string; readonly finishedAt:string|null }
 export interface RunOperation { readonly runId:RunId; readonly operationId:string; readonly sequence:number; readonly status:RunOperationStatus; readonly reconciliation:ReconciliationStatus; readonly attempts:number; readonly before:JsonValue; readonly after:JsonValue; readonly externalRequestId:string|null; readonly error:SerializedDomainError|null; readonly startedAt:string|null; readonly finishedAt:string|null }
+export function parseChangeRun(input:unknown):ChangeRun;
+export function parseRunOperation(input:unknown):RunOperation;
+export function recoverRunState(state:"pending"|"running"): "partial";
 ```
 
-Run transitions: `pending→running`, `running→completed|partial|failed`, `partial→running`. `canonicalJson`, `sha256Hex`, and `hashPlanExecutable` reject unsupported/non-finite values and hash only `PlanExecutableContent`. The planner derives `binding` from the referenced complete snapshot, uses the fixed `policyVersion: "1"`, and never accepts caller-supplied account identity.
+Normal run transitions are `pending→running`,
+`running→completed|partial|failed`, and `partial→running`.
+`recoverRunState` is the only domain path for startup recovery to map
+`pending|running→partial`; that edge is not accepted by
+`transitionRunState`. Pending/running runs have `finishedAt:null`; completed,
+partial, and failed runs require a canonical non-null `finishedAt`.
 
-- [ ] **Step 4: Verify hash determinism and transition tables**
-Run `npm test -- test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect one pass with graph, hash, and state assertions green.
+All exported parsers first descriptor-snapshot through `canonicalJson`, then
+strictly validate the safe clone, recursively freeze it, and reject unknown
+fields. Plan executable parsing enforces exact schema/policy versions, a
+closed operation union, valid branded IDs/account binding, canonical UTC
+timestamps where present, nonnegative safe sequence/attempt counts, bounded
+trim-equal strings, sorted unique protected/expected IDs, valid JSON
+precondition/before/after/inverse data, and graph agreement. A parsed
+`ChangePlan` requires lowercase-hex SHA-256 equal to its executable hash and
+requires top-level `operations`/`dependencies` to equal—and be returned as
+the same frozen arrays as—the executable copies.
+
+`canonicalJson` is a hostile-runtime boundary: it snapshots own data
+descriptors without invoking getters/iterators; accepts only null, Boolean,
+string, finite number, dense plain-object/array JSON; treats `-0` as `0`;
+sorts object keys; preserves array order and repeated non-cyclic references;
+and rejects accessors, proxies, symbols, functions, BigInt, `undefined`,
+non-finite numbers, custom prototypes/`toJSON`, array extra properties,
+sparse arrays, cycles, and reflection/recursion failures as generic
+`VALIDATION_ERROR`. `sha256Hex` hashes UTF-8 text to 64 lowercase hex.
+`hashPlanExecutable` strictly parses/projects only
+`PlanExecutableContent`, so extra metadata can neither enter nor be silently
+ignored by the hash. The planner derives `binding` from the referenced
+complete snapshot, uses fixed `policyVersion:"1"`, and never accepts
+caller-supplied account identity.
+
+- [ ] **Step 4: Verify hash determinism, hostile inputs, parsers, and transition tables**
+Run `npm test -- test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect one pass with reordered-object/hash vectors, metadata exclusion, executable-change sensitivity, frozen safe-clone parsers, graph tie-break/malformed cases, every lifecycle state pair, recovery-only edges, and hostile canonical input assertions green.
 
 - [ ] **Step 5: Commit**
 

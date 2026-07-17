@@ -395,11 +395,11 @@ Expected: FAIL resolving `plan-service.ts`, `operation-resolver.ts`, or the shar
 `resolveOperationRequests` receives `{ storage, snapshot, actions, protectedRepositoryIds, protectedListIds, nextOperationId }`. It must:
 
 1. Page every selector to exhaustion against `snapshot.id`.
-2. Resolve and sort repository and List targets by stable ID.
+2. Resolve and sort repository and List targets by stable ID; expand a multi-ID `list_update` request to one resolved operation per List.
 3. Remove protected targets and preserve protected membership before assigning operation IDs.
 4. Normalize add/remove/set membership actions per repository into one exact sorted set.
 5. Use `expectedListIds` for the snapshot precondition and `targetLists` for the desired complete set.
-6. Convert created-List references to `{ kind: "created", createOperationId }` and add create-before-membership dependencies.
+6. Resolve request-time `{ kind: "created", clientRef }` references to exactly one matching `list_create`, convert them to `{ kind: "created", createOperationId }`, reject missing/duplicate references, and add create-before-membership dependencies.
 7. Snapshot full before/after/inverse JSON for every operation.
 8. Collapse exact duplicates and reject incompatible changes to the same target.
 9. Assign `op_000001`, `op_000002`, and later IDs only after deterministic sorting.
