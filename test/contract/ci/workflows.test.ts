@@ -53,6 +53,111 @@ async function verifierFailure(root: string) {
   return failure.stderr;
 }
 
+const safeExtraWorkflow = `name: Extra
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo safe
+`;
+
+const releasePolicySkeleton = `name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo verified
+`;
+
+const validFutureReleaseWorkflow = `name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_npm:
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Create the verified GitHub release
+        env:
+          GH_TOKEN: \${{ github.token }}
+        run: gh release create v1.0.0 package.tgz --verify-tag
+  npm-publish:
+    if: \${{ inputs.publish_npm }}
+    needs: release
+    environment: npm-publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm publish artifacts/package.tgz --provenance --access public
+`;
+
+async function withPolicyFixture<T>(
+  callback: (fixtureRoot: string) => Promise<T>,
+): Promise<T> {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "workflow-policy-"));
+  try {
+    await cp(
+      resolve(repositoryRoot, ".github"),
+      resolve(fixtureRoot, ".github"),
+      { recursive: true },
+    );
+    return await callback(fixtureRoot);
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+}
+
+async function writeWorkflow(
+  fixtureRoot: string,
+  name: string,
+  source: string,
+): Promise<void> {
+  await writeFile(
+    resolve(fixtureRoot, ".github", "workflows", name),
+    source,
+    "utf8",
+  );
+}
+
 describe("GitHub workflow policy", () => {
   it("tests Node 22 and 24 without live mutation credentials", async () => {
     const ci = await readRepositoryFile(workflowPaths[0]);
@@ -135,6 +240,220 @@ describe("GitHub workflow policy", () => {
     expect(result.stdout).toMatch(
       /^Workflow policy check passed: \d+ workflows and 2 dependency ecosystems\.\n$/,
     );
+  });
+
+  it.each([
+    {
+      name: "a format wrapper around github.token",
+      expression: "${{ format('{0}', github.token) }}",
+    },
+    {
+      name: "toJSON of the complete secrets context",
+      expression: "${{ toJSON(secrets) }}",
+    },
+    {
+      name: "a bracketed secret",
+      expression: "${{ secrets['DEPLOY_CREDENTIAL'] }}",
+    },
+    {
+      name: "a dynamically indexed GitHub context",
+      expression: "${{ github[format('{0}', 'token')] }}",
+    },
+    {
+      name: "a numeric secrets index",
+      expression: "${{ secrets[0] }}",
+    },
+    {
+      name: "mixed-case bracket access",
+      expression: "${{ SeCrEtS['DEPLOY_CREDENTIAL'] }}",
+    },
+    {
+      name: "mixed-case GitHub token access",
+      expression: "${{ GiThUb['ToKeN'] }}",
+    },
+  ])("rejects $name in a non-release workflow", async ({ expression }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      const target = resolve(fixtureRoot, workflowPaths[0]);
+      const source = await readFile(target, "utf8");
+      const marker = '  GITHUB_STARS_MCP_READ_ONLY: "true"';
+      expect(source).toContain(marker);
+      await writeFile(
+        target,
+        source.replace(
+          marker,
+          `${marker}\n  SAFE_VALUE: >-\n    ${expression}`,
+        ),
+        "utf8",
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(LIVE_TOKEN_REFERENCE)");
+    });
+  });
+
+  it("rejects pull_request_target in every workflow", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      const target = resolve(fixtureRoot, workflowPaths[0]);
+      const source = await readFile(target, "utf8");
+      expect(source).toContain("  pull_request:\n");
+      await writeFile(
+        target,
+        source.replace(
+          "  pull_request:\n",
+          "  pull_request:\n  pull_request_target:\n",
+        ),
+        "utf8",
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(PULL_REQUEST_TARGET_FORBIDDEN)");
+    });
+  });
+
+  it.each(["nightly.yml", "release.yaml"])(
+    "rejects unapproved workflow path %s",
+    async (name) => {
+      await withPolicyFixture(async (fixtureRoot) => {
+        await writeWorkflow(
+          fixtureRoot,
+          name,
+          name === "release.yaml" ? releasePolicySkeleton : safeExtraWorkflow,
+        );
+
+        const stderr = await verifierFailure(fixtureRoot);
+        expect(stderr).toContain("(WORKFLOW_FORBIDDEN)");
+      });
+    },
+  );
+
+  it("rejects a release.yml disguised as an automatic release", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        releasePolicySkeleton.replace(
+          "  workflow_dispatch:\n",
+          "  push:\n    branches: [main]\n",
+        ),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_TRIGGERS)");
+    });
+  });
+
+  it("rejects release jobs without their protected environment", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        releasePolicySkeleton.replace("    environment: release\n", ""),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_ENVIRONMENT)");
+    });
+  });
+
+  it("rejects release jobs with permissions broader than the exact minimum", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        releasePolicySkeleton.replace(
+          "    runs-on: ubuntu-latest\n",
+          `    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      packages: read
+`,
+        ),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_PERMISSIONS)");
+    });
+  });
+
+  it("rejects jobs outside the release and npm-publish allowlist", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        `${releasePolicySkeleton}
+  exfiltrate:
+    environment: release
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo unsafe
+`,
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_JOBS)");
+    });
+  });
+
+  it.each([
+    {
+      name: "a wrapped GitHub token",
+      source: validFutureReleaseWorkflow.replace(
+        "GH_TOKEN: ${{ github.token }}",
+        "GH_TOKEN: ${{ format('{0}', github.token) }}",
+      ),
+    },
+    {
+      name: "an aliased token variable",
+      source: validFutureReleaseWorkflow.replace("GH_TOKEN:", "TOKEN_ALIAS:"),
+    },
+    {
+      name: "the secrets context",
+      source: validFutureReleaseWorkflow.replace(
+        "${{ github.token }}",
+        "${{ secrets.RELEASE_TOKEN }}",
+      ),
+    },
+    {
+      name: "a literal personal access token",
+      source: validFutureReleaseWorkflow.replace(
+        "${{ github.token }}",
+        `ghp_${"Z".repeat(36)}`,
+      ),
+    },
+    {
+      name: "a token outside the gh release step",
+      source: validFutureReleaseWorkflow
+        .replace(
+          "permissions:\n",
+          "env:\n  GH_TOKEN: ${{ github.token }}\n\npermissions:\n",
+        )
+        .replace("        env:\n          GH_TOKEN: ${{ github.token }}\n", ""),
+    },
+  ])("rejects $name in release.yml", async ({ source }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(fixtureRoot, "release.yml", source);
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_TOKEN_REFERENCE)");
+    });
+  });
+
+  it("accepts the future Task 7 manually gated release workflow", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow,
+      );
+
+      const result = await runVerifier(fixtureRoot);
+      expect(result.stderr).toBe("");
+      expect(result.stdout).toBe(
+        "Workflow policy check passed: 4 workflows and 2 dependency ecosystems.\n",
+      );
+    });
   });
 
   it.each([

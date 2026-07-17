@@ -1,7 +1,7 @@
 /* global console, process */
 
 import { readdir, readFile } from "node:fs/promises";
-import { basename, resolve } from "node:path";
+import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import {
@@ -18,6 +18,8 @@ const EXPECTED_WORKFLOWS = [
   ".github/workflows/codeql.yml",
   ".github/workflows/package-smoke.yml",
 ];
+const RELEASE_WORKFLOW = ".github/workflows/release.yml";
+const ALLOWED_WORKFLOWS = new Set([...EXPECTED_WORKFLOWS, RELEASE_WORKFLOW]);
 
 const PINS = Object.freeze({
   checkout: "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
@@ -31,9 +33,22 @@ const PINS = Object.freeze({
 });
 
 const PINNED_ACTION = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+@[0-9a-f]{40}$/;
-const LIVE_TOKEN_NAME = /^(?:GITHUB_STARS_TOKEN|GITHUB_TOKEN|GH_TOKEN)$/;
-const LIVE_TOKEN_VALUE =
-  /(?:\$\{\{\s*(?:secrets\.|github\.token)|\bGITHUB_STARS_TOKEN\b|\bGITHUB_TOKEN\b|\bGH_TOKEN\b|github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]{16,})/i;
+const ACTION_EXPRESSION = /\$\{\{([\s\S]*?)\}\}/gu;
+const LIVE_TOKEN_NAME = /\b(?:GITHUB_STARS_TOKEN|GITHUB_TOKEN|GH_TOKEN)\b/iu;
+const TOKEN_LITERAL =
+  /(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]{16,})/iu;
+const SECRETS_CONTEXT = /\bsecrets\b/iu;
+const GITHUB_TOKEN_CONTEXT = /\bgithub\s*\.\s*token\b/iu;
+const GITHUB_INDEX_CONTEXT = /\bgithub\s*\[/iu;
+const RELEASE_ROOT_PERMISSIONS = Object.freeze({
+  attestations: "write",
+  contents: "write",
+  "id-token": "write",
+});
+const NPM_PUBLISH_PERMISSIONS = Object.freeze({
+  contents: "read",
+  "id-token": "write",
+});
 const STANDARD_YAML_TAGS = new Set([
   "tag:yaml.org,2002:binary",
   "tag:yaml.org,2002:bool",
@@ -123,6 +138,67 @@ function walk(node, visitor) {
   if (isSeq(node)) {
     for (const item of node.items) walk(item, visitor);
   }
+}
+
+function walkScalars(node, visitor) {
+  if (isScalar(node)) {
+    if (typeof node.value === "string") visitor(node, node.value);
+    return;
+  }
+  if (isMap(node)) {
+    for (const pair of node.items) {
+      walkScalars(pair.key, visitor);
+      walkScalars(pair.value, visitor);
+    }
+    return;
+  }
+  if (isSeq(node)) {
+    for (const item of node.items) walkScalars(item, visitor);
+  }
+}
+
+function mappingKeys(node) {
+  if (!isMap(node)) return undefined;
+  const keys = [];
+  for (const pair of node.items) {
+    const key = scalarKey(pair);
+    if (key === undefined) return undefined;
+    keys.push(key);
+  }
+  return keys;
+}
+
+function sameMapping(node, expected) {
+  if (!isMap(node) || node.items.length !== Object.keys(expected).length) {
+    return false;
+  }
+  for (const [key, value] of Object.entries(expected)) {
+    if (scalarText(pairAt(node, key)?.value) !== value) return false;
+  }
+  return true;
+}
+
+function hasCredentialReference(value) {
+  if (LIVE_TOKEN_NAME.test(value) || TOKEN_LITERAL.test(value)) return true;
+  for (const match of value.matchAll(ACTION_EXPRESSION)) {
+    const expression = match[1] ?? "";
+    if (
+      SECRETS_CONTEXT.test(expression) ||
+      GITHUB_TOKEN_CONTEXT.test(expression) ||
+      GITHUB_INDEX_CONTEXT.test(expression)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function validateCredentialReferences(context, code, allowedNodes = new Set()) {
+  walkScalars(context.root, (node, value) => {
+    if (!allowedNodes.has(node) && hasCredentialReference(value)) {
+      issueAt(context, node, code);
+    }
+  });
 }
 
 function issueAt(context, node, code) {
@@ -225,19 +301,25 @@ function expectSequence(context, path, expected, code) {
 
 function expectMapping(context, path, expected, code) {
   const node = nodeAt(context.root, path);
-  if (!isMap(node) || node.items.length !== Object.keys(expected).length) {
+  if (!sameMapping(node, expected)) {
     issueAt(context, node, code);
-    return;
-  }
-  for (const [key, value] of Object.entries(expected)) {
-    if (scalarText(pairAt(node, key)?.value) !== value) {
-      issueAt(context, pairAt(node, key)?.value ?? node, code);
-    }
   }
 }
 
 function hasMapKey(node, key) {
   return pairAt(node, key) !== undefined;
+}
+
+function validateForbiddenTriggers(context) {
+  const triggers = nodeAt(context.root, ["on"]);
+  const forbidden = pairAt(triggers, "pull_request_target");
+  if (forbidden !== undefined) {
+    issueAt(
+      context,
+      forbidden.key ?? triggers,
+      "PULL_REQUEST_TARGET_FORBIDDEN",
+    );
+  }
 }
 
 function requirePullRequestAndMainPush(context, code) {
@@ -286,11 +368,10 @@ function validateCheckoutPersistence(context, steps) {
 }
 
 function allowedWrites(path) {
-  const name = basename(path);
-  if (name === "codeql.yml" || name === "codeql.yaml") {
+  if (path === ".github/workflows/codeql.yml") {
     return new Set(["security-events"]);
   }
-  if (name === "release.yml" || name === "release.yaml") {
+  if (path === RELEASE_WORKFLOW) {
     return new Set(["attestations", "contents", "id-token"]);
   }
   return new Set();
@@ -337,18 +418,9 @@ function validateGenericWorkflow(context) {
       validatePermissionMap(context, pair.value, writes);
     }
 
-    if (key !== undefined && LIVE_TOKEN_NAME.test(key)) {
-      issueAt(context, pair.key, "LIVE_TOKEN_REFERENCE");
-    }
-
     if (key === "GITHUB_STARS_MCP_READ_ONLY") {
       const value = scalarText(pair.value);
       if (value !== "true") issueAt(context, pair.value, "READ_ONLY_REQUIRED");
-    }
-
-    const value = scalarText(pair.value);
-    if (typeof value === "string" && LIVE_TOKEN_VALUE.test(value)) {
-      issueAt(context, pair.value, "LIVE_TOKEN_REFERENCE");
     }
   });
 }
@@ -523,6 +595,118 @@ function validateCodeql(context) {
   validateCheckoutPersistence(context, steps);
 }
 
+function isGhReleaseStep(step) {
+  const command = scalarText(pairAt(step, "run")?.value);
+  return (
+    command !== undefined &&
+    command
+      .split(/\r?\n/u)
+      .some((line) => /^\s*gh\s+release(?:\s|$)/u.test(line))
+  );
+}
+
+function allowedReleaseTokenNodes(context) {
+  const allowed = new Set();
+  for (const step of stepMaps(context, "release")) {
+    if (!isGhReleaseStep(step)) continue;
+    const token = pairAt(nodeAt(step, ["env"]), "GH_TOKEN");
+    if (
+      token !== undefined &&
+      scalarText(token.value) === "${{ github.token }}"
+    ) {
+      if (isScalar(token.key)) allowed.add(token.key);
+      if (isScalar(token.value)) allowed.add(token.value);
+    }
+  }
+  return allowed;
+}
+
+function validateReleaseJob(
+  context,
+  jobs,
+  name,
+  environment,
+  permissions,
+  inheritedPermissions,
+) {
+  const job = pairAt(jobs, name)?.value;
+  if (!isMap(job)) return;
+
+  if (scalarText(pairAt(job, "environment")?.value) !== environment) {
+    issueAt(
+      context,
+      pairAt(job, "environment")?.value ?? job,
+      "RELEASE_ENVIRONMENT",
+    );
+  }
+
+  const jobPermissions = pairAt(job, "permissions")?.value;
+  const effectivePermissions = jobPermissions ?? inheritedPermissions;
+  if (!sameMapping(effectivePermissions, permissions)) {
+    issueAt(
+      context,
+      jobPermissions ?? effectivePermissions ?? job,
+      "RELEASE_PERMISSIONS",
+    );
+  }
+}
+
+function validateRelease(context) {
+  const triggers = nodeAt(context.root, ["on"]);
+  const triggerKeys = mappingKeys(triggers);
+  const dispatch = pairAt(triggers, "workflow_dispatch")?.value;
+  if (
+    triggerKeys === undefined ||
+    triggerKeys.length !== 1 ||
+    triggerKeys[0] !== "workflow_dispatch" ||
+    (dispatch !== null && !isMap(dispatch))
+  ) {
+    issueAt(context, triggers, "RELEASE_TRIGGERS");
+  }
+
+  const rootPermissions = nodeAt(context.root, ["permissions"]);
+  if (!sameMapping(rootPermissions, RELEASE_ROOT_PERMISSIONS)) {
+    issueAt(context, rootPermissions, "RELEASE_PERMISSIONS");
+  }
+
+  const jobs = nodeAt(context.root, ["jobs"]);
+  const jobKeys = mappingKeys(jobs);
+  if (
+    jobKeys === undefined ||
+    !jobKeys.includes("release") ||
+    jobKeys.some((key) => key !== "release" && key !== "npm-publish")
+  ) {
+    issueAt(context, jobs, "RELEASE_JOBS");
+  }
+
+  if (isMap(jobs)) {
+    validateReleaseJob(
+      context,
+      jobs,
+      "release",
+      "release",
+      RELEASE_ROOT_PERMISSIONS,
+      rootPermissions,
+    );
+    if (pairAt(jobs, "npm-publish") !== undefined) {
+      validateReleaseJob(
+        context,
+        jobs,
+        "npm-publish",
+        "npm-publish",
+        NPM_PUBLISH_PERMISSIONS,
+        rootPermissions,
+      );
+    }
+  }
+
+  validateCredentialReferences(
+    context,
+    "RELEASE_TOKEN_REFERENCE",
+    allowedReleaseTokenNodes(context),
+  );
+}
+
 function validateDependabot(context) {
   expectScalar(context, ["version"], "2", "DEPENDABOT_VERSION");
   const updates = nodeAt(context.root, ["updates"]);
@@ -604,6 +788,16 @@ async function workflowPaths(root, issues) {
       });
     }
   }
+  for (const path of paths) {
+    if (!ALLOWED_WORKFLOWS.has(path)) {
+      issues.push({
+        path,
+        line: 1,
+        column: 1,
+        code: "WORKFLOW_FORBIDDEN",
+      });
+    }
+  }
   return paths;
 }
 
@@ -628,7 +822,13 @@ export async function verifyRepository(root = process.cwd()) {
     validateYamlStructure(context);
     if (!isMap(context.root)) continue;
 
+    validateForbiddenTriggers(context);
     validateGenericWorkflow(context);
+    if (path === RELEASE_WORKFLOW) {
+      validateRelease(context);
+    } else {
+      validateCredentialReferences(context, "LIVE_TOKEN_REFERENCE");
+    }
     if (path === ".github/workflows/ci.yml") validateCi(context);
     if (path === ".github/workflows/package-smoke.yml") {
       validatePackageSmoke(context);
