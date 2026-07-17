@@ -13,11 +13,16 @@ import {
 import { tmpdir } from "node:os";
 import { delimiter, extname, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
+import { TextDecoder } from "node:util";
 
 const REPOSITORY_ROOT = resolve(".");
 const PLUGIN_ROOT = resolve("plugins/github-stars-mcp");
 const MARKETPLACE_PATH = resolve(".agents/plugins/marketplace.json");
 const PACKAGE_PATH = resolve("package.json");
+const BASE_CONFIG_PATH = resolve("tsconfig.json");
+const BUILD_CONFIG_PATH = resolve("tsconfig.build.json");
+const SOURCE_ROOT = resolve("src");
+const DIST_ROOT = resolve("dist");
 const SKILL_PATH = resolve(PLUGIN_ROOT, "skills/manage-github-stars/SKILL.md");
 const EXPECTED_ENV = Object.freeze([
   "GITHUB_STARS_TOKEN",
@@ -50,62 +55,18 @@ const EXPECTED_PACKAGE_FILES = Object.freeze([
   "README.md",
   "LICENSE",
 ]);
-const SENSITIVE_MATERIAL_TOKENS = new Set([
-  "auth",
-  "authentication",
-  "cookie",
-  "cookies",
-  "credential",
-  "credentials",
-  "secret",
-  "secrets",
-  "session",
-  "sessions",
-  "token",
-  "tokens",
+const BUILD_CONFIG_KEYS = new Set([
+  "compilerOptions",
+  "exclude",
+  "extends",
+  "include",
 ]);
-const LOCAL_STATE_TOKENS = new Set([
-  "cache",
-  "database",
-  "db",
-  "history",
-  "log",
-  "logs",
-  "sqlite",
-  "sqlite3",
-  "state",
-  "temp",
-  "tmp",
-]);
-const LOCAL_DIAGNOSTIC_TOKENS = new Set([
-  "core",
-  "coverage",
-  "crash",
-  "diagnostic",
-  "dump",
-]);
-const PRIVATE_KEY_EXTENSIONS = new Set([
-  ".jks",
-  ".key",
-  ".keystore",
-  ".p12",
-  ".pem",
-  ".pfx",
-]);
-const LOCAL_ARTIFACT_FILENAMES = new Set([
-  ".ds_store",
-  ".eslintcache",
-  ".nyc_output",
-  ".npmrc",
-  ".pnpmrc",
-  ".stylelintcache",
-  ".yarnrc",
-  "desktop.ini",
-  "npm-shrinkwrap.json",
-  "package-lock.json",
-  "pnpm-lock.yaml",
-  "thumbs.db",
-  "yarn.lock",
+const BUILD_COMPILER_OPTION_KEYS = new Set([
+  "declaration",
+  "noEmit",
+  "outDir",
+  "rootDir",
+  "sourceMap",
 ]);
 const MANIFEST_KEYS = new Set([
   "author",
@@ -623,12 +584,7 @@ async function validatePluginTree(assets) {
     const metadata = await fileMetadata(path, "PLUGIN_FILE");
     const contents = await readFile(path);
     const source = contents.toString("utf8");
-    assert(
-      !/github_pat_|gh[pousr]_[A-Za-z0-9_]{4,}|authorization\s*:\s*bearer/iu.test(
-        source,
-      ),
-      "PLUGIN_CREDENTIAL_VALUE",
-    );
+    assert(!containsCredentialMaterial(contents), "PLUGIN_CREDENTIAL_VALUE");
     assert(
       ALLOWED_PLUGIN_EXTENSIONS.has(extension) &&
         (metadata.mode & 0o111) === 0 &&
@@ -743,111 +699,169 @@ function parseExternalJson(source, code) {
   }
 }
 
-function componentTokens(component) {
-  return component
-    .toLowerCase()
-    .split(/[._-]+/u)
-    .filter((token) => token.length > 0);
-}
-
-function hasPrivateKeyTokens(tokens) {
-  return (
-    tokens.includes("privatekey") ||
-    tokens.some(
-      (token, index) => token === "private" && tokens[index + 1] === "key",
-    )
-  );
-}
-
-function hasFamilyToken(component, family) {
-  const tokens = componentTokens(component);
-  return (
-    hasPrivateKeyTokens(tokens) || tokens.some((token) => family.has(token))
-  );
-}
-
-function isCompiledRuntimeFilename(filename) {
-  return /(?:\.(?:[cm]?js|d\.[cm]?ts))(?:\.map)?$/u.test(filename);
-}
-
-function compiledRuntimeStem(filename) {
-  return filename.replace(/(?:\.(?:[cm]?js|d\.[cm]?ts))(?:\.map)?$/u, "");
-}
-
-function exactSensitiveMaterial(component) {
-  const tokens = componentTokens(component);
-  return (
-    hasPrivateKeyTokens(tokens) ||
-    (tokens.length === 1 && SENSITIVE_MATERIAL_TOKENS.has(tokens[0]))
-  );
-}
-
-function dotenvFamily(filename) {
-  return /^\.env(?:rc)?(?:$|[._~-])/u.test(filename);
-}
-
-function localArtifactFilename(filename) {
-  if (
-    LOCAL_ARTIFACT_FILENAMES.has(filename) ||
-    filename.endsWith("~") ||
-    /\.(?:bak|backup|old|orig|save|sw[opx]|temp|tmp)$/u.test(filename) ||
-    /\.tsbuildinfo$/u.test(filename) ||
-    /^(?:\.#|#.*#$)/u.test(filename)
-  ) {
-    return true;
+async function validateBuildConfig() {
+  for (const [path, code] of [
+    [BASE_CONFIG_PATH, "BASE_CONFIG"],
+    [BUILD_CONFIG_PATH, "BUILD_CONFIG"],
+  ]) {
+    const result = await assertRepositoryPath(path, code);
+    assert(result.metadata.isFile(), `${code}_KIND`);
   }
-  const tokens = componentTokens(filename);
-  return (
-    tokens.some(
-      (token) =>
-        LOCAL_STATE_TOKENS.has(token) || LOCAL_DIAGNOSTIC_TOKENS.has(token),
-    ) || /^(?:npm-debug|pnpm-debug|yarn-(?:debug|error))\.log/u.test(filename)
+
+  const baseConfig = await readJson(BASE_CONFIG_PATH, "BASE_CONFIG");
+  const buildConfig = await readJson(BUILD_CONFIG_PATH, "BUILD_CONFIG");
+  assert(baseConfig.extends === undefined, "BUILD_CONFIG");
+  assertExactKeys(buildConfig, BUILD_CONFIG_KEYS, "BUILD_CONFIG");
+  assert(buildConfig.extends === "./tsconfig.json", "BUILD_CONFIG");
+  assertExactArray(buildConfig.include, ["src/**/*.ts"], "BUILD_CONFIG");
+  assertExactArray(buildConfig.exclude, ["test/**/*.ts"], "BUILD_CONFIG");
+
+  const compilerOptions = assertPlainObject(
+    buildConfig.compilerOptions,
+    "BUILD_CONFIG",
+  );
+  assertExactKeys(compilerOptions, BUILD_COMPILER_OPTION_KEYS, "BUILD_CONFIG");
+  assert(
+    compilerOptions.noEmit === false &&
+      compilerOptions.rootDir === "src" &&
+      compilerOptions.outDir === "dist" &&
+      compilerOptions.declaration === true &&
+      compilerOptions.sourceMap === true,
+    "BUILD_CONFIG",
+  );
+
+  const baseCompilerOptions = assertPlainObject(
+    baseConfig.compilerOptions,
+    "BASE_CONFIG",
+  );
+  assert(
+    (baseCompilerOptions.allowJs === undefined ||
+      baseCompilerOptions.allowJs === false) &&
+      (baseCompilerOptions.declarationMap === undefined ||
+        baseCompilerOptions.declarationMap === false) &&
+      (baseCompilerOptions.emitDeclarationOnly === undefined ||
+        baseCompilerOptions.emitDeclarationOnly === false) &&
+      (baseCompilerOptions.inlineSourceMap === undefined ||
+        baseCompilerOptions.inlineSourceMap === false) &&
+      baseCompilerOptions.declarationDir === undefined &&
+      baseCompilerOptions.outFile === undefined,
+    "BUILD_CONFIG",
   );
 }
 
-function sensitivePackedPath(path) {
-  const segments = path.toLowerCase().split("/");
-  const filename = segments.at(-1);
-  assert(typeof filename === "string", "PACKAGE_DRY_RUN_FILE_PATH");
-  const compiledRuntime = isCompiledRuntimeFilename(filename);
-  const packageMetadata = filename === "package.json";
+function canonicalTreeEntryName(name, code) {
+  assert(
+    name.length > 0 &&
+      name !== "." &&
+      name !== ".." &&
+      !name.includes("/") &&
+      !name.includes("\\") &&
+      !name.includes("\0") &&
+      name.normalize("NFC") === name,
+    `${code}_PATH`,
+  );
+}
 
-  for (const [index, component] of segments.slice(0, -1).entries()) {
-    const allowedAuthNamespace =
-      path.startsWith("dist/") &&
-      index === 1 &&
-      component === "auth" &&
-      (compiledRuntime || packageMetadata);
+async function collectCanonicalRegularFiles(root, code) {
+  const rootResult = await assertRepositoryPath(root, `${code}_ROOT`);
+  assert(rootResult.metadata.isDirectory(), `${code}_ROOT_KIND`);
+  const files = [];
+
+  async function visit(directory) {
+    let entries;
+    try {
+      entries = await readdir(directory, { withFileTypes: true });
+    } catch {
+      fail(`${code}_READ`);
+    }
+    for (const entry of entries.sort((left, right) =>
+      left.name.localeCompare(right.name, "en"),
+    )) {
+      canonicalTreeEntryName(entry.name, code);
+      const path = resolve(directory, entry.name);
+      const result = await assertRepositoryPath(path, code);
+      if (result.metadata.isDirectory()) {
+        await visit(path);
+        continue;
+      }
+      assert(result.metadata.isFile(), `${code}_ENTRY_KIND`);
+      const relativePath = relative(root, path).replaceAll("\\", "/");
+      assert(
+        relativePath.length > 0 &&
+          resolve(root, ...relativePath.split("/")) === path,
+        `${code}_PATH`,
+      );
+      files.push(relativePath);
+    }
+  }
+
+  await visit(root);
+  return files.sort();
+}
+
+function exactPathSet(actual, expected) {
+  if (actual.length !== expected.length) return false;
+  const sortedActual = [...actual].sort();
+  const sortedExpected = [...expected].sort();
+  return sortedActual.every((path, index) => path === sortedExpected[index]);
+}
+
+async function validateGeneratedOutputManifest() {
+  await validateBuildConfig();
+  const sources = await collectCanonicalRegularFiles(
+    SOURCE_ROOT,
+    "SOURCE_TREE",
+  );
+  const expected = new Set();
+  for (const source of sources) {
+    assert(
+      source.endsWith(".ts") && !source.endsWith(".d.ts"),
+      "SOURCE_TREE_EXTENSION",
+    );
+    const stem = source.slice(0, -3);
+    for (const suffix of [".js", ".js.map", ".d.ts"]) {
+      const output = `dist/${stem}${suffix}`;
+      assert(!expected.has(output), "SOURCE_OUTPUT_COLLISION");
+      expected.add(output);
+    }
+  }
+  assert(expected.size === sources.length * 3, "SOURCE_OUTPUT_COLLISION");
+  const expectedPaths = [...expected].sort();
+  const actualPaths = (
+    await collectCanonicalRegularFiles(DIST_ROOT, "DIST_TREE")
+  ).map((path) => `dist/${path}`);
+  assert(exactPathSet(actualPaths, expectedPaths), "DIST_TREE_CONTENTS");
+  return expectedPaths;
+}
+
+function literalBearerValue(source) {
+  const pattern =
+    /\bbearer[ \t\r\n]+([A-Za-z0-9_~+/-](?:[A-Za-z0-9._~+/-]*[A-Za-z0-9_~+/-])?={0,2})(?=$|[\t\n\r "'`,;)}\]])/giu;
+  for (const match of source.matchAll(pattern)) {
+    const value = match[1]?.replace(/=+$/u, "");
     if (
-      !allowedAuthNamespace &&
-      (hasFamilyToken(component, SENSITIVE_MATERIAL_TOKENS) ||
-        hasFamilyToken(component, LOCAL_STATE_TOKENS) ||
-        hasFamilyToken(component, LOCAL_DIAGNOSTIC_TOKENS))
+      typeof value === "string" &&
+      value.length >= 4 &&
+      (/[0-9._~+/-]/u.test(value) || value.length >= 20)
     ) {
       return true;
     }
   }
-
-  if (dotenvFamily(filename)) return true;
-  if (PRIVATE_KEY_EXTENSIONS.has(extname(filename))) return true;
-  if (packageMetadata) return false;
-  if (compiledRuntime) {
-    return exactSensitiveMaterial(compiledRuntimeStem(filename));
-  }
-  return (
-    hasFamilyToken(filename, SENSITIVE_MATERIAL_TOKENS) ||
-    localArtifactFilename(filename)
-  );
+  return false;
 }
 
 function containsCredentialMaterial(contents) {
-  const source = contents.toString("utf8");
+  let source;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true }).decode(contents);
+  } catch {
+    return false;
+  }
+  if (source.includes("\0")) return false;
   return (
     /github_pat_[A-Za-z0-9_]{4,}/u.test(source) ||
     /gh[pousr]_[A-Za-z0-9_]{4,}/u.test(source) ||
-    /["'`]?\bauthorization\b["'`]?(?:\s*[:=]\s*|\s+)["'`]?\s*bearer\s+[A-Za-z0-9._~+/-]{4,}={0,2}(?=\s*(?:["'`]|[,;}\]\r\n]|$))/iu.test(
-      source,
-    ) ||
+    literalBearerValue(source) ||
     /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/u.test(source)
   );
 }
@@ -895,7 +909,7 @@ function runExternal(command, arguments_, options, code) {
   return result.stdout;
 }
 
-async function validatePackageDryRun(staticOnly) {
+async function validatePackageDryRun(staticOnly, expectedDistPaths) {
   if (staticOnly) return;
   const npmEntry = process.env.npm_execpath;
   if (typeof npmEntry !== "string" || npmEntry.length === 0) return;
@@ -938,8 +952,14 @@ async function validatePackageDryRun(staticOnly) {
       }),
     "PACKAGE_DRY_RUN_CONTENTS",
   );
+  assert(
+    exactPathSet(
+      paths.filter((path) => path.startsWith("dist/")),
+      expectedDistPaths,
+    ),
+    "PACKAGE_DRY_RUN_DIST_CONTENTS",
+  );
   for (const path of paths) {
-    assert(!sensitivePackedPath(path), "PACKAGE_DRY_RUN_SENSITIVE_PATH");
     const contents = await readPackedFileIfPresent(path);
     if (contents !== null) {
       assert(
@@ -1163,9 +1183,10 @@ async function main() {
   await validateMcpConfiguration();
   await validateMarketplace();
   await validatePackageMetadata();
+  const expectedDistPaths = await validateGeneratedOutputManifest();
   await validateSkill();
   await validatePluginTree(assets);
-  await validatePackageDryRun(staticOnly);
+  await validatePackageDryRun(staticOnly, expectedDistPaths);
   await validateWithCodex(staticOnly);
   process.stdout.write("Validated Codex plugin github-stars-mcp\n");
 }

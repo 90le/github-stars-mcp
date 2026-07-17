@@ -72,6 +72,10 @@ async function withPluginFixture(
       join(root, ".agents/plugins/marketplace.json"),
     );
     await cp("package.json", join(root, "package.json"));
+    await cp("tsconfig.json", join(root, "tsconfig.json"));
+    await cp("tsconfig.build.json", join(root, "tsconfig.build.json"));
+    await mkdir(join(root, "src"), { recursive: true });
+    await mkdir(join(root, "dist"), { recursive: true });
     await callback(root);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -172,6 +176,38 @@ async function fakeNpmPackCommand(
     "utf8",
   );
   return command;
+}
+
+async function addGeneratedModule(
+  root: string,
+  sourcePath: string,
+  javascript = "export {};\n",
+): Promise<readonly [string, string, string]> {
+  if (
+    !sourcePath.endsWith(".ts") ||
+    sourcePath.endsWith(".d.ts") ||
+    sourcePath.includes("\\")
+  ) {
+    throw new Error(`Unsupported generated-module fixture: ${sourcePath}`);
+  }
+  const stem = sourcePath.slice(0, -3);
+  const source = join(root, "src", sourcePath);
+  const outputs = [
+    `dist/${stem}.js`,
+    `dist/${stem}.js.map`,
+    `dist/${stem}.d.ts`,
+  ] as const;
+  await mkdir(resolve(source, ".."), { recursive: true });
+  await writeFile(source, "export {};\n", "utf8");
+  for (const output of outputs) {
+    await mkdir(resolve(root, output, ".."), { recursive: true });
+    await writeFile(
+      join(root, output),
+      output.endsWith(".js") ? javascript : "{}\n",
+      "utf8",
+    );
+  }
+  return outputs;
 }
 
 interface FakeCodex {
@@ -356,8 +392,6 @@ async function readJsonLines(
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
-const ALLOWED_PACK_PREFIXES = Object.freeze(["dist", PLUGIN_ROOT]);
-
 function mixedCase(value: string): string {
   return [...value]
     .map((character, index) =>
@@ -419,38 +453,72 @@ const WAVE3_LOCAL_ARTIFACT_NAMES = Object.freeze([
   "coverage-final.json",
   ".nyc_output",
 ]);
-const WAVE3_SENSITIVE_PACK_PATHS: readonly (readonly [string, string])[] = [
-  ...WAVE3_DOTENV_NAMES.flatMap((name) =>
-    ALLOWED_PACK_PREFIXES.map(
-      (prefix) =>
-        [
-          `dotenv ${name} under ${prefix}`,
-          `${prefix}/config/${mixedCase(name)}`,
-        ] as const,
-    ),
+const WAVE4_UNMAPPED_DIST_PATHS: readonly (readonly [string, string])[] = [
+  ["arbitrary benign output", "dist/generated/arbitrary-output.js"],
+  ["SQLite state", "dist/state/github-stars.sqlite"],
+  ["root dotenv", "dist/.env"],
+  ["nested dotenv variant", "dist/config/local/.env.production.local"],
+  ["SQLite3 database", "dist/storage/github-stars.sqlite3"],
+  ["DB database", "dist/storage/github-stars.db"],
+  ["database extension", "dist/storage/github-stars.database"],
+  ["SQLite WAL", "dist/storage/github-stars.sqlite-wal"],
+  ["SQLite SHM", "dist/storage/github-stars.sqlite-shm"],
+  ["DB WAL", "dist/storage/github-stars.db-wal"],
+  ["DB SHM", "dist/storage/github-stars.db-shm"],
+  ["credential material", "dist/config/credentials.json"],
+  ["token material", "dist/config/token.txt"],
+  ["secret material", "dist/config/secret.yaml"],
+  ["private key material", "dist/config/private-key.pem"],
+  ["auth material", "dist/config/auth.json"],
+  ["cookie material", "dist/config/cookie.txt"],
+  ["session material", "dist/config/session.dat"],
+  ["npm credentials", "dist/.npmrc"],
+  ["npm debug log", "dist/npm-debug.log"],
+  ["debug log", "dist/logs/debug.log"],
+  ["cache directory", "dist/.cache/output.js"],
+  ["temporary directory", "dist/tmp/output.js"],
+  ["temp directory", "dist/temp/output.js"],
+  ["case-varied state", "dist/StAtE/GITHUB-STARS.SQLITE"],
+  ...WAVE3_DOTENV_NAMES.map(
+    (name) =>
+      [`Wave 3 dotenv ${name}`, `dist/config/${mixedCase(name)}`] as const,
   ),
-  ...WAVE3_SENSITIVE_DIRECTORY_FAMILIES.flatMap((family) =>
-    ALLOWED_PACK_PREFIXES.map((prefix, index) => {
-      const varied =
-        index === 0
-          ? `${mixedCase(family)}-data`
-          : `.${mixedCase(family)}_backup`;
-      return [
-        `${family} component ${varied} under ${prefix}`,
-        `${prefix}/nested/${varied}/module.js`,
-      ] as const;
-    }),
-  ),
-  ...WAVE3_LOCAL_ARTIFACT_NAMES.map(
-    (name, index) =>
+  ...WAVE3_SENSITIVE_DIRECTORY_FAMILIES.flatMap((family) => {
+    const varied = mixedCase(family);
+    return [
       [
-        `local artifact ${name}`,
-        `${ALLOWED_PACK_PREFIXES[index % ALLOWED_PACK_PREFIXES.length]}/nested/${mixedCase(name)}`,
+        `Wave 3 ${family} data directory`,
+        `dist/nested/${varied}-data/module.js`,
+      ] as const,
+      [
+        `Wave 3 ${family} backup directory`,
+        `dist/nested/.${varied}_backup/module.js`,
+      ] as const,
+    ];
+  }),
+  ...WAVE3_LOCAL_ARTIFACT_NAMES.map(
+    (name) =>
+      [
+        `Wave 3 local artifact ${name}`,
+        `dist/nested/${mixedCase(name)}`,
       ] as const,
   ),
 ];
 
-const WAVE3_BEARER_ENCODINGS = Object.freeze([
+const WAVE4_LEGITIMATE_SOURCE_MODULES = Object.freeze([
+  "auth.ts",
+  "token.ts",
+  "credential.ts",
+  "secret.ts",
+  "security/private-key.ts",
+  "auth/credential-provider.ts",
+  "auth/auth-provider.ts",
+  "storage/runtime-secret-repository.ts",
+  "storage/runtime-state.ts",
+  "storage/sqlite-store.ts",
+]);
+
+const WAVE4_BEARER_ENCODINGS = Object.freeze([
   [
     "double-quoted JSON",
     "eyJhbGciOiJIUzI1NiJ9.payload.signature",
@@ -495,6 +563,31 @@ const WAVE3_BEARER_ENCODINGS = Object.freeze([
     "backtick JS-like assignment",
     "opaque.token-eight",
     "`Authorization` = `Bearer opaque.token-eight`",
+  ],
+  [
+    "bracket assignment",
+    "opaque-bracket-token",
+    'headers["Authorization"] = "Bearer opaque-bracket-token";',
+  ],
+  [
+    "Headers.set call",
+    "opaque-set-token",
+    'headers.set("Authorization", "Bearer opaque-set-token");',
+  ],
+  [
+    "mixed-case bracket assignment",
+    "opaque-mixed-token",
+    "headers['aUtHoRiZaTiOn'] = 'bEaReR opaque-mixed-token';",
+  ],
+  [
+    "dot assignment",
+    "opaque-dot-token",
+    'headers.authorization = "Bearer opaque-dot-token";',
+  ],
+  [
+    "standalone literal value",
+    "opaque-standalone-token",
+    'const authorizationValue = "Bearer opaque-standalone-token";',
   ],
   ["padded token68", "abc/DEF+123==", "authorization:\t'Bearer abc/DEF+123=='"],
 ] as const);
@@ -1017,35 +1110,103 @@ describe("Codex plugin package", () => {
   });
 
   it.each([
-    ["SQLite state", "dist/state/github-stars.sqlite"],
-    ["root dotenv", "dist/.env"],
-    ["nested dotenv variant", "dist/config/local/.env.production.local"],
-    ["SQLite3 database", "dist/storage/github-stars.sqlite3"],
-    ["DB database", "dist/storage/github-stars.db"],
-    ["database extension", "dist/storage/github-stars.database"],
-    ["SQLite WAL", "dist/storage/github-stars.sqlite-wal"],
-    ["SQLite SHM", "dist/storage/github-stars.sqlite-shm"],
-    ["DB WAL", "dist/storage/github-stars.db-wal"],
-    ["DB SHM", "dist/storage/github-stars.db-shm"],
-    ["credential material", "dist/config/credentials.json"],
-    ["token material", "dist/config/token.txt"],
-    ["secret material", "dist/config/secret.yaml"],
-    ["private key material", "dist/config/private-key.pem"],
-    ["auth material", "dist/config/auth.json"],
-    ["cookie material", "dist/config/cookie.txt"],
-    ["session material", "dist/config/session.dat"],
-    ["npm credentials", "dist/.npmrc"],
-    ["npm debug log", "dist/npm-debug.log"],
-    ["debug log", "dist/logs/debug.log"],
-    ["cache directory", "dist/.cache/output.js"],
-    ["temporary directory", "dist/tmp/output.js"],
-    ["temp directory", "dist/temp/output.js"],
-    ["case-varied state", "dist/StAtE/GITHUB-STARS.SQLITE"],
-  ])("rejects %s inside an allowed npm pack prefix", async (_name, path) => {
+    ["rootDir", "./src"],
+    ["outDir", "build"],
+    ["declaration", false],
+    ["sourceMap", false],
+    ["declarationMap", true],
+    ["noEmit", true],
+  ] as const)(
+    "rejects a build config with unlocked %s",
+    async (_name, value) => {
+      await withPluginFixture(async (root) => {
+        await rewriteJson(join(root, "tsconfig.build.json"), (config) => {
+          const compilerOptions = config.compilerOptions as Record<
+            string,
+            unknown
+          >;
+          compilerOptions[_name] = value;
+        });
+
+        const result = runFixtureValidator(root);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("BUILD_CONFIG");
+      });
+    },
+  );
+
+  it("rejects a build config that broadens the canonical source include", async () => {
     await withPluginFixture(async (root) => {
+      await rewriteJson(join(root, "tsconfig.build.json"), (config) => {
+        config.include = ["src/**/*"];
+      });
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("BUILD_CONFIG");
+    });
+  });
+
+  it("rejects unsupported files in the canonical source tree", async () => {
+    await withPluginFixture(async (root) => {
+      await writeFile(
+        join(root, "src/unsupported.mts"),
+        "export {};\n",
+        "utf8",
+      );
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("SOURCE_TREE_EXTENSION");
+    });
+  });
+
+  it("rejects a source directory redirected through a reparse point", async () => {
+    await withPluginFixture(async (root) => {
+      const target = join(root, "outside-source");
+      await mkdir(target, { recursive: true });
+      await writeFile(join(target, "module.ts"), "export {};\n", "utf8");
+      await symlink(
+        target,
+        join(root, "src/linked"),
+        process.platform === "win32" ? "junction" : "dir",
+      );
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("SOURCE_TREE_LINK");
+    });
+  });
+
+  it("rejects a source whose complete generated output triple is missing", async () => {
+    await withPluginFixture(async (root) => {
+      const outputs = await addGeneratedModule(root, "generated/module.ts");
+      await rm(join(root, outputs[1]));
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("DIST_TREE_CONTENTS");
+    });
+  });
+
+  it("rejects an extra local dist output even when npm omits it", async () => {
+    await withPluginFixture(async (root) => {
+      await addGeneratedModule(root, "generated/module.ts");
+      await writeFile(join(root, "dist/unmapped.bin"), "extra\n", "utf8");
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("DIST_TREE_CONTENTS");
+    });
+  });
+
+  it("rejects an npm dry-run that omits a generated output", async () => {
+    await withPluginFixture(async (root) => {
+      const outputs = await addGeneratedModule(root, "generated/module.ts");
       const npmEntry = await fakeNpmPackCommand(root, [
         ...PACKED_PLUGIN_PATHS,
-        path,
+        outputs[0],
+        outputs[2],
       ]);
 
       const result = runFixtureValidator(root, {
@@ -1053,12 +1214,12 @@ describe("Codex plugin package", () => {
         env: { npm_execpath: npmEntry, PATH: "" },
       });
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("PACKAGE_DRY_RUN_SENSITIVE_PATH");
+      expect(result.stderr).toContain("PACKAGE_DRY_RUN_DIST_CONTENTS");
     });
   });
 
-  it.each(WAVE3_SENSITIVE_PACK_PATHS)(
-    "rejects the generated sensitive path family: %s",
+  it.each(WAVE4_UNMAPPED_DIST_PATHS)(
+    "rejects an unmapped dist path independent of its name: %s",
     async (_name, path) => {
       await withPluginFixture(async (root) => {
         const npmEntry = await fakeNpmPackCommand(root, [
@@ -1071,7 +1232,27 @@ describe("Codex plugin package", () => {
           env: { npm_execpath: npmEntry, PATH: "" },
         });
         expect(result.status).toBe(1);
-        expect(result.stderr).toContain("PACKAGE_DRY_RUN_SENSITIVE_PATH");
+        expect(result.stderr).toContain("PACKAGE_DRY_RUN_DIST_CONTENTS");
+      });
+    },
+  );
+
+  it.each(WAVE4_LEGITIMATE_SOURCE_MODULES)(
+    "accepts a sensitive-looking module generated from canonical source: %s",
+    async (sourcePath) => {
+      await withPluginFixture(async (root) => {
+        const outputs = await addGeneratedModule(root, sourcePath);
+        const npmEntry = await fakeNpmPackCommand(root, [
+          ...PACKED_PLUGIN_PATHS,
+          ...outputs,
+        ]);
+
+        const result = runFixtureValidator(root, {
+          staticOnly: false,
+          env: { npm_execpath: npmEntry, PATH: "" },
+        });
+        expect(result.status).toBe(0);
+        expect(result.stderr).toBe("");
       });
     },
   );
@@ -1079,33 +1260,32 @@ describe("Codex plugin package", () => {
   it.each([
     [
       "fine-grained GitHub token",
-      "dist/generated/value-one.js",
+      "generated/value-one.ts",
       'export const value = "github_pat_AAAAAAAAAAAAAAAAAAAA";\n',
     ],
     [
       "classic GitHub token",
-      "dist/generated/value-two.js",
+      "generated/value-two.ts",
       'export const value = "ghp_AAAAAAAAAAAAAAAAAAAA";\n',
     ],
     [
       "bearer authorization",
-      "dist/generated/value-three.js",
+      "generated/value-three.ts",
       'export const value = "Authorization: Bearer not-a-placeholder";\n',
     ],
     [
       "PEM private key",
-      "dist/generated/value-four.js",
+      "generated/value-four.ts",
       "-----BEGIN PRIVATE KEY-----\nnot-a-placeholder\n-----END PRIVATE KEY-----\n",
     ],
   ])(
     "rejects locally readable packed content containing %s",
-    async (_name, path, contents) => {
+    async (_name, sourcePath, contents) => {
       await withPluginFixture(async (root) => {
-        await mkdir(resolve(root, path, ".."), { recursive: true });
-        await writeFile(join(root, path), contents, "utf8");
+        const outputs = await addGeneratedModule(root, sourcePath, contents);
         const npmEntry = await fakeNpmPackCommand(root, [
           ...PACKED_PLUGIN_PATHS,
-          path,
+          ...outputs,
         ]);
 
         const result = runFixtureValidator(root, {
@@ -1118,17 +1298,19 @@ describe("Codex plugin package", () => {
     },
   );
 
-  it.each(WAVE3_BEARER_ENCODINGS)(
+  it.each(WAVE4_BEARER_ENCODINGS)(
     "rejects a complete Bearer credential in %s syntax without echoing it",
     async (name, credential, encoded) => {
       await withPluginFixture(async (root) => {
         const slug = name.toLowerCase().replaceAll(/[^a-z0-9]+/gu, "-");
-        const path = `dist/generated/bearer-${slug}.js`;
-        await mkdir(resolve(root, path, ".."), { recursive: true });
-        await writeFile(join(root, path), `${encoded}\n`, "utf8");
+        const outputs = await addGeneratedModule(
+          root,
+          `generated/bearer-${slug}.ts`,
+          `${encoded}\n`,
+        );
         const npmEntry = await fakeNpmPackCommand(root, [
           ...PACKED_PLUGIN_PATHS,
-          path,
+          ...outputs,
         ]);
 
         const result = runFixtureValidator(root, {
@@ -1153,46 +1335,24 @@ describe("Codex plugin package", () => {
       "separate field and scheme names",
       'const field = "Authorization"; const scheme = "Bearer";\n',
     ],
-    ["a Bearer value without an authorization field", "Bearer opaque-token\n"],
+    [
+      "the product redaction regex source",
+      "const redaction = /Bearer\\s+[A-Za-z0-9._~+/-]{4,}/giu;\n",
+    ],
+    [
+      "prose without a token-shaped value",
+      "The client supports Bearer authentication.\n",
+    ],
   ])("accepts non-credential Bearer control: %s", async (_name, contents) => {
     await withPluginFixture(async (root) => {
-      const path = "dist/generated/bearer-control.js";
-      await mkdir(resolve(root, path, ".."), { recursive: true });
-      await writeFile(join(root, path), contents, "utf8");
+      const outputs = await addGeneratedModule(
+        root,
+        "generated/bearer-control.ts",
+        contents,
+      );
       const npmEntry = await fakeNpmPackCommand(root, [
         ...PACKED_PLUGIN_PATHS,
-        path,
-      ]);
-
-      const result = runFixtureValidator(root, {
-        staticOnly: false,
-        env: { npm_execpath: npmEntry, PATH: "" },
-      });
-      expect(result.status).toBe(0);
-      expect(result.stderr).toBe("");
-    });
-  });
-
-  it("accepts legitimate compiled runtime artifacts and package metadata", async () => {
-    await withPluginFixture(async (root) => {
-      const paths = [
-        "dist/auth/credential-provider.js",
-        "dist/auth/auth-provider.js",
-        "dist/storage/runtime-secret-repository.d.ts",
-        "dist/storage/runtime-state.js",
-        "dist/storage/sqlite-database.js.map",
-        "dist/storage/sqlite-store.js",
-        "dist/storage/state-directory.js",
-        "dist/security/secret-redactor.js.map",
-        "dist/package.json",
-      ];
-      for (const path of paths) {
-        await mkdir(resolve(root, path, ".."), { recursive: true });
-        await writeFile(join(root, path), "{}\n", "utf8");
-      }
-      const npmEntry = await fakeNpmPackCommand(root, [
-        ...PACKED_PLUGIN_PATHS,
-        ...paths,
+        ...outputs,
       ]);
 
       const result = runFixtureValidator(root, {
