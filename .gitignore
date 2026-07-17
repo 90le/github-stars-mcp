@@ -1,0 +1,10 @@
+.worktrees/
+.superpowers/
+node_modules/
+dist/
+coverage/
+artifacts/
+.env
+*.db
+*.db-shm
+*.db-wal
