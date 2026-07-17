@@ -159,7 +159,7 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 
 - **QUERY-01:** The server shall query an explicit snapshot or the latest complete snapshot.
 - **QUERY-02:** Filters shall use a validated expression tree with `all`, `any`, and `not` groups.
-- **QUERY-03:** Supported comparisons shall include equality, inequality, set membership, substring, numeric range, timestamp before/after, null checks, and Boolean values.
+- **QUERY-03:** Supported comparisons shall include equality, inequality, set membership, substring, numeric range, timestamp before/after, null checks, and Boolean values. Set filters shall be bounded and compiled through a constant-number-of-bind-variables representation rather than one SQLite variable per member.
 - **QUERY-04:** Query results shall support stable sorts, cursor pagination, a maximum page size, totals, and aggregate counts. Cursors shall be opaque, authenticated with an installation-local secret, bound to their resource, snapshot, normalized selection/filter, and normalized sort, and remain valid across process restarts. Any canonical re-encoding or boundary modification without a valid authenticator shall fail closed.
 - **QUERY-05:** The server shall distinguish `pushed_at` from `updated_at`. Rules about code inactivity shall use `pushed_at` unless the caller names another field.
 - **QUERY-06:** The server shall support List membership, language, topic, owner, fork, archive, visibility, star count, license, and age filters.
@@ -611,7 +611,7 @@ Production tool inputs shall not accept an API base URL, arbitrary hostname, red
 - Logs shall redact common GitHub token formats and authorization headers.
 - The server shall keep a resolved token in memory for the process lifetime or a shorter configured lifetime.
 - The SQLite schema shall contain no token column.
-- Cursor authentication shall use a randomly generated HMAC-SHA-256 key of at least 256 bits. The key shall be created atomically once, retained across restarts in the owner-only state database, copied defensively in memory, and never returned by an MCP tool, application port, log, audit record, export, or error.
+- Cursor authentication shall use a randomly generated HMAC-SHA-256 key of at least 256 actual bits. The key shall be created atomically once, retained across restarts in the owner-only state database, copied through intrinsic typed-array operations into an exclusive unpooled backing store, and never returned by an MCP tool, application port, shared Buffer slab, log, audit record, export, or error.
 - Child-process errors shall discard stdout before they reach an MCP result.
 
 ### 15.3 Prompt injection and untrusted content

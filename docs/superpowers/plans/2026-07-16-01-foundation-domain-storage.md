@@ -418,9 +418,13 @@ value with zero through three fractional digits and returns exactly
 millisecond precision (`.SSSZ`); longer fractions, offsets, expanded years,
 invalid calendar dates, and non-canonical cursor timestamps are rejected.
 `repositorySchema` uses this same utility for `pushedAt` and `updatedAt`, and
-all adapters/storage records use it for Star/List/observation timestamps, so
-JavaScript evaluation and SQLite ordering cannot disagree. No unresolved
-relative value reaches SQL or an executable plan.
+`starRecordSchema`, `userListSchema`, `repositoryViewSchema`, and
+`observedRepositoryMetadataSchema` normalize every Star/List/view/observation
+timestamp through it. Temporal sort extraction also canonicalizes defensively
+before in-memory comparison or cursor creation, so even a manually constructed
+view cannot disagree with SQLite. Adapters and storage must parse through
+these schemas at their boundaries. No unresolved relative value reaches SQL
+or an executable plan.
 `is_unclassified` means `listIds.length === 0`. Null checks are accepted only
 for nullable fields/collections and use a Boolean value. `normalizeSort`
 descriptor-snapshots plain data-only terms exactly once, rejects accessors,
@@ -437,12 +441,22 @@ export function compileCursor(sort: readonly RepositorySort[], cursor: Validated
 Map fields only to fixed columns. Topics use `EXISTS (SELECT 1 FROM
 json_each(rv.topics_json) WHERE value=?)`; Lists use `EXISTS (SELECT 1 FROM
 list_memberships m WHERE m.snapshot_id=ss.snapshot_id AND
-m.repository_id=ss.repository_id AND m.list_id=?)`. Unit tests run a
+m.repository_id=ss.repository_id AND m.list_id=?)`. Every `in`/`not_in` set
+contains 1–5,000 values, all sets together contain at most 10,000 values, and
+set values are deduplicated then deterministically sorted during parsing.
+Compilation binds each set once as canonical JSON and reads it with
+`json_each(?)`; it never emits one SQLite variable per member. Unit tests run a
 table-driven evaluator/SQL equivalence case for every allowed field/operator
-pair, including nulls and `is_unclassified`.
+pair, including nulls and `is_unclassified`, plus 5,000-value and aggregate
+budget boundaries.
 
 `createCursorCodec(signingKey)` defensively copies a caller-injected key of at
-least 32 bytes and returns repository/List encode and decode methods.
+least 32 actual bytes and returns repository/List encode and decode methods.
+It obtains typed-array length/data through intrinsic operations, so overridden
+subclass properties cannot fake the length, copies into a dedicated unpooled
+`Uint8Array` backing store, and retains no `Buffer` view of the key. Tests
+cover forged `Uint8Array` subclasses, detached/hostile inputs, source mutation,
+and absence of key bytes from the shared Buffer slab.
 Repository cursors are max-4-KiB base64url canonical JSON envelopes with
 `{mac,payload:{v:1,kind:"repositories",snapshotId,filterHash,sortHash,values,nulls,repositoryId}}`;
 List cursors use
