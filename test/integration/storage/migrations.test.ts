@@ -7,6 +7,24 @@ import {
   type SqliteMigration,
 } from "../../../src/storage/sqlite-database.js";
 
+function expectRollbackRemainsUsable(
+  database: ReturnType<typeof openSqliteDatabase>,
+): void {
+  database.exec(
+    `BEGIN IMMEDIATE;
+     CREATE TABLE rollback_probe(value TEXT) STRICT;
+     ROLLBACK;`,
+  );
+  expect(database.inTransaction).toBe(false);
+  expect(
+    database
+      .prepare(
+        "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='rollback_probe'",
+      )
+      .get(),
+  ).toBeUndefined();
+}
+
 describe("SQLite migrations", () => {
   test("supports an empty binary migration list", () => {
     const database = openSqliteDatabase(":memory:");
@@ -246,6 +264,235 @@ describe("SQLite migrations", () => {
     ).toBe(1);
     expect(database.inTransaction).toBe(false);
     database.close();
+  });
+
+  test("rejects migration accessors without invoking or persisting them", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    let getterCalls = 0;
+    const hostile = {
+      version: 2,
+      name: "accessor-escape",
+      get sql(): string {
+        getterCalls += 1;
+        if (getterCalls === 1) {
+          database.exec("CREATE TABLE getter_side_effect(value TEXT) STRICT;");
+          return "CREATE TABLE apparently_safe(value TEXT) STRICT;";
+        }
+        return `CREATE TABLE getter_payload(value TEXT) STRICT;
+                COMMIT;
+                BEGIN IMMEDIATE;`;
+      },
+    } satisfies SqliteMigration;
+
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", [
+        ...SQLITE_MIGRATIONS,
+        hostile,
+      ]),
+    ).toThrow(/plain data/u);
+    expect(getterCalls).toBe(0);
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_schema
+           WHERE type='table' AND name IN
+             ('getter_side_effect','apparently_safe','getter_payload')`,
+        )
+        .all(),
+    ).toEqual([]);
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(1);
+    expectRollbackRemainsUsable(database);
+    database.close();
+  });
+
+  test("rejects proxied migration definitions without invoking traps", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    let trapCalls = 0;
+    const proxied = new Proxy<SqliteMigration>(
+      {
+        version: 2,
+        name: "proxy-escape",
+        sql: "CREATE TABLE proxy_payload(value TEXT) STRICT;",
+      },
+      {
+        get(target, property, receiver) {
+          trapCalls += 1;
+          return Reflect.get(target, property, receiver) as unknown;
+        },
+        getOwnPropertyDescriptor(target, property) {
+          trapCalls += 1;
+          return Reflect.getOwnPropertyDescriptor(target, property);
+        },
+        getPrototypeOf(target) {
+          trapCalls += 1;
+          return Reflect.getPrototypeOf(target);
+        },
+        ownKeys(target) {
+          trapCalls += 1;
+          return Reflect.ownKeys(target);
+        },
+      },
+    );
+
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", [
+        ...SQLITE_MIGRATIONS,
+        proxied,
+      ]),
+    ).toThrow(/plain data/u);
+    expect(trapCalls).toBe(0);
+    expect(
+      database
+        .prepare(
+          "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='proxy_payload'",
+        )
+        .get(),
+    ).toBeUndefined();
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(1);
+    expectRollbackRemainsUsable(database);
+    database.close();
+  });
+
+  test("rejects proxied migration arrays without invoking traps", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    let trapCalls = 0;
+    const proxied = new Proxy<readonly SqliteMigration[]>(
+      [
+        ...SQLITE_MIGRATIONS,
+        {
+          version: 2,
+          name: "proxy-array-escape",
+          sql: "CREATE TABLE proxy_array_payload(value TEXT) STRICT;",
+        },
+      ],
+      {
+        get(target, property, receiver) {
+          trapCalls += 1;
+          return Reflect.get(target, property, receiver) as unknown;
+        },
+        getOwnPropertyDescriptor(target, property) {
+          trapCalls += 1;
+          return Reflect.getOwnPropertyDescriptor(target, property);
+        },
+        getPrototypeOf(target) {
+          trapCalls += 1;
+          return Reflect.getPrototypeOf(target);
+        },
+        ownKeys(target) {
+          trapCalls += 1;
+          return Reflect.ownKeys(target);
+        },
+      },
+    );
+
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", proxied),
+    ).toThrow(/plain data/u);
+    expect(trapCalls).toBe(0);
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(1);
+    expectRollbackRemainsUsable(database);
+    database.close();
+  });
+
+  test("rejects unknown migration fields before DDL or ledger writes", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    const migration = {
+      version: 2,
+      name: "unknown-field",
+      sql: "CREATE TABLE unknown_field_payload(value TEXT) STRICT;",
+      source: "hostile",
+    };
+
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", [
+        ...SQLITE_MIGRATIONS,
+        migration,
+      ]),
+    ).toThrow(/plain data/u);
+    expect(
+      database
+        .prepare(
+          "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='unknown_field_payload'",
+        )
+        .get(),
+    ).toBeUndefined();
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(1);
+    expectRollbackRemainsUsable(database);
+    database.close();
+  });
+
+  test("uses one migration snapshot across SQLite callback reentry", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    const migration = {
+      version: 2,
+      name: "snapshot-reentry",
+      sql: `CREATE TABLE reentry_snapshot(value TEXT) STRICT;
+            SELECT mutate_migration_definition();`,
+    };
+    const expectedChecksum = migrationChecksum(migration);
+    const migrations: SqliteMigration[] = [...SQLITE_MIGRATIONS, migration];
+    database.function("mutate_migration_definition", () => {
+      migration.name = "mutated-after-exec-started";
+      migration.sql =
+        "CREATE TABLE mutated_definition_payload(value TEXT) STRICT;";
+      migrations[1] = {
+        version: 2,
+        name: "replaced-after-exec-started",
+        sql: "CREATE TABLE replaced_definition_payload(value TEXT) STRICT;",
+      };
+      return 1;
+    });
+
+    migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", migrations);
+    expect(
+      database
+        .prepare(
+          "SELECT version,name,checksum FROM schema_migrations WHERE version=2",
+        )
+        .get(),
+    ).toEqual({
+      version: 2,
+      name: "snapshot-reentry",
+      checksum: expectedChecksum,
+    });
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_schema
+           WHERE type='table' AND name IN
+             ('mutated_definition_payload','replaced_definition_payload')`,
+        )
+        .all(),
+    ).toEqual([]);
+    database.close();
+  });
+
+  test("rejects checksum accessors without invoking them", () => {
+    let getterCalls = 0;
+    const hostile = {
+      version: 2,
+      name: "checksum-accessor",
+      get sql(): string {
+        getterCalls += 1;
+        return "CREATE TABLE checksum_accessor(value TEXT) STRICT;";
+      },
+    } satisfies SqliteMigration;
+
+    expect(() => migrationChecksum(hostile)).toThrow(/plain data/u);
+    expect(getterCalls).toBe(0);
   });
 
   test("allows transaction words in comments, literals, and trigger bodies", () => {

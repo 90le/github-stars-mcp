@@ -173,23 +173,58 @@ test.each(["-wal", "-shm"] as const)(
   },
 );
 
-test("rejects a non-regular database or sidecar after open", () => {
-  const root = mkdtempSync(join(tmpdir(), "github-stars-state-"));
-  try {
-    const prepared = prepareStateDirectory(join(root, "state"));
-    const database = openSqliteDatabase(prepared.databasePath);
-    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
-    validateStateFilesAfterOpen(prepared);
-    database.close();
+test.each(["-wal", "-shm"] as const)(
+  "rejects a non-regular sidecar at %s after open",
+  (suffix) => {
+    const root = mkdtempSync(join(tmpdir(), "github-stars-state-"));
+    try {
+      const prepared = prepareStateDirectory(join(root, "state"));
+      const database = openSqliteDatabase(prepared.databasePath);
+      migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+      validateStateFilesAfterOpen(prepared);
+      database.close();
 
-    mkdirSync(`${prepared.databasePath}-wal`);
-    expect(() => validateStateFilesAfterOpen(prepared)).toThrow(
-      /filesystem type/u,
-    );
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+      const sidecarPath = `${prepared.databasePath}${suffix}`;
+      rmSync(sidecarPath, { force: true });
+      mkdirSync(sidecarPath);
+      expect(() => validateStateFilesAfterOpen(prepared)).toThrow(
+        /filesystem type/u,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each(["-wal", "-shm"] as const)(
+  "rejects a sidecar link at %s after open",
+  (suffix) => {
+    const root = mkdtempSync(join(tmpdir(), "github-stars-state-"));
+    try {
+      const prepared = prepareStateDirectory(join(root, "state"));
+      const database = openSqliteDatabase(prepared.databasePath);
+      migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+      validateStateFilesAfterOpen(prepared);
+      database.close();
+
+      const sidecarPath = `${prepared.databasePath}${suffix}`;
+      const target = join(root, `post-open-target${suffix}`);
+      rmSync(sidecarPath, { force: true });
+      if (process.platform === "win32") {
+        mkdirSync(target);
+        symlinkSync(target, sidecarPath, "junction");
+      } else {
+        writeFileSync(target, "");
+        symlinkSync(target, sidecarPath, "file");
+      }
+      expect(() => validateStateFilesAfterOpen(prepared)).toThrow(
+        /symbolic link|junction/u,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 test("requires the main database file to exist after open", () => {
   const root = mkdtempSync(join(tmpdir(), "github-stars-state-"));
@@ -287,31 +322,6 @@ test.skipIf(process.platform === "win32")(
       prepareStateDirectory(dataDir);
       expect(statSync(dataDir).mode & 0o777).toBe(0o500);
       expect(statSync(databasePath).mode & 0o777).toBe(0o400);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
-  },
-);
-
-test.skipIf(process.platform === "win32")(
-  "rejects database and sidecar symlinks",
-  () => {
-    const root = mkdtempSync(join(tmpdir(), "github-stars-state-"));
-    try {
-      const linkedDataDir = join(root, "linked-state");
-      mkdirSync(linkedDataDir);
-      const target = join(root, "target");
-      writeFileSync(target, "");
-      symlinkSync(target, join(linkedDataDir, STATE_DATABASE_BASENAME), "file");
-      expect(() => prepareStateDirectory(linkedDataDir)).toThrow(
-        /symbolic link/u,
-      );
-
-      const prepared = prepareStateDirectory(join(root, "regular-state"));
-      symlinkSync(target, `${prepared.databasePath}-wal`, "file");
-      expect(() => validateStateFilesAfterOpen(prepared)).toThrow(
-        /symbolic link/u,
-      );
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

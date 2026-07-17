@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import type Database from "better-sqlite3";
 import { AppError } from "../domain/errors.js";
 import { canonicalUtcTimestamp } from "../domain/timestamp.js";
@@ -17,11 +18,166 @@ export const SQLITE_MIGRATIONS: readonly SqliteMigration[] = Object.freeze([
   initialMigration,
 ]);
 
+const arrayIsArray = Array.isArray;
+const arrayPrototype = Array.prototype;
+const numberIsSafeInteger = Number.isSafeInteger;
+const objectFreeze = Object.freeze;
+const objectGetOwnPropertyDescriptors = Object.getOwnPropertyDescriptors;
+const objectGetPrototypeOf = Object.getPrototypeOf;
+const objectPrototype = Object.prototype;
+const reflectDefineProperty = Reflect.defineProperty;
+const reflectOwnKeys = Reflect.ownKeys;
+const stringFromValue = String;
+const isProxy = utilTypes.isProxy;
+
+function migrationError(message: string, cause?: unknown): AppError {
+  return new AppError("STORAGE_ERROR", message, {
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
+
+function isDataDescriptor(
+  descriptor: PropertyDescriptor | undefined,
+): descriptor is PropertyDescriptor {
+  return descriptor !== undefined && "value" in descriptor;
+}
+
+function descriptorValue(descriptor: PropertyDescriptor): unknown {
+  return descriptor.value as unknown;
+}
+
+function ownPropertyDescriptors(
+  input: object,
+): Record<PropertyKey, PropertyDescriptor | undefined> {
+  return objectGetOwnPropertyDescriptors(input);
+}
+
+function snapshotMigrationDefinition(input: unknown): SqliteMigration {
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    isProxy(input) ||
+    objectGetPrototypeOf(input) !== objectPrototype
+  ) {
+    throw migrationError(
+      "migration definitions must be exact plain data objects",
+    );
+  }
+
+  const descriptors = ownPropertyDescriptors(input);
+  const keys = reflectOwnKeys(descriptors);
+  if (keys.length !== 3) {
+    throw migrationError(
+      "migration definitions must be exact plain data objects",
+    );
+  }
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key !== "version" && key !== "name" && key !== "sql") {
+      throw migrationError(
+        "migration definitions must be exact plain data objects",
+      );
+    }
+  }
+
+  const versionDescriptor = descriptors.version;
+  const nameDescriptor = descriptors.name;
+  const sqlDescriptor = descriptors.sql;
+  if (
+    !isDataDescriptor(versionDescriptor) ||
+    versionDescriptor.enumerable !== true ||
+    !isDataDescriptor(nameDescriptor) ||
+    nameDescriptor.enumerable !== true ||
+    !isDataDescriptor(sqlDescriptor) ||
+    sqlDescriptor.enumerable !== true
+  ) {
+    throw migrationError(
+      "migration definitions must contain only plain data properties",
+    );
+  }
+
+  const version = descriptorValue(versionDescriptor);
+  const name = descriptorValue(nameDescriptor);
+  const sql = descriptorValue(sqlDescriptor);
+  if (
+    typeof version !== "number" ||
+    !numberIsSafeInteger(version) ||
+    typeof name !== "string" ||
+    typeof sql !== "string"
+  ) {
+    throw migrationError(
+      "migration definitions must contain valid plain data values",
+    );
+  }
+  return objectFreeze({ version, name, sql });
+}
+
+function snapshotMigrationDefinitions(
+  input: unknown,
+): readonly SqliteMigration[] {
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    isProxy(input) ||
+    !arrayIsArray(input) ||
+    objectGetPrototypeOf(input) !== arrayPrototype
+  ) {
+    throw migrationError(
+      "migration definitions must be an exact plain data array",
+    );
+  }
+
+  const descriptors = ownPropertyDescriptors(input);
+  const lengthDescriptor = descriptors.length;
+  const lengthValue =
+    lengthDescriptor === undefined
+      ? undefined
+      : descriptorValue(lengthDescriptor);
+  if (
+    !isDataDescriptor(lengthDescriptor) ||
+    lengthDescriptor.enumerable !== false ||
+    typeof lengthValue !== "number" ||
+    !numberIsSafeInteger(lengthValue)
+  ) {
+    throw migrationError(
+      "migration definitions must be an exact plain data array",
+    );
+  }
+  const length = lengthValue;
+  if (reflectOwnKeys(descriptors).length !== length + 1) {
+    throw migrationError(
+      "migration definitions must be an exact plain data array",
+    );
+  }
+
+  const snapshot: SqliteMigration[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const key = stringFromValue(index);
+    const descriptor = descriptors[key];
+    if (!isDataDescriptor(descriptor) || descriptor.enumerable !== true) {
+      throw migrationError(
+        "migration definitions must be an exact plain data array",
+      );
+    }
+    if (
+      !reflectDefineProperty(snapshot, key, {
+        configurable: true,
+        enumerable: true,
+        value: snapshotMigrationDefinition(descriptorValue(descriptor)),
+        writable: true,
+      })
+    ) {
+      throw migrationError("migration definition snapshot failed");
+    }
+  }
+  return objectFreeze(snapshot);
+}
+
 function normalizedText(value: string): string {
   return value.replace(/\r\n?/gu, "\n");
 }
 
-export function migrationChecksum(migration: SqliteMigration): string {
+function checksumMigrationSnapshot(migration: SqliteMigration): string {
   return createHash("sha256")
     .update(
       `${String(migration.version)}\n${migration.name}\n${normalizedText(
@@ -32,16 +188,14 @@ export function migrationChecksum(migration: SqliteMigration): string {
     .digest("hex");
 }
 
+export function migrationChecksum(migration: SqliteMigration): string {
+  return checksumMigrationSnapshot(snapshotMigrationDefinition(migration));
+}
+
 interface MigrationRow {
   readonly version: number;
   readonly name: string;
   readonly checksum: string;
-}
-
-function migrationError(message: string, cause?: unknown): AppError {
-  return new AppError("STORAGE_ERROR", message, {
-    ...(cause === undefined ? {} : { cause }),
-  });
 }
 
 type SqlToken =
@@ -218,8 +372,9 @@ export function migrateSqliteDatabase(
   if (database.inTransaction) {
     throw migrationError("cannot migrate inside an existing transaction");
   }
-  for (const migration of migrations) {
-    assertNoTransactionControl(migration.sql);
+  const migrationSnapshot = snapshotMigrationDefinitions(migrations);
+  for (let index = 0; index < migrationSnapshot.length; index += 1) {
+    assertNoTransactionControl(migrationSnapshot[index]!.sql);
   }
 
   try {
@@ -240,21 +395,25 @@ export function migrateSqliteDatabase(
       if (row.version !== expectedVersion) {
         throw migrationError("schema migration ledger contains a gap");
       }
-      const expected = migrations[index];
+      const expected = migrationSnapshot[index];
       if (expected === undefined) {
         throw migrationError("database schema is newer than this binary");
       }
       if (
         expected.version !== row.version ||
         expected.name !== row.name ||
-        migrationChecksum(expected) !== row.checksum
+        checksumMigrationSnapshot(expected) !== row.checksum
       ) {
         throw migrationError("schema migration checksum or name drift");
       }
     }
 
-    for (let index = rows.length; index < migrations.length; index += 1) {
-      const migration = migrations[index]!;
+    for (
+      let index = rows.length;
+      index < migrationSnapshot.length;
+      index += 1
+    ) {
+      const migration = migrationSnapshot[index]!;
       if (
         migration.version !== index + 1 ||
         migration.name.length === 0 ||
@@ -276,7 +435,7 @@ export function migrateSqliteDatabase(
         .run({
           version: migration.version,
           name: migration.name,
-          checksum: migrationChecksum(migration),
+          checksum: checksumMigrationSnapshot(migration),
           appliedAt,
         });
     }
