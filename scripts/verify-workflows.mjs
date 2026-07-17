@@ -40,6 +40,9 @@ const TOKEN_LITERAL =
 const SECRETS_CONTEXT = /\bsecrets\b/iu;
 const GITHUB_TOKEN_CONTEXT = /\bgithub\s*\.\s*token\b/iu;
 const GITHUB_INDEX_CONTEXT = /\bgithub\s*\[/iu;
+const COMPLETE_GITHUB_CONTEXT = /\bgithub\b(?!\s*(?:\.|\[))/iu;
+const RELEASE_SHELL_CONTROL = /[\r\n;&|<>`]|\$\(/u;
+const RELEASE_STEP_KEYS = new Set(["name", "env", "run"]);
 const RELEASE_ROOT_PERMISSIONS = Object.freeze({
   attestations: "write",
   contents: "write",
@@ -185,7 +188,8 @@ function hasCredentialReference(value) {
     if (
       SECRETS_CONTEXT.test(expression) ||
       GITHUB_TOKEN_CONTEXT.test(expression) ||
-      GITHUB_INDEX_CONTEXT.test(expression)
+      GITHUB_INDEX_CONTEXT.test(expression) ||
+      COMPLETE_GITHUB_CONTEXT.test(expression)
     ) {
       return true;
     }
@@ -506,6 +510,15 @@ function validatePackageSmoke(context) {
     "${{ matrix.os }}",
     "PACKAGE_RUNNER_MATRIX",
   );
+  const matrix = nodeAt(context.root, [
+    "jobs",
+    "package-smoke",
+    "strategy",
+    "matrix",
+  ]);
+  if (!sameTextSet(mappingKeys(matrix), ["os", "node-version"])) {
+    issueAt(context, matrix, "PACKAGE_MATRIX_SHAPE");
+  }
   expectSequence(
     context,
     ["jobs", "package-smoke", "strategy", "matrix", "os"],
@@ -596,12 +609,35 @@ function validateCodeql(context) {
 }
 
 function isGhReleaseStep(step) {
+  const keys = mappingKeys(step);
+  if (
+    keys === undefined ||
+    !keys.includes("env") ||
+    !keys.includes("run") ||
+    keys.some((key) => !RELEASE_STEP_KEYS.has(key)) ||
+    !sameMapping(nodeAt(step, ["env"]), {
+      GH_TOKEN: "${{ github.token }}",
+    })
+  ) {
+    return false;
+  }
+
   const command = scalarText(pairAt(step, "run")?.value);
+  if (
+    command === undefined ||
+    command.trim() !== command ||
+    RELEASE_SHELL_CONTROL.test(command)
+  ) {
+    return false;
+  }
+  const tokens = command.split(" ");
   return (
-    command !== undefined &&
-    command
-      .split(/\r?\n/u)
-      .some((line) => /^\s*gh\s+release(?:\s|$)/u.test(line))
+    tokens.length >= 5 &&
+    tokens.every((token) => token.length > 0) &&
+    tokens[0] === "gh" &&
+    tokens[1] === "release" &&
+    tokens[2] === "create" &&
+    tokens.at(-1) === "--verify-tag"
   );
 }
 
@@ -629,8 +665,12 @@ function validateReleaseJob(
   permissions,
   inheritedPermissions,
 ) {
-  const job = pairAt(jobs, name)?.value;
-  if (!isMap(job)) return;
+  const jobPair = pairAt(jobs, name);
+  const job = jobPair?.value;
+  if (!isMap(job)) {
+    issueAt(context, job ?? jobPair?.key ?? jobs, "RELEASE_JOB_MAPPING");
+    return;
+  }
 
   if (scalarText(pairAt(job, "environment")?.value) !== environment) {
     issueAt(
@@ -649,6 +689,22 @@ function validateReleaseJob(
       "RELEASE_PERMISSIONS",
     );
   }
+}
+
+function validateReleaseCheckout(context) {
+  const steps = stepMaps(context, "release");
+  const checkoutSteps = steps.filter((step) => {
+    const reference = scalarText(pairAt(step, "uses")?.value);
+    return reference !== undefined && /^actions\/checkout@/iu.test(reference);
+  });
+  const expected = checkoutSteps.filter(
+    (step) => scalarText(pairAt(step, "uses")?.value) === PINS.checkout,
+  );
+  if (checkoutSteps.length !== 1 || expected.length !== 1) {
+    issueAt(context, context.root, "RELEASE_CHECKOUT_REQUIRED");
+    return;
+  }
+  validateCheckoutPersistence(context, expected);
 }
 
 function validateRelease(context) {
@@ -700,6 +756,7 @@ function validateRelease(context) {
     }
   }
 
+  validateReleaseCheckout(context);
   validateCredentialReferences(
     context,
     "RELEASE_TOKEN_REFERENCE",
