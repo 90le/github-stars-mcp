@@ -863,11 +863,16 @@ JSON parsing; RegExp matching; Object, Array, Reflect, Number, String, and
 WeakSet operations; `createHash`, `createHmac`, Hash/Hmac update and digest;
 and timing-safe comparison. It sends canonical encoding through the shared
 hardened serializer and invokes receiver-sensitive methods through the
-captured `Reflect.apply`. Post-load replacement of CommonJS crypto exports,
-crypto prototypes, globals, or prototype methods cannot change cursor bytes,
-bypass authentication, expose the HMAC key, or forge runtime brands. The
-codec freezes returned payloads and its public method table through the
-captured freeze function.
+captured `Reflect.apply`. `CURSOR_INTRINSICS` protects direct signing-key copy.
+After domain modules normalize cursor values, the table keeps canonical
+encoding, HMAC generation and verification, Buffer decoding, freezing, and
+runtime-brand checks stable when callers replace the captured dependencies
+after module load. The guarantee excludes realm-replacement independence for
+`normalizeSort`, `parseFilter`, ID parsing, and timestamp normalization; those
+external domain modules retain their own contracts. Callers cannot use
+replacements inside the protected pipeline to expose the HMAC key, bypass
+authentication, or forge runtime brands. The codec freezes returned payloads
+and its public method table through the captured freeze function.
 
 `memory-storage.ts` starts unmigrated, initializes a private random 32-byte
 cursor key only in `migrate()`, and rejects all other operations before ready.
@@ -1070,9 +1075,11 @@ Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.te
   Star/List/membership verification rejected, repository/List/two-direction
   membership cursor tamper/cross-context pages, runtime-brand lookalikes and
   locked selection-hash vectors, and aggregates independent of cursor;
-- post-load replacement of CommonJS crypto exports, Hash/Hmac methods,
-  Buffer/JSON/RegExp/WeakSet/Uint8Array hooks with unchanged authenticated
-  cursor round trips, zero hook calls, and no key leakage; exact
+- post-load replacement of CommonJS crypto exports, Hash/Hmac update and
+  digest, Buffer conversion/measurement/encoding/equality, JSON
+  parse/stringify, RegExp test/exec, WeakSet constructor/add/has, and the
+  Uint8Array constructor, with unchanged authenticated cursor round trips,
+  zero protected-pipeline hook calls, and no key leakage; exact
   `SharedArrayBuffer` subview key copies under a replaced global constructor
   without source wiping or view retention;
 - one-plan-one-run, binding/ID/sequence/before validation, idempotency without
