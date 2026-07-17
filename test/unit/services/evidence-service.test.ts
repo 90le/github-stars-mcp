@@ -12,6 +12,7 @@ import {
 } from "../../../src/domain/ids.js";
 import {
   repositorySchema,
+  repositoryViewSchema,
   type Repository,
 } from "../../../src/domain/repository.js";
 
@@ -156,6 +157,23 @@ describe("EvidenceService", () => {
     expect(remote.getReadme).not.toHaveBeenCalled();
     expect(Object.isFrozen(result)).toBe(true);
     expect(result.every(Object.isFrozen)).toBe(true);
+  });
+
+  it("accepts RepositoryView subtypes supplied by snapshot queries", async () => {
+    const remote = github();
+    const view = repositoryViewSchema.parse({
+      ...repository("1"),
+      starredAt: "2026-07-17T00:00:00.000Z",
+    });
+
+    const result = await new EvidenceService(remote.port, 1).fetch(
+      [view],
+      "summary",
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0]?.repositoryId).toBe("R_1");
+    expect(remote.getReadme).not.toHaveBeenCalled();
   });
 
   it("returns README provenance, preserves malicious prose, and reports missing values", async () => {

@@ -8,7 +8,11 @@ import { canonicalJsonClone } from "../../domain/canonical-json.js";
 import { AppError } from "../../domain/errors.js";
 import type { RepositoryId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
-import { repositorySchema, type Repository } from "../../domain/repository.js";
+import {
+  repositorySchema,
+  repositoryViewSchema,
+  type Repository,
+} from "../../domain/repository.js";
 
 export type EvidenceRecord = Readonly<{
   repositoryId: RepositoryId;
@@ -76,7 +80,15 @@ function exactKeys(
 
 function frozenRepository(input: unknown): Repository {
   try {
-    const parsed = repositorySchema.parse(input);
+    const view = repositoryViewSchema.safeParse(input);
+    let parsed: Repository;
+    if (view.success) {
+      const { starredAt, ...repository } = view.data;
+      void starredAt;
+      parsed = repository;
+    } else {
+      parsed = repositorySchema.parse(input);
+    }
     return Object.freeze({
       ...parsed,
       topics: Object.freeze([...parsed.topics]),
