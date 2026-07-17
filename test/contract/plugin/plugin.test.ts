@@ -873,6 +873,116 @@ describe("Codex plugin package", () => {
     });
   });
 
+  it.each([
+    ["SQLite state", "dist/state/github-stars.sqlite"],
+    ["root dotenv", "dist/.env"],
+    ["nested dotenv variant", "dist/config/local/.env.production.local"],
+    ["SQLite3 database", "dist/storage/github-stars.sqlite3"],
+    ["DB database", "dist/storage/github-stars.db"],
+    ["database extension", "dist/storage/github-stars.database"],
+    ["SQLite WAL", "dist/storage/github-stars.sqlite-wal"],
+    ["SQLite SHM", "dist/storage/github-stars.sqlite-shm"],
+    ["DB WAL", "dist/storage/github-stars.db-wal"],
+    ["DB SHM", "dist/storage/github-stars.db-shm"],
+    ["credential material", "dist/config/credentials.json"],
+    ["token material", "dist/config/token.txt"],
+    ["secret material", "dist/config/secret.yaml"],
+    ["private key material", "dist/config/private-key.pem"],
+    ["auth material", "dist/config/auth.json"],
+    ["cookie material", "dist/config/cookie.txt"],
+    ["session material", "dist/config/session.dat"],
+    ["npm credentials", "dist/.npmrc"],
+    ["npm debug log", "dist/npm-debug.log"],
+    ["debug log", "dist/logs/debug.log"],
+    ["cache directory", "dist/.cache/output.js"],
+    ["temporary directory", "dist/tmp/output.js"],
+    ["temp directory", "dist/temp/output.js"],
+    ["case-varied state", "dist/StAtE/GITHUB-STARS.SQLITE"],
+  ])("rejects %s inside an allowed npm pack prefix", async (_name, path) => {
+    await withPluginFixture(async (root) => {
+      const npmEntry = await fakeNpmPackCommand(root, [
+        ...PACKED_PLUGIN_PATHS,
+        path,
+      ]);
+
+      const result = runFixtureValidator(root, {
+        staticOnly: false,
+        env: { npm_execpath: npmEntry, PATH: "" },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PACKAGE_DRY_RUN_SENSITIVE_PATH");
+    });
+  });
+
+  it.each([
+    [
+      "fine-grained GitHub token",
+      "dist/generated/value-one.js",
+      'export const value = "github_pat_AAAAAAAAAAAAAAAAAAAA";\n',
+    ],
+    [
+      "classic GitHub token",
+      "dist/generated/value-two.js",
+      'export const value = "ghp_AAAAAAAAAAAAAAAAAAAA";\n',
+    ],
+    [
+      "bearer authorization",
+      "dist/generated/value-three.js",
+      'export const value = "Authorization: Bearer not-a-placeholder";\n',
+    ],
+    [
+      "PEM private key",
+      "dist/generated/value-four.js",
+      "-----BEGIN PRIVATE KEY-----\nnot-a-placeholder\n-----END PRIVATE KEY-----\n",
+    ],
+  ])(
+    "rejects locally readable packed content containing %s",
+    async (_name, path, contents) => {
+      await withPluginFixture(async (root) => {
+        await mkdir(resolve(root, path, ".."), { recursive: true });
+        await writeFile(join(root, path), contents, "utf8");
+        const npmEntry = await fakeNpmPackCommand(root, [
+          ...PACKED_PLUGIN_PATHS,
+          path,
+        ]);
+
+        const result = runFixtureValidator(root, {
+          staticOnly: false,
+          env: { npm_execpath: npmEntry, PATH: "" },
+        });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("PACKAGE_DRY_RUN_SENSITIVE_CONTENT");
+      });
+    },
+  );
+
+  it("accepts legitimate compiled runtime artifacts and package metadata", async () => {
+    await withPluginFixture(async (root) => {
+      const paths = [
+        "dist/auth/credential-provider.js",
+        "dist/storage/runtime-secret-repository.d.ts",
+        "dist/storage/sqlite-database.js.map",
+        "dist/storage/state-directory.js",
+        "dist/package.json",
+      ];
+      for (const path of paths) {
+        await mkdir(resolve(root, path, ".."), { recursive: true });
+        await writeFile(join(root, path), "{}\n", "utf8");
+      }
+      const npmEntry = await fakeNpmPackCommand(root, [
+        ...PACKED_PLUGIN_PATHS,
+        ...paths,
+      ]);
+
+      const result = runFixtureValidator(root, {
+        staticOnly: false,
+        env: { npm_execpath: npmEntry, PATH: "" },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+    });
+  });
+
   it("isolates every Codex home and XDG directory", async () => {
     await withPluginFixture(async (root) => {
       const fake = await fakeCodexCommand(root);

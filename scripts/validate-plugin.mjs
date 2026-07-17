@@ -50,6 +50,62 @@ const EXPECTED_PACKAGE_FILES = Object.freeze([
   "README.md",
   "LICENSE",
 ]);
+const LOCAL_STATE_COMPONENTS = new Set([
+  ".cache",
+  ".cookies",
+  ".credentials",
+  ".logs",
+  ".secrets",
+  ".sessions",
+  ".state",
+  ".temp",
+  ".tmp",
+  "cache",
+  "cookies",
+  "credentials",
+  "logs",
+  "secrets",
+  "sessions",
+  "state",
+  "temp",
+  "tmp",
+  "tokens",
+]);
+const SENSITIVE_MATERIAL_TOKENS = new Set([
+  "auth",
+  "authentication",
+  "cookie",
+  "cookies",
+  "credential",
+  "credentials",
+  "secret",
+  "secrets",
+  "session",
+  "sessions",
+  "token",
+  "tokens",
+]);
+const SENSITIVE_MATERIAL_EXTENSIONS = new Set([
+  ".bin",
+  ".conf",
+  ".config",
+  ".dat",
+  ".ini",
+  ".json",
+  ".toml",
+  ".txt",
+  ".xml",
+  ".yaml",
+  ".yml",
+]);
+const PRIVATE_KEY_EXTENSIONS = new Set([
+  ".jks",
+  ".key",
+  ".keystore",
+  ".p12",
+  ".pem",
+  ".pfx",
+]);
 const MANIFEST_KEYS = new Set([
   "author",
   "description",
@@ -686,6 +742,73 @@ function parseExternalJson(source, code) {
   }
 }
 
+function sensitivePackedPath(path) {
+  const segments = path.toLowerCase().split("/");
+  const filename = segments.at(-1);
+  assert(typeof filename === "string", "PACKAGE_DRY_RUN_FILE_PATH");
+  if (
+    segments
+      .slice(0, -1)
+      .some((component) => LOCAL_STATE_COMPONENTS.has(component))
+  ) {
+    return true;
+  }
+  if (
+    filename === ".env" ||
+    filename.startsWith(".env.") ||
+    filename === ".npmrc" ||
+    filename.endsWith(".log") ||
+    /\.(?:sqlite3?|db3?|database)(?:-(?:wal|shm))?$/u.test(filename) ||
+    /\.(?:bak|swp|temp|tmp)$/u.test(filename)
+  ) {
+    return true;
+  }
+
+  const extension = extname(filename);
+  if (PRIVATE_KEY_EXTENSIONS.has(extension)) return true;
+  if (!SENSITIVE_MATERIAL_EXTENSIONS.has(extension)) return false;
+  const stem = filename.slice(0, -extension.length);
+  const tokens = stem.split(/[._-]+/u);
+  return (
+    tokens.some((token) => SENSITIVE_MATERIAL_TOKENS.has(token)) ||
+    /(?:^|[._-])private[._-]?key(?:$|[._-])/u.test(stem)
+  );
+}
+
+function containsCredentialMaterial(contents) {
+  const source = contents.toString("utf8");
+  return (
+    /github_pat_[A-Za-z0-9_]{4,}/u.test(source) ||
+    /gh[pousr]_[A-Za-z0-9_]{4,}/u.test(source) ||
+    /authorization\s*:\s*bearer\s+\S+/iu.test(source) ||
+    /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/u.test(source)
+  );
+}
+
+async function readPackedFileIfPresent(path) {
+  const target = resolve(REPOSITORY_ROOT, ...path.split("/"));
+  try {
+    await lstat(target);
+  } catch (error) {
+    if (
+      error !== null &&
+      typeof error === "object" &&
+      "code" in error &&
+      error.code === "ENOENT"
+    ) {
+      return null;
+    }
+    fail("PACKAGE_DRY_RUN_FILE_READ");
+  }
+  const result = await assertRepositoryPath(target, "PACKAGE_DRY_RUN_FILE");
+  assert(result.metadata.isFile(), "PACKAGE_DRY_RUN_FILE_KIND");
+  try {
+    return await readFile(target);
+  } catch {
+    fail("PACKAGE_DRY_RUN_FILE_READ");
+  }
+}
+
 function runExternal(command, arguments_, options, code) {
   const result = spawnSync(command, arguments_, {
     cwd: options.cwd,
@@ -748,6 +871,16 @@ async function validatePackageDryRun(staticOnly) {
       }),
     "PACKAGE_DRY_RUN_CONTENTS",
   );
+  for (const path of paths) {
+    assert(!sensitivePackedPath(path), "PACKAGE_DRY_RUN_SENSITIVE_PATH");
+    const contents = await readPackedFileIfPresent(path);
+    if (contents !== null) {
+      assert(
+        !containsCredentialMaterial(contents),
+        "PACKAGE_DRY_RUN_SENSITIVE_CONTENT",
+      );
+    }
+  }
   for (const expected of [
     "plugins/github-stars-mcp/.codex-plugin/plugin.json",
     "plugins/github-stars-mcp/.mcp.json",
