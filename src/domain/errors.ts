@@ -1,7 +1,7 @@
 import type { JsonValue } from "./json.js";
 import { redactSecrets } from "./redaction.js";
 
-export const APP_ERROR_CODES = [
+export const APP_ERROR_CODES = Object.freeze([
   "AUTH_REQUIRED",
   "INSUFFICIENT_PERMISSION",
   "CAPABILITY_UNAVAILABLE",
@@ -20,9 +20,13 @@ export const APP_ERROR_CODES = [
   "RECONCILIATION_REQUIRED",
   "STORAGE_ERROR",
   "INTERNAL_ERROR",
-] as const;
+] as const);
 
 export type AppErrorCode = (typeof APP_ERROR_CODES)[number];
+
+const APP_ERROR_CODE_LOOKUP = Object.freeze(
+  Object.fromEntries(APP_ERROR_CODES.map((code) => [code, true] as const)),
+) as Readonly<Record<AppErrorCode, true>>;
 
 interface AppErrorOptions {
   readonly retryable?: boolean;
@@ -57,7 +61,7 @@ export class AppError extends Error {
     this.secrets = Object.freeze([...(options.secrets ?? [])]);
     Object.defineProperty(this, "secrets", {
       configurable: false,
-      enumerable: true,
+      enumerable: false,
       writable: false,
     });
 
@@ -69,11 +73,15 @@ export class AppError extends Error {
       });
     }
   }
+
+  toJSON(): SerializedDomainError {
+    return serializeError(this);
+  }
 }
 
 function isAppErrorCode(value: unknown): value is AppErrorCode {
   return (
-    typeof value === "string" && APP_ERROR_CODES.some((code) => code === value)
+    typeof value === "string" && Object.hasOwn(APP_ERROR_CODE_LOOKUP, value)
   );
 }
 

@@ -35,6 +35,26 @@ describe("domain errors and redaction", () => {
     expect(APP_ERROR_CODES).toHaveLength(18);
   });
 
+  test("freezes exported codes and rejects caller-injected error codes", () => {
+    const unsafeCode = "CALLER_DEFINED_ERROR";
+    const mutableCodes = APP_ERROR_CODES as unknown as string[];
+    let expanded = false;
+    try {
+      mutableCodes.push(unsafeCode);
+      expanded = true;
+    } catch {
+      // A frozen public contract rejects the unsafe mutation.
+    }
+
+    const error = new AppError("AUTH_REQUIRED", "safe message");
+    Object.defineProperty(error, "code", { value: unsafeCode });
+    const serialized = serializeError(error);
+    if (expanded) mutableCodes.pop();
+
+    expect(Object.isFrozen(APP_ERROR_CODES)).toBe(true);
+    expect(serialized.code).toBe("INTERNAL_ERROR");
+  });
+
   test("stores AppError metadata and serializes only its safe public fields", () => {
     const arbitrarySecret = "not-pattern-matched-secret-value";
     const cause = new Error(arbitrarySecret);
@@ -68,6 +88,30 @@ describe("domain errors and redaction", () => {
     });
     expect(serialized).not.toHaveProperty("cause");
     expect(serialized).not.toHaveProperty("stack");
+  });
+
+  test("makes direct AppError JSON serialization use the redacted public shape", () => {
+    const arbitrarySecret = "direct-json-secret";
+    const error = new AppError(
+      "AUTH_REQUIRED",
+      `bad credential ${arbitrarySecret}`,
+      {
+        details: {
+          authorization: `Bearer ${arbitrarySecret}`,
+          subprocess: { stdout: arbitrarySecret },
+        },
+        secrets: [arbitrarySecret],
+        cause: new Error(arbitrarySecret),
+      },
+    );
+
+    const json = JSON.stringify(error);
+
+    expect(json).not.toContain(arbitrarySecret);
+    expect(JSON.parse(json) as unknown).toEqual(serializeError(error));
+    expect(Object.getOwnPropertyDescriptor(error, "secrets")).toMatchObject({
+      enumerable: false,
+    });
   });
 
   test("recursively redacts registered secrets and secret-bearing fields without invoking getters", () => {
@@ -166,6 +210,44 @@ describe("domain errors and redaction", () => {
     });
   });
 
+  test("returns dense JSON-safe arrays without invoking sparse or accessor indices", () => {
+    const hiddenSecret = "hidden-array-secret";
+    let getterCalls = 0;
+    const hostileArray: unknown[] = ["visible"];
+    Object.defineProperty(hostileArray, "1", {
+      configurable: true,
+      enumerable: false,
+      value: hiddenSecret,
+    });
+    Object.defineProperty(hostileArray, "2", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return hiddenSecret;
+      },
+    });
+    hostileArray.length = 4;
+
+    const redacted = redactSecrets(hostileArray);
+
+    expect(Array.isArray(redacted)).toBe(true);
+    if (!Array.isArray(redacted)) {
+      throw new TypeError("redacted array must remain an array");
+    }
+    expect(redacted).toEqual([
+      "visible",
+      "[Unsupported array item]",
+      "[Unsupported array item]",
+      "[Unsupported array item]",
+    ]);
+    expect(
+      Array.from({ length: 4 }, (_, index) => Object.hasOwn(redacted, index)),
+    ).toEqual([true, true, true, true]);
+    expect(getterCalls).toBe(0);
+    expect(JSON.stringify(redacted)).not.toContain(hiddenSecret);
+  });
+
   test("fails closed when a registered-secret list cannot be inspected", () => {
     const arbitrarySecret = "credential-secret";
     const hostileSecrets = new Proxy([arbitrarySecret], {
@@ -177,6 +259,61 @@ describe("domain errors and redaction", () => {
     expect(redactSecrets(`leaked ${arbitrarySecret}`, hostileSecrets)).toBe(
       "[REDACTED]",
     );
+  });
+
+  test("reads non-enumerable registered secret indices", () => {
+    const arbitrarySecret = "non-enumerable-secret";
+    const secrets: string[] = [];
+    Object.defineProperty(secrets, "0", {
+      configurable: true,
+      enumerable: false,
+      value: arbitrarySecret,
+      writable: true,
+    });
+
+    expect(redactSecrets(`leaked ${arbitrarySecret}`, secrets)).toBe(
+      "leaked [REDACTED]",
+    );
+  });
+
+  test("fails closed for malformed registered secret arrays without invoking accessors", () => {
+    const arbitrarySecret = "registry-secret";
+    let getterCalls = 0;
+    const holey = new Array<string>(1);
+    const accessor: string[] = [];
+    Object.defineProperty(accessor, "0", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return arbitrarySecret;
+      },
+    });
+    const malformedIndex = [arbitrarySecret];
+    Object.defineProperty(malformedIndex, "01", {
+      configurable: true,
+      enumerable: false,
+      value: "malformed-index-secret",
+    });
+    const nonString = [arbitrarySecret, 42] as unknown as string[];
+    const descriptorFailure = new Proxy([arbitrarySecret], {
+      getOwnPropertyDescriptor: () => {
+        throw new Error("descriptor inspection failed");
+      },
+    });
+
+    for (const secrets of [
+      holey,
+      accessor,
+      malformedIndex,
+      nonString,
+      descriptorFailure,
+    ]) {
+      expect(redactSecrets(`leaked ${arbitrarySecret}`, secrets)).toBe(
+        "[REDACTED]",
+      );
+    }
+    expect(getterCalls).toBe(0);
   });
 
   test("maps unknown hostile errors to a generic internal error without reading them", () => {

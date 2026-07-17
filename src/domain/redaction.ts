@@ -3,6 +3,7 @@ import type { JsonValue } from "./json.js";
 const REDACTED = "[REDACTED]";
 const TRUNCATED = "[Truncated]";
 const CIRCULAR = "[Circular]";
+const UNSUPPORTED_ARRAY_ITEM = "[Unsupported array item]";
 const MAX_DEPTH = 20;
 const SENSITIVE_KEYS = new Set([
   "authorization",
@@ -17,21 +18,44 @@ function registeredSecrets(
 ): readonly string[] | undefined {
   let descriptors: Record<string, PropertyDescriptor>;
   try {
+    if (!Array.isArray(secrets)) return undefined;
     descriptors = Object.getOwnPropertyDescriptors(secrets);
   } catch {
     return undefined;
   }
 
+  const lengthDescriptor = descriptors.length;
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    typeof lengthDescriptor.value !== "number" ||
+    !Number.isInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) {
+    return undefined;
+  }
+
+  const length = lengthDescriptor.value;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") return undefined;
+    if (key === "length") continue;
+    if (!/^(?:0|[1-9]\d*)$/u.test(key)) return undefined;
+    const index = Number(key);
+    if (!Number.isSafeInteger(index) || index >= length) return undefined;
+  }
+
   const unique = new Set<string>();
-  for (const descriptor of Object.values(descriptors)) {
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
     if (
-      descriptor.enumerable === true &&
+      descriptor !== undefined &&
       "value" in descriptor &&
-      typeof descriptor.value === "string" &&
-      descriptor.value.length > 0
+      typeof descriptor.value === "string"
     ) {
-      unique.add(descriptor.value);
+      if (descriptor.value.length > 0) unique.add(descriptor.value);
+      continue;
     }
+    return undefined;
   }
   return [...unique].sort((left, right) => right.length - left.length);
 }
@@ -66,35 +90,32 @@ function redactArray(
   ancestors: WeakSet<object>,
 ): JsonValue {
   const descriptors = dataDescriptors(value);
-  if (descriptors === undefined) return "[Unsupported array]";
-
-  const result: JsonValue[] = [];
+  if (descriptors === undefined) return [UNSUPPORTED_ARRAY_ITEM];
   const lengthDescriptor = descriptors.length;
   if (
-    lengthDescriptor !== undefined &&
-    "value" in lengthDescriptor &&
-    typeof lengthDescriptor.value === "number"
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    typeof lengthDescriptor.value !== "number" ||
+    !Number.isInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
   ) {
-    result.length = lengthDescriptor.value;
+    return [UNSUPPORTED_ARRAY_ITEM];
   }
 
+  const result: JsonValue[] = [];
   ancestors.add(value);
   try {
-    for (const [key, descriptor] of Object.entries(descriptors)) {
+    for (let index = 0; index < lengthDescriptor.value; index += 1) {
+      const descriptor = descriptors[String(index)];
       if (
-        key === "length" ||
+        descriptor === undefined ||
         descriptor.enumerable !== true ||
-        !("value" in descriptor) ||
-        !/^(?:0|[1-9]\d*)$/u.test(key)
+        !("value" in descriptor)
       ) {
+        result.push(UNSUPPORTED_ARRAY_ITEM);
         continue;
       }
-      result[Number(key)] = redactValue(
-        descriptor.value,
-        secrets,
-        depth + 1,
-        ancestors,
-      );
+      result.push(redactValue(descriptor.value, secrets, depth + 1, ancestors));
     }
   } finally {
     ancestors.delete(value);
