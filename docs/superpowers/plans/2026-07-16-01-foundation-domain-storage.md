@@ -328,7 +328,8 @@ git commit -m "feat: add safe errors and configuration"
 ### Task 4: Implement recursive filters, stable cursors, and safe SQL
 
 **Files:**
-- Create: `src/domain/filter.ts`, `src/domain/cursor.ts`, `src/storage/filter-sql.ts`
+- Create: `src/domain/timestamp.ts`, `src/domain/filter.ts`, `src/domain/cursor.ts`, `src/storage/filter-sql.ts`
+- Modify: `src/domain/repository.ts`, `test/unit/domain/records.test.ts`, `test/fixtures/domain.ts`
 - Create: `test/unit/domain/filter.test.ts`
 
 **Interfaces:**
@@ -339,7 +340,7 @@ git commit -m "feat: add safe errors and configuration"
 
 ```ts
 import { expect, test } from "vitest";
-import { decodeRepositoryCursor, encodeRepositoryCursor } from "../../../src/domain/cursor.js";
+import { createCursorCodec } from "../../../src/domain/cursor.js";
 import { matchesFilter, parseFilter } from "../../../src/domain/filter.js";
 import { compileFilter } from "../../../src/storage/filter-sql.js";
 import { repositoryViewFixture } from "../../fixtures/domain.js";
@@ -363,15 +364,20 @@ test("evaluates filters while parameterizing caller text", () => {
   )).toEqual({field:"pushed_at",op:"before",value:"2023-07-16T00:00:00.000Z"});
   const sql = compileFilter(parseFilter({ field: "owner", op: "eq", value: "x' OR 1=1 --" }));
   expect(sql.sql).not.toContain("OR 1=1"); expect(sql.params).toEqual(["x' OR 1=1 --"]);
-  const cursor = encodeRepositoryCursor({
+  const cursors = createCursorCodec(new Uint8Array(32).fill(7));
+  const context = {
     kind:"repositories",snapshotId:"snap_1",filterHash:"f".repeat(64),
-    sortHash:"s".repeat(64),values:[12,null],nulls:[false,true],repositoryId:"R_9",
+    sort:[{field:"stargazer_count",direction:"desc"},{field:"pushed_at",direction:"asc"}],
+  } as const;
+  const cursor = cursors.encodeRepository(context, {
+    values:[12,null,"openai/sdk"],nulls:[false,true,false],repositoryId:"R_9",
   });
-  expect(decodeRepositoryCursor(cursor, {
-    kind:"repositories",snapshotId:"snap_1",filterHash:"f".repeat(64),sortHash:"s".repeat(64),
-  })).toMatchObject({values:[12,null],nulls:[false,true],repositoryId:"R_9"});
-  expect(() => decodeRepositoryCursor(cursor, {
-    kind:"repositories",snapshotId:"snap_2",filterHash:"f".repeat(64),sortHash:"s".repeat(64),
+  expect(cursors.decodeRepository(cursor, context)).toMatchObject({
+    values:[12,null,"openai/sdk"],nulls:[false,true,false],repositoryId:"R_9",
+  });
+  expect(() => cursors.decodeRepository(cursor, {
+    ...context,
+    snapshotId:"snap_2",
   })).toThrow(/cursor.*snapshot/iu);
 });
 ```
@@ -406,16 +412,26 @@ temporal comparisons it also accepts
 and immediately resolves it, using the injected UTC `now`, to the absolute ISO
 timestamp present in the returned `FilterExpression`. Calendar months/years
 use UTC calendar arithmetic; all other units use exact duration arithmetic.
-No unresolved relative value reaches SQL or an executable plan.
+Any relative result outside years `0000..9999` is rejected. The shared
+`canonicalUtcTimestamp` accepts only a valid `YYYY-MM-DDTHH:mm:ss[.SSS]Z`
+value with zero through three fractional digits and returns exactly
+millisecond precision (`.SSSZ`); longer fractions, offsets, expanded years,
+invalid calendar dates, and non-canonical cursor timestamps are rejected.
+`repositorySchema` uses this same utility for `pushedAt` and `updatedAt`, and
+all adapters/storage records use it for Star/List/observation timestamps, so
+JavaScript evaluation and SQLite ordering cannot disagree. No unresolved
+relative value reaches SQL or an executable plan.
 `is_unclassified` means `listIds.length === 0`. Null checks are accepted only
 for nullable fields/collections and use a Boolean value. `normalizeSort`
-deduplicates then appends `full_name ASC` and internal `repository_id ASC`.
+descriptor-snapshots plain data-only terms exactly once, rejects accessors,
+symbols, sparse arrays, custom prototypes, and hostile proxies, deduplicates,
+then appends `full_name ASC` and internal `repository_id ASC`.
 
 ```ts
 export interface SqlFragment { readonly sql: string; readonly params: readonly (string|number)[] }
 export function compileFilter(filter: FilterExpression): SqlFragment;
 export function compileOrder(sort: readonly RepositorySort[]): string;
-export function compileCursor(sort: readonly RepositorySort[], cursor: string|null): SqlFragment;
+export function compileCursor(sort: readonly RepositorySort[], cursor: ValidatedRepositoryCursorPayload|null): SqlFragment;
 ```
 
 Map fields only to fixed columns. Topics use `EXISTS (SELECT 1 FROM
@@ -425,16 +441,28 @@ m.repository_id=ss.repository_id AND m.list_id=?)`. Unit tests run a
 table-driven evaluator/SQL equivalence case for every allowed field/operator
 pair, including nulls and `is_unclassified`.
 
-Repository cursors are max-4-KiB base64url canonical JSON with
-`{v:1,kind:"repositories",snapshotId,filterHash,sortHash,values,nulls,repositoryId}`.
+`createCursorCodec(signingKey)` defensively copies a caller-injected key of at
+least 32 bytes and returns repository/List encode and decode methods.
+Repository cursors are max-4-KiB base64url canonical JSON envelopes with
+`{mac,payload:{v:1,kind:"repositories",snapshotId,filterHash,sortHash,values,nulls,repositoryId}}`;
 List cursors use
-`{v:1,kind:"lists",snapshotId,selectionHash,values,listId}`. Decode requires
-the expected resource kind, snapshot, canonical filter/selection hash, and
-normalized sort hash; reuse across any boundary raises `VALIDATION_ERROR`.
+`{mac,payload:{v:1,kind:"lists",snapshotId,selectionHash,values,listId}}`.
+`mac` is lowercase-hex HMAC-SHA-256 over the canonical payload and is checked
+with constant-time comparison. Decode descriptor-snapshots data-only plain
+objects and dense arrays, rejects cycles/exotic prototypes/accessors/symbols
+and all malformed input as `VALIDATION_ERROR`, authenticates the envelope,
+and requires the expected resource kind, snapshot, canonical
+filter/selection hash, and normalized sort. It returns a runtime-branded,
+frozen `ValidatedRepositoryCursorPayload`; no sort-only/partial decoder is
+exported, and `compileCursor` accepts only that fully validated payload.
+Canonical re-encoding after changing any boundary, plus reuse across any
+context boundary, raises `VALIDATION_ERROR`.
 Every nullable sort uses explicit `NULLS LAST` semantics in both directions,
 encoded null markers, and a stable ID final key. Tests cover null/non-null
 boundaries, duplicate sort values, empty final pages, cursor tampering, and
-cross-snapshot/filter/sort/resource reuse.
+cross-snapshot/filter/sort/resource reuse. In-memory text comparison uses UTF-8
+byte ordering to match SQLite `BINARY`; cursor temporal values use the shared
+canonical UTC validator and stargazer values are nonnegative integers.
 
 - [ ] **Step 4: Verify behavior and SQL safety**
 Run `npm test -- test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect one pass, hostile text only in parameters, and clean static checks.
@@ -442,7 +470,7 @@ Run `npm test -- test/unit/domain/filter.test.ts && npm run typecheck && npm run
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/domain/filter.ts src/domain/cursor.ts src/storage/filter-sql.ts test/unit/domain/filter.test.ts test/fixtures/domain.ts
+git add src/domain/timestamp.ts src/domain/filter.ts src/domain/cursor.ts src/domain/repository.ts src/storage/filter-sql.ts test/unit/domain/filter.test.ts test/unit/domain/records.test.ts test/fixtures/domain.ts
 git commit -m "feat: add deterministic repository filters"
 ```
 
@@ -612,7 +640,8 @@ transactions snapshot Maps and restore on throw. Its tests prove
 attempts, and `retryRunOperation` changes only reconciled-unresolved or
 retryable-failed rows back to `pending` without changing attempts. Succeeded
 rows remain immutable. It exposes no raw SQL, generic query, `execute`, or
-async transaction.
+async transaction. Its query implementation owns a private injected cursor
+codec; the cursor signing key is never a `StoragePort` method or property.
 
 - [ ] **Step 4: Verify exact structural compliance**
 Run `npm test -- test/unit/ports/storage-port.test.ts && npm run typecheck && npm run lint`; expect one pass and exact fake-port structural compliance.
@@ -629,12 +658,13 @@ git commit -m "feat: define synchronous storage port"
 **Files:**
 - Create: `src/storage/migrations/001-initial.ts`, `src/storage/migrations.ts`
 - Create: `src/storage/sqlite-database.ts`, `src/storage/snapshot-repository.ts`, `src/storage/lease-repository.ts`
+- Create: `src/storage/runtime-secret-repository.ts`
 - Create: `src/storage/state-directory.ts`
 - Create: `test/integration/storage/snapshot.test.ts`
 
 **Interfaces:**
-- Consumes: snapshot/query/lease port contracts and `compileFilter`.
-- Produces: configured SQLite connection, atomic publication, stable query pages, owner-checked leases.
+- Consumes: snapshot/query/lease port contracts, `createCursorCodec`, and `compileFilter`.
+- Produces: configured SQLite connection, private persistent cursor key, atomic publication, authenticated stable query pages, owner-checked leases.
 
 - [ ] **Step 1: Write failing publication and lease tests**
 
@@ -682,6 +712,7 @@ Migration 001 creates:
 
 ```sql
 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
+CREATE TABLE runtime_secrets(name TEXT PRIMARY KEY,value BLOB NOT NULL CHECK(length(value)>=32),created_at TEXT NOT NULL);
 CREATE TABLE accounts(host TEXT NOT NULL,login TEXT NOT NULL,account_id TEXT NOT NULL,PRIMARY KEY(host,account_id),UNIQUE(host,login));
 CREATE TABLE repositories(repository_id TEXT PRIMARY KEY,repository_database_id TEXT NOT NULL UNIQUE,current_version_hash TEXT,observed_at TEXT NOT NULL);
 CREATE TABLE repository_versions(repository_id TEXT NOT NULL REFERENCES repositories(repository_id) ON DELETE CASCADE,version_hash TEXT NOT NULL,owner TEXT NOT NULL,name TEXT NOT NULL,full_name TEXT NOT NULL,description TEXT,url TEXT NOT NULL,stargazer_count INTEGER NOT NULL CHECK(stargazer_count>=0),is_fork INTEGER NOT NULL CHECK(is_fork IN(0,1)),is_archived INTEGER NOT NULL CHECK(is_archived IN(0,1)),is_disabled INTEGER NOT NULL CHECK(is_disabled IN(0,1)),is_private INTEGER NOT NULL CHECK(is_private IN(0,1)),visibility TEXT NOT NULL CHECK(visibility IN('public','private','internal')),primary_language TEXT,topics_json TEXT NOT NULL,license_spdx_id TEXT,pushed_at TEXT,updated_at TEXT NOT NULL,PRIMARY KEY(repository_id,version_hash));
@@ -700,6 +731,14 @@ CREATE TABLE leases(name TEXT PRIMARY KEY,owner_id TEXT NOT NULL,acquired_at TEX
 
 Add indexes for complete snapshot binding/time, snapshot repository pagination, and run sequence. `openSqliteDatabase` applies only the pragmas. `migrateSqliteDatabase(db, appliedAt)` applies pending migrations inside `BEGIN IMMEDIATE` and rejects schema newer than the binary.
 
+`RuntimeSecretRepository.getOrCreateCursorSigningKey(createdAt)` generates 32
+cryptographically random bytes, inserts them with `INSERT OR IGNORE` inside a
+`BEGIN IMMEDIATE` transaction, then returns a defensive copy of the single
+persisted value. Concurrent/reopened stores therefore share the same
+installation key and old cursors survive restart. `SQLiteStore` constructs the
+cursor codec internally after migration; no application/storage port exposes
+the key, and tests prove it never enters logs, audits, exports, or errors.
+
 `createSnapshot` upserts the bound account then inserts `building`.
 `appendSnapshotBatch` canonicalizes each remote Repository, hashes only its
 query-relevant GitHub metadata, inserts an immutable `repository_versions` row
@@ -711,8 +750,13 @@ ID. Every explicit/latest snapshot query joins `snapshot_stars` to
 the mutable current pointer. Thus a later sync cannot change an older
 snapshot's query results or plan hash. `getRepositoryMetadata` alone follows
 the current version and returns its local observation time for incremental
-reuse.
+reuse. Every incoming GitHub timestamp is canonicalized through the shared
+millisecond UTC utility before persistence.
 
+`queryRepositories` fully decodes/authenticates a cursor against the requested
+snapshot, normalized filter hash, and sort before passing the branded payload
+to `compileCursor`; it signs the next boundary with the same context.
+`queryLists` follows the same rule with one canonical fixed List selection.
 `completeSnapshot` verifies actual SQL counts match supplied counts and
 performs one guarded `building→complete` update. `failSnapshot` and startup
 recovery perform `building→failed`; failed/building snapshots never satisfy
@@ -742,12 +786,12 @@ pre-existing restrictive mode, and skip only the numeric-mode assertions on
 Windows.
 
 - [ ] **Step 4: Verify rollback, foreign keys, queries, and lease ownership**
-Run `npm test -- test/integration/storage/snapshot.test.ts test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect all pass, including orphan-FK rejection, mid-save rollback, and duplicate-free cursor pages.
+Run `npm test -- test/integration/storage/snapshot.test.ts test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect all pass, including orphan-FK rejection, mid-save rollback, duplicate-free cursor pages, authenticated-tamper rejection, and cursor continuity after database reopen.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/storage/migrations/001-initial.ts src/storage/migrations.ts src/storage/sqlite-database.ts src/storage/snapshot-repository.ts src/storage/lease-repository.ts src/storage/state-directory.ts test/integration/storage/snapshot.test.ts
+git add src/storage/migrations/001-initial.ts src/storage/migrations.ts src/storage/sqlite-database.ts src/storage/snapshot-repository.ts src/storage/lease-repository.ts src/storage/runtime-secret-repository.ts src/storage/state-directory.ts test/integration/storage/snapshot.test.ts
 git commit -m "feat: persist complete snapshots and leases"
 ```
 

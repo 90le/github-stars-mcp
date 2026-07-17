@@ -160,7 +160,7 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 - **QUERY-01:** The server shall query an explicit snapshot or the latest complete snapshot.
 - **QUERY-02:** Filters shall use a validated expression tree with `all`, `any`, and `not` groups.
 - **QUERY-03:** Supported comparisons shall include equality, inequality, set membership, substring, numeric range, timestamp before/after, null checks, and Boolean values.
-- **QUERY-04:** Query results shall support stable sorts, cursor pagination, a maximum page size, totals, and aggregate counts.
+- **QUERY-04:** Query results shall support stable sorts, cursor pagination, a maximum page size, totals, and aggregate counts. Cursors shall be opaque, authenticated with an installation-local secret, bound to their resource, snapshot, normalized selection/filter, and normalized sort, and remain valid across process restarts. Any canonical re-encoding or boundary modification without a valid authenticator shall fail closed.
 - **QUERY-05:** The server shall distinguish `pushed_at` from `updated_at`. Rules about code inactivity shall use `pushed_at` unless the caller names another field.
 - **QUERY-06:** The server shall support List membership, language, topic, owner, fork, archive, visibility, star count, license, and age filters.
 - **QUERY-07:** An evidence request may fetch a bounded number of README files for AI review.
@@ -494,6 +494,7 @@ SQLite will use foreign keys, WAL mode, prepared statements, and explicit transa
 ### 13.1 Tables
 
 - `schema_migrations`: applied migration version and checksum.
+- `runtime_secrets`: installation-local non-exportable secrets such as the cursor HMAC key; never GitHub credentials.
 - `leases`: named local-process leases with owner, heartbeat, and expiry.
 - `accounts`: GitHub host, login, and stable account identifiers.
 - `snapshots`: lifecycle, timestamps, counts, and source rate-limit data.
@@ -609,6 +610,7 @@ Production tool inputs shall not accept an API base URL, arbitrary hostname, red
 - Logs shall redact common GitHub token formats and authorization headers.
 - The server shall keep a resolved token in memory for the process lifetime or a shorter configured lifetime.
 - The SQLite schema shall contain no token column.
+- Cursor authentication shall use a randomly generated HMAC-SHA-256 key of at least 256 bits. The key shall be created atomically once, retained across restarts in the owner-only state database, copied defensively in memory, and never returned by an MCP tool, application port, log, audit record, export, or error.
 - Child-process errors shall discard stdout before they reach an MCP result.
 
 ### 15.3 Prompt injection and untrusted content
@@ -801,6 +803,7 @@ Source files shall stay focused. A module that mixes MCP schemas, GitHub calls, 
 - Filter parsing and evaluation.
 - UTC timestamp and relative-age resolution.
 - Stable sorting and cursors.
+- Cursor authentication, canonical tamper rejection, cross-context rejection, and restart continuity.
 - Plan resolution and protected targets.
 - Canonical serialization and hashing.
 - Plan and run state machines.
@@ -852,6 +855,7 @@ A maintainer-only live contract suite shall use a disposable GitHub account and 
 - Reject token-bearing redirects and production API host overrides.
 - Prove that repository deletion, archive, transfer, visibility, and contents methods do not exist in the GitHub port.
 - Redact tokens from nested errors and subprocess failures.
+- Reject canonically re-encoded cursor payloads with an invalid authenticator and prove the cursor key is absent from tools, logs, audit records, exports, and errors.
 - Treat README prompt-injection fixtures as inert data.
 - Reject plan account, host, hash, state, and expiry mismatches.
 - Verify protected IDs survive every selector form.

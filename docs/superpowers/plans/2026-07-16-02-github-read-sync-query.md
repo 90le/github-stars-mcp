@@ -60,6 +60,10 @@ export type ListMembership = Readonly<{ listId: UserListId; repositoryId: Reposi
 
 Plan 02 consumes `StoragePort` from `src/app/ports/storage-port.ts` with these locked methods: `acquireLease`, `renewLease`, `releaseLease`, `createSnapshot`, `appendSnapshotBatch`, `completeSnapshot`, `failSnapshot`, `getLatestCompleteSnapshot`, `getCompleteSnapshot`, `getRepositoryMetadata`, `queryRepositories`, `queryLists`, and `hasStar`. Plan 01 owns `SnapshotDraft`, `SnapshotBatch`, `SnapshotCounts`, `AcquireLeaseInput`, and all query types.
 
+All GitHub timestamps are normalized at the adapter boundary through Plan
+01's `canonicalUtcTimestamp` to exact `.SSSZ` UTC form before they enter Star,
+List, repository, rate-limit, or snapshot records.
+
 Plan 02 creates this read side; Plan 03 extends the same interface with named Star/List mutations:
 
 ```ts
@@ -430,8 +434,11 @@ GraphQL errors can never produce `available`; contract tests cover each case.
 `normalizeRestRepository` and `normalizeGraphqlRepository` are compile-time
 checked to return the exact Plan 01 `Repository`, including `isDisabled` and
 `isPrivate`; numeric IDs are stringified, visibility/topics normalized, and
-nullable `pushedAt`/license preserved. `normalizeUserList` includes nullable
-`lastAddedAt`. `StatusService.status` caches capabilities unless refresh is
+nullable `pushedAt`/license preserved. Every repository, Star, List, and
+rate-limit timestamp passes through `canonicalUtcTimestamp`, rejecting
+sub-millisecond precision, offsets, invalid dates, and expanded years before
+storage. `normalizeUserList` includes nullable `lastAddedAt`.
+`StatusService.status` caches capabilities unless refresh is
 requested and returns binding, credential source name, capabilities, latest
 complete snapshot, and rate-limit state without a token.
 
@@ -665,7 +672,7 @@ async query(input: StarsQueryInput): Promise<StarsQueryResult> {
 }
 ```
 
-`ListsQueryService.query` applies the same snapshot resolution and limit validation, then calls `queryLists({ snapshotId: snapshot.id, pageSize: input.limit, cursor: input.cursor })`. Plan 01 remains the only filter validation/evaluation/SQL, stable cursor, and aggregate implementation; `pushed_at` and `updated_at` stay distinct.
+`ListsQueryService.query` applies the same snapshot resolution and limit validation, then calls `queryLists({ snapshotId: snapshot.id, pageSize: input.limit, cursor: input.cursor })`. Plan 01 remains the only filter validation/evaluation/SQL, authenticated stable cursor, and aggregate implementation; cursor signing is internal to storage and never exposed by either service, while `pushed_at` and `updated_at` stay distinct.
 
 - [ ] **Step 4: Run query/domain/storage tests and typecheck**
 Run: `npm test -- test/unit/services/query-service.test.ts test/unit/domain/filter.test.ts test/integration/storage/snapshot.test.ts && npm run typecheck`
