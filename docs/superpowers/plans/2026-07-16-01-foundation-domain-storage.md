@@ -122,7 +122,7 @@ Run `npm shrinkwrap`; verify lockfile version 3, exact direct versions, and no
 non-official registry resolution URL.
 
 - [ ] **Step 4: Verify foundation behavior**
-Run `npm run format && npm run lint && npm run typecheck && npm test -- test/unit/project-setup.test.ts && npm run build && npm pack --dry-run`; expect all exit 0, one passing test, and no `src`, `test`, or `.env` in the tarball.
+Run `npm run format && npm run lint && npm run typecheck && npm test -- test/unit/project-setup.test.ts && npm run build && npm pack --dry-run`; expect all exit 0, three passing tests, and no `src`, `test`, or `.env` in the tarball.
 
 - [ ] **Step 5: Commit**
 
