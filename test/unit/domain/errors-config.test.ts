@@ -583,6 +583,88 @@ describe("domain errors and redaction", () => {
     });
   });
 
+  test("does not dispatch registered-secret replacement through String @@replace", () => {
+    const shortSecret = "registered-secret";
+    const longSecret = "registered-secret-long";
+    const replaceDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      Symbol.replace,
+    );
+    let replaceHookCalls = 0;
+    let redacted: ReturnType<typeof redactSecrets> | undefined;
+
+    try {
+      Object.defineProperty(String.prototype, Symbol.replace, {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          replaceHookCalls += 1;
+          return (): string => {
+            replaceHookCalls += 1;
+            return "poisoned replacement";
+          };
+        },
+      });
+      redacted = redactSecrets(`${longSecret}|${shortSecret}|${longSecret}`, [
+        shortSecret,
+        longSecret,
+      ]);
+    } finally {
+      if (replaceDescriptor === undefined) {
+        Reflect.deleteProperty(String.prototype, Symbol.replace);
+      } else {
+        Object.defineProperty(
+          String.prototype,
+          Symbol.replace,
+          replaceDescriptor,
+        );
+      }
+    }
+
+    expect(replaceHookCalls).toBe(0);
+    expect(redacted).toBe("[REDACTED]|[REDACTED]|[REDACTED]");
+  });
+
+  test("redacts repeated, overlapping, empty, and long-boundary registered secrets", () => {
+    const longPadding = "x".repeat(64 * 1_024);
+    const cases = [
+      {
+        label: "repeated",
+        value: "secret|secret|secret",
+        secrets: ["secret"],
+        expected: "[REDACTED]|[REDACTED]|[REDACTED]",
+      },
+      {
+        label: "non-overlapping match advancement",
+        value: "ababa",
+        secrets: ["aba"],
+        expected: "[REDACTED]ba",
+      },
+      {
+        label: "longest registered secret precedence",
+        value: "abcab bc",
+        secrets: ["bc", "abcab"],
+        expected: "[REDACTED] [REDACTED]",
+      },
+      {
+        label: "empty secret ignored",
+        value: "visible",
+        secrets: [""],
+        expected: "visible",
+      },
+      {
+        label: "long text boundaries",
+        value: `edge-secret${longPadding}edge-secret`,
+        secrets: ["edge-secret"],
+        expected: `[REDACTED]${longPadding}[REDACTED]`,
+      },
+    ] as const;
+
+    for (const { label, value, secrets, expected } of cases) {
+      expect(redactSecrets(value, secrets), label).toBe(expected);
+    }
+  });
+
   test("returns prototype-free records and JSON arrays that stringify without inherited hooks", () => {
     const secret = "prototype-free-output-secret";
     const objectInput = { nested: ["visible", secret] };

@@ -128,6 +128,10 @@ type AdapterPublicSurface = Pick<
   OctokitGitHubAdapter,
   keyof OctokitGitHubAdapter
 >;
+type AdapterStaticSurface = Omit<
+  typeof import("../../src/github/octokit-github-adapter.js").OctokitGitHubAdapter,
+  "prototype"
+>;
 
 export type GitHubPortAssignsToExpected = Assert<
   Assignable<GitHubPort, ExpectedGitHubPort>
@@ -152,4 +156,7 @@ export type AdapterHasExactKeys = Assert<
 >;
 export type AdapterHasExactSignatures = Assert<
   NoSignatureMismatch<AdapterPublicSurface, ExpectedGitHubPort>
+>;
+export type AdapterHasNoPublicStatics = Assert<
+  SameKeys<AdapterStaticSurface, Readonly<Record<never, never>>>
 >;

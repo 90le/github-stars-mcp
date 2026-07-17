@@ -28,7 +28,7 @@ const INTRINSICS = FREEZE({
   reflectSetPrototypeOf: Reflect.setPrototypeOf,
   stringCharCodeAt: String.prototype.charCodeAt,
   stringFromValue: String,
-  stringReplaceAll: String.prototype.replaceAll,
+  stringIndexOf: String.prototype.indexOf,
   stringSlice: String.prototype.slice,
   stringToLowerCase: String.prototype.toLowerCase,
   utilIsProxy: utilTypes.isProxy,
@@ -314,16 +314,38 @@ function redactCredentials(value: string): string {
   return output + suffix;
 }
 
+function redactRegisteredSecret(value: string, secret: string): string {
+  if (secret.length === 0) return value;
+
+  let output = "";
+  let copyStart = 0;
+  let searchStart = 0;
+  while (searchStart <= value.length) {
+    const match = INTRINSICS.reflectApply(INTRINSICS.stringIndexOf, value, [
+      secret,
+      searchStart,
+    ]);
+    if (match < 0) break;
+    output += INTRINSICS.reflectApply(INTRINSICS.stringSlice, value, [
+      copyStart,
+      match,
+    ]);
+    output += REDACTED;
+    searchStart = match + secret.length;
+    copyStart = searchStart;
+  }
+  if (copyStart === 0) return value;
+  return (
+    output + INTRINSICS.reflectApply(INTRINSICS.stringSlice, value, [copyStart])
+  );
+}
+
 function redactString(value: string, secrets: readonly string[]): string {
   let redacted = value;
   for (let index = 0; index < secrets.length; index += 1) {
     const secret = secrets[index];
     if (secret !== undefined) {
-      redacted = INTRINSICS.reflectApply(
-        INTRINSICS.stringReplaceAll,
-        redacted,
-        [secret, REDACTED],
-      ) as string;
+      redacted = redactRegisteredSecret(redacted, secret);
     }
   }
   return redactCredentials(redacted);

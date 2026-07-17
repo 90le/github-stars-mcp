@@ -59,7 +59,42 @@ const APPROVED_PORT_EXPORTS = Object.freeze(
 );
 
 const APPROVED_ADAPTER_EXPORTS = Object.freeze(["OctokitGitHubAdapter"]);
+const APPROVED_ADAPTER_STATIC_MEMBERS = Object.freeze([] as string[]);
+const APPROVED_PORT_ALIAS_EXPORTS = Object.freeze([
+  "AccountBinding",
+  "RepositoryCoordinates",
+]);
+const APPROVED_PORT_INTERFACE_EXPORTS = Object.freeze([
+  "GitHubDiscoveryReadPort",
+  "GitHubEvidenceReadPort",
+  "GitHubListReadPort",
+  "GitHubLiveReadPort",
+  "GitHubMutationPort",
+  "GitHubPort",
+  "GitHubStarReadPort",
+  "GitHubStatusReadPort",
+  "GitHubSyncReadPort",
+]);
+const APPROVED_PORT_TYPE_ALIAS_EXPORTS = Object.freeze([
+  "CapabilityState",
+  "CreateUserListInput",
+  "GitHubCapabilities",
+  "GitHubListItem",
+  "GitHubReadme",
+  "GitHubRepository",
+  "GitHubSearchInput",
+  "GitHubSearchPage",
+  "GitHubStar",
+  "GitHubUserList",
+  "MutationReceipt",
+  "Page",
+  "RateLimitState",
+  "RepositoryIdentity",
+  "UpdateUserListInput",
+  "UserListMutationResult",
+]);
 const UNRESOLVED_COMPUTED_MEMBER = "<computed-public-member>";
+const UNRESOLVED_COMPUTED_STATIC_MEMBER = "<computed-public-static-member>";
 const FORBIDDEN_PUBLIC_MEMBERS = new Set([
   "request",
   "graphql",
@@ -96,8 +131,11 @@ type BoundaryIssue =
   | "compiler-contract"
   | "port-module-exports"
   | "adapter-module-exports"
+  | "port-export-symbols"
+  | "adapter-export-symbols"
   | "port-public-members"
   | "adapter-public-members"
+  | "adapter-public-static-members"
   | "forbidden-public-member";
 
 type BoundaryProof = Readonly<{
@@ -105,9 +143,21 @@ type BoundaryProof = Readonly<{
   diagnostics: readonly ts.Diagnostic[];
   portExports: readonly string[];
   adapterExports: readonly string[];
+  portExportSymbolsValid: boolean;
+  adapterExportSymbolsValid: boolean;
   portMembers: readonly string[];
   adapterMembers: readonly string[];
+  adapterStaticMembers: readonly string[];
   forbiddenMembers: readonly string[];
+}>;
+
+type ExportSymbolShape = Readonly<{
+  flags: ts.SymbolFlags;
+  declarationKind: ts.SyntaxKind;
+  aliasedTarget?: Readonly<{
+    flags: ts.SymbolFlags;
+    declarationKind: ts.SyntaxKind;
+  }>;
 }>;
 
 type SourceOverrides = Readonly<Record<string, string>>;
@@ -233,6 +283,99 @@ function moduleExportNames(
   );
 }
 
+const ALIASED_INTERFACE_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
+  flags: ts.SymbolFlags.Alias,
+  declarationKind: ts.SyntaxKind.ExportSpecifier,
+  aliasedTarget: Object.freeze({
+    flags: ts.SymbolFlags.Interface,
+    declarationKind: ts.SyntaxKind.InterfaceDeclaration,
+  }),
+});
+const INTERFACE_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
+  flags: ts.SymbolFlags.Interface,
+  declarationKind: ts.SyntaxKind.InterfaceDeclaration,
+});
+const TYPE_ALIAS_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
+  flags: ts.SymbolFlags.TypeAlias,
+  declarationKind: ts.SyntaxKind.TypeAliasDeclaration,
+});
+const CLASS_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
+  flags: ts.SymbolFlags.Class,
+  declarationKind: ts.SyntaxKind.ClassDeclaration,
+});
+
+function expectedPortExportShape(
+  exportName: string,
+): ExportSymbolShape | undefined {
+  if (APPROVED_PORT_ALIAS_EXPORTS.some((name) => name === exportName)) {
+    return ALIASED_INTERFACE_EXPORT_SHAPE;
+  }
+  if (APPROVED_PORT_INTERFACE_EXPORTS.some((name) => name === exportName)) {
+    return INTERFACE_EXPORT_SHAPE;
+  }
+  if (APPROVED_PORT_TYPE_ALIAS_EXPORTS.some((name) => name === exportName)) {
+    return TYPE_ALIAS_EXPORT_SHAPE;
+  }
+  return undefined;
+}
+
+function expectedAdapterExportShape(
+  exportName: string,
+): ExportSymbolShape | undefined {
+  return exportName === "OctokitGitHubAdapter" ? CLASS_EXPORT_SHAPE : undefined;
+}
+
+function symbolHasExactDeclarationShape(
+  symbol: ts.Symbol,
+  flags: ts.SymbolFlags,
+  declarationKind: ts.SyntaxKind,
+): boolean {
+  const declarations = symbol.getDeclarations() ?? [];
+  return (
+    symbol.flags === flags &&
+    declarations.length === 1 &&
+    declarations[0]?.kind === declarationKind
+  );
+}
+
+function exportSymbolHasExactShape(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  shape: ExportSymbolShape,
+): boolean {
+  if (
+    !symbolHasExactDeclarationShape(symbol, shape.flags, shape.declarationKind)
+  ) {
+    return false;
+  }
+  if (shape.aliasedTarget === undefined) return true;
+  const target = checker.getAliasedSymbol(symbol);
+  return symbolHasExactDeclarationShape(
+    target,
+    shape.aliasedTarget.flags,
+    shape.aliasedTarget.declarationKind,
+  );
+}
+
+function moduleExportSymbolsHaveExactShapes(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  expectedNames: readonly string[],
+  expectedShape: (exportName: string) => ExportSymbolShape | undefined,
+): boolean {
+  const symbols = moduleExports(checker, sourceFile);
+  const names = symbols.map((symbol) => symbol.getName()).sort();
+  return (
+    sameNames(names, expectedNames) &&
+    symbols.every((symbol) => {
+      const shape = expectedShape(symbol.getName());
+      return (
+        shape !== undefined && exportSymbolHasExactShape(checker, symbol, shape)
+      );
+    })
+  );
+}
+
 function resolveAlias(checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol {
   let resolved = symbol;
   const seen = new Set<ts.Symbol>();
@@ -304,9 +447,9 @@ function publicTypeMemberNames(
   );
 }
 
-function adapterDeclarationMemberNames(
+function requiredAdapterDeclaration(
   sourceFile: ts.SourceFile,
-): readonly string[] {
+): ts.ClassDeclaration {
   const declaration = sourceFile.statements.find(
     (statement): statement is ts.ClassDeclaration =>
       ts.isClassDeclaration(statement) &&
@@ -315,6 +458,13 @@ function adapterDeclarationMemberNames(
   if (declaration === undefined) {
     throw new Error("OctokitGitHubAdapter declaration was not resolved");
   }
+  return declaration;
+}
+
+function adapterDeclarationMemberNames(
+  sourceFile: ts.SourceFile,
+): readonly string[] {
+  const declaration = requiredAdapterDeclaration(sourceFile);
   const names = new Set<string>();
   for (const member of declaration.members) {
     if (ts.isConstructorDeclaration(member)) {
@@ -347,6 +497,55 @@ function adapterPublicMemberNames(
       ...new Set([
         ...publicTypeMemberNames(checker, symbol),
         ...adapterDeclarationMemberNames(sourceFile),
+      ]),
+    ].sort(),
+  );
+}
+
+function adapterDeclarationStaticMemberNames(
+  sourceFile: ts.SourceFile,
+): readonly string[] {
+  const declaration = requiredAdapterDeclaration(sourceFile);
+  const names = new Set<string>();
+  for (const member of declaration.members) {
+    if (
+      ts.isConstructorDeclaration(member) ||
+      isPrivateOrProtected(member) ||
+      !hasModifier(member, ts.SyntaxKind.StaticKeyword)
+    ) {
+      continue;
+    }
+    const name = staticDeclarationName((member as ts.NamedDeclaration).name);
+    names.add(name ?? UNRESOLVED_COMPUTED_STATIC_MEMBER);
+  }
+  return Object.freeze([...names].sort());
+}
+
+function adapterPublicStaticMemberNames(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  sourceFile: ts.SourceFile,
+): readonly string[] {
+  const declaration = requiredAdapterDeclaration(sourceFile);
+  const staticType = checker.getTypeOfSymbolAtLocation(symbol, declaration);
+  const checkerNames = checker
+    .getPropertiesOfType(staticType)
+    .filter((property) => property.getName() !== "prototype")
+    .filter((property) => {
+      const declarations = property.getDeclarations() ?? [];
+      return (
+        declarations.length === 0 ||
+        declarations.some(
+          (propertyDeclaration) => !isPrivateOrProtected(propertyDeclaration),
+        )
+      );
+    })
+    .map((property) => property.getName());
+  return Object.freeze(
+    [
+      ...new Set([
+        ...checkerNames,
+        ...adapterDeclarationStaticMemberNames(sourceFile),
       ]),
     ].sort(),
   );
@@ -488,15 +687,32 @@ function proveProductionBoundary(
   const adapterSource = requiredSourceFile(program, GITHUB_ADAPTER_FILE);
   const portExports = moduleExportNames(checker, portSource);
   const adapterExports = moduleExportNames(checker, adapterSource);
+  const portExportSymbolsValid = moduleExportSymbolsHaveExactShapes(
+    checker,
+    portSource,
+    APPROVED_PORT_EXPORTS,
+    expectedPortExportShape,
+  );
+  const adapterExportSymbolsValid = moduleExportSymbolsHaveExactShapes(
+    checker,
+    adapterSource,
+    APPROVED_ADAPTER_EXPORTS,
+    expectedAdapterExportShape,
+  );
   const issues = new Set<BoundaryIssue>();
   if (!sameNames(portExports, APPROVED_PORT_EXPORTS)) {
     issues.add("port-module-exports");
+  } else if (!portExportSymbolsValid) {
+    issues.add("port-export-symbols");
   }
   if (!sameNames(adapterExports, APPROVED_ADAPTER_EXPORTS)) {
     issues.add("adapter-module-exports");
+  } else if (!adapterExportSymbolsValid) {
+    issues.add("adapter-export-symbols");
   }
   let portMembers: readonly string[] = Object.freeze([]);
   let adapterMembers: readonly string[] = Object.freeze([]);
+  let adapterStaticMembers: readonly string[] = Object.freeze([]);
   let forbiddenMembers: readonly string[] = Object.freeze([]);
   if (issues.size === 0) {
     portMembers = publicTypeMemberNames(
@@ -504,6 +720,11 @@ function proveProductionBoundary(
       requiredExport(checker, portSource, "GitHubPort"),
     );
     adapterMembers = adapterPublicMemberNames(
+      checker,
+      requiredExport(checker, adapterSource, "OctokitGitHubAdapter"),
+      adapterSource,
+    );
+    adapterStaticMembers = adapterPublicStaticMemberNames(
       checker,
       requiredExport(checker, adapterSource, "OctokitGitHubAdapter"),
       adapterSource,
@@ -522,6 +743,9 @@ function proveProductionBoundary(
     if (!sameNames(adapterMembers, APPROVED_GITHUB_CAPABILITIES)) {
       issues.add("adapter-public-members");
     }
+    if (!sameNames(adapterStaticMembers, APPROVED_ADAPTER_STATIC_MEMBERS)) {
+      issues.add("adapter-public-static-members");
+    }
     if (forbiddenMembers.length > 0) {
       issues.add("forbidden-public-member");
     }
@@ -538,8 +762,11 @@ function proveProductionBoundary(
     diagnostics: Object.freeze(diagnostics),
     portExports,
     adapterExports,
+    portExportSymbolsValid,
+    adapterExportSymbolsValid,
     portMembers,
     adapterMembers,
+    adapterStaticMembers,
     forbiddenMembers,
   });
 }
@@ -588,16 +815,22 @@ describe("GitHub capability boundary", () => {
       diagnosticCount: proof.diagnostics.length,
       portExports: proof.portExports,
       adapterExports: proof.adapterExports,
+      portExportSymbolsValid: proof.portExportSymbolsValid,
+      adapterExportSymbolsValid: proof.adapterExportSymbolsValid,
       portMembers: proof.portMembers,
       adapterMembers: proof.adapterMembers,
+      adapterStaticMembers: proof.adapterStaticMembers,
       forbiddenMembers: proof.forbiddenMembers,
     }).toEqual({
       issues: [],
       diagnosticCount: 0,
       portExports: APPROVED_PORT_EXPORTS,
       adapterExports: APPROVED_ADAPTER_EXPORTS,
+      portExportSymbolsValid: true,
+      adapterExportSymbolsValid: true,
       portMembers: APPROVED_GITHUB_CAPABILITIES,
       adapterMembers: APPROVED_GITHUB_CAPABILITIES,
+      adapterStaticMembers: APPROVED_ADAPTER_STATIC_MEMBERS,
       forbiddenMembers: [],
     });
   });
@@ -669,6 +902,34 @@ describe("GitHub capability boundary", () => {
     const proof = proveProductionBoundary(withAdapterSource(changed));
 
     expect(proof.issues).toContain("adapter-public-members");
+  });
+
+  it.each([
+    ["method", "  public static boundaryStatic(): void {}"],
+    [
+      "raw client property",
+      "  public static readonly client = { request(): void {} };",
+    ],
+  ])("rejects an extra public static adapter %s", (_label, member) => {
+    const proof = proveProductionBoundary(
+      withAdapterSource(withAdapterMembers(member)),
+      { forceCompiler: true },
+    );
+
+    expect(proof.issues).toContain("adapter-public-static-members");
+    expect(proof.issues).toContain("compiler-contract");
+    expect(diagnosticTouches(proof, CONTRACT_PROBE_FILE)).toBe(true);
+  });
+
+  it("rejects a namespace merge that preserves the GitHubPort export name", () => {
+    const changed = `${GITHUB_PORT_SOURCE}
+export namespace GitHubPort {
+  export const boundaryNamespaceValue = true;
+}
+`;
+    const proof = proveProductionBoundary(withPortSource(changed));
+
+    expect(proof.issues).toContain("port-export-symbols");
   });
 
   it.each([
@@ -789,6 +1050,8 @@ describe("GitHub capability boundary", () => {
   private request<T>(input: T): T { return input; }
   protected graphql<T>(input: T): T { return input; }
   private deleteRepository(): void {}
+  private static boundaryStatic(): void {}
+  protected static readonly client = { request(): void {} };
   #rawRequest(): void {}
 `)}
 // request(), graphql(), deleteRepository(), updateFile(), and rawRequest().
