@@ -834,16 +834,156 @@ async function validateGeneratedOutputManifest() {
   return expectedPaths;
 }
 
-function literalBearerValue(source) {
+function bearerWhitespace(character) {
   return (
-    /["'`][ \t\r\n]*bearer[ \t\r\n]+(?:[A-Za-z0-9._~+/-]|\\)/iu.test(source) ||
-    /(?:^|[\r\n]|[:=])[ \t\r\n]*bearer[ \t\r\n]+(?:[A-Za-z0-9._~+/-]|\\)/iu.test(
-      source,
-    ) ||
-    /(?:^|[\r\n])[ \t]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]+bearer[ \t]+(?:[A-Za-z0-9._~+/-]|\\)(?:[A-Za-z0-9._~+/-]*={0,2})?[ \t]*(?=$|[\r\n])/iu.test(
-      source,
-    )
+    character === " " ||
+    character === "\t" ||
+    character === "\r" ||
+    character === "\n"
   );
+}
+
+function skipBearerWhitespace(source, start, horizontalOnly = false) {
+  let index = start;
+  while (
+    source[index] === " " ||
+    source[index] === "\t" ||
+    (!horizontalOnly && (source[index] === "\r" || source[index] === "\n"))
+  ) {
+    index += 1;
+  }
+  return index;
+}
+
+function bearerTokenCharacter(character) {
+  if (typeof character !== "string" || character.length !== 1) return false;
+  return /[A-Za-z0-9._~+/-]/u.test(character);
+}
+
+function escapedBearerTokenCharacterLength(source, start) {
+  if (source[start] !== "\\") return 0;
+  const marker = source[start + 1];
+  const digits = marker === "u" ? 4 : marker === "x" ? 2 : 0;
+  if (digits === 0) return 0;
+  const encoded = source.slice(start + 2, start + 2 + digits);
+  if (encoded.length !== digits || !/^[0-9A-Fa-f]+$/u.test(encoded)) {
+    return 0;
+  }
+  const decoded = String.fromCodePoint(Number.parseInt(encoded, 16));
+  return bearerTokenCharacter(decoded) ? digits + 2 : 0;
+}
+
+function bearerTokenCharacterLength(source, start) {
+  return bearerTokenCharacter(source[start])
+    ? 1
+    : escapedBearerTokenCharacterLength(source, start);
+}
+
+function completeBearerCredentialAt(source, start) {
+  let index = skipBearerWhitespace(source, start);
+  if (source.slice(index, index + 6).toLowerCase() !== "bearer") return false;
+  index += 6;
+  if (!bearerWhitespace(source[index])) return false;
+  index = skipBearerWhitespace(source, index);
+
+  let tokenLength = bearerTokenCharacterLength(source, index);
+  if (tokenLength === 0) return false;
+  while (tokenLength > 0) {
+    index += tokenLength;
+    tokenLength = bearerTokenCharacterLength(source, index);
+  }
+  while (source[index] === "=") index += 1;
+
+  const boundary = source[index];
+  return (
+    boundary === undefined ||
+    bearerWhitespace(boundary) ||
+    "\"'`,;)}]#".includes(boundary) ||
+    (boundary === "\\" && "\"'`".includes(source[index + 1] ?? ""))
+  );
+}
+
+function quoteCharacter(character) {
+  return character === '"' || character === "'" || character === "`";
+}
+
+function quotedLiteralEnd(source, start) {
+  const quote = source[start];
+  for (let index = start + 1; index < source.length; index++) {
+    if (source[index] === "\\") {
+      index += 1;
+      continue;
+    }
+    if (source[index] === quote) return index;
+  }
+  return source.length;
+}
+
+function readConfigKey(source, start) {
+  const quote = source[start];
+  if (quoteCharacter(quote)) {
+    const end = quotedLiteralEnd(source, start);
+    if (end === source.length) return null;
+    return { key: source.slice(start + 1, end), end: end + 1 };
+  }
+  const match = /^[A-Za-z_][A-Za-z0-9_.-]*/u.exec(source.slice(start));
+  return match === null
+    ? null
+    : { key: match[0], end: start + match[0].length };
+}
+
+function bearerConfigKey(key) {
+  const normalized = key.toLowerCase();
+  return normalized === "authorization" || normalized === "token";
+}
+
+function configValueContainsBearer(source, start) {
+  let index = skipBearerWhitespace(source, start, true);
+  if (quoteCharacter(source[index])) index += 1;
+  return completeBearerCredentialAt(source, index);
+}
+
+function configLineContainsBearer(line) {
+  let index = skipBearerWhitespace(line, 0, true);
+  if (
+    line[index] === "-" &&
+    (line[index + 1] === " " || line[index + 1] === "\t")
+  ) {
+    return configValueContainsBearer(line, index + 1);
+  }
+
+  const key = readConfigKey(line, index);
+  if (key === null || !bearerConfigKey(key.key)) return false;
+  const valueSeparator = skipBearerWhitespace(line, key.end, true);
+  if (line[valueSeparator] === ":" || line[valueSeparator] === "=") {
+    return configValueContainsBearer(line, valueSeparator + 1);
+  }
+  if (valueSeparator > key.end) {
+    return configValueContainsBearer(line, valueSeparator);
+  }
+  return false;
+}
+
+function quotedContentContainsBearer(source) {
+  for (let index = 0; index < source.length; index++) {
+    if (!quoteCharacter(source[index])) continue;
+    if (completeBearerCredentialAt(source, index + 1)) return true;
+    const lineEnd = source.indexOf("\n", index + 1);
+    const contents = source.slice(
+      index + 1,
+      lineEnd === -1 ? source.length : lineEnd,
+    );
+    if (configLineContainsBearer(contents)) return true;
+  }
+  return false;
+}
+
+function literalBearerValue(source) {
+  for (const rawLine of source.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    if (configLineContainsBearer(line)) return true;
+  }
+  return quotedContentContainsBearer(source);
 }
 
 function containsCredentialMaterial(contents) {

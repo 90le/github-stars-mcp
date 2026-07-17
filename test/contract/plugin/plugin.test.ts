@@ -532,6 +532,12 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
   ],
   ["unquoted env with a short alphabetic value", "Ab", "TOKEN =   BeArEr Ab"],
   ["unquoted YAML with a one-character value", "Q", "token:\tBEARER Q"],
+  ["YAML sequence value", "Ab", "- Bearer Ab"],
+  [
+    "whitespace-separated config with a trailing comment",
+    "Ab",
+    "authorization Bearer Ab # local value",
+  ],
   [
     "Headers.set with a short alphabetic value",
     "Alpha",
@@ -1365,8 +1371,16 @@ describe("Codex plugin package", () => {
       "const redaction = /Bearer\\s+[A-Za-z0-9._~+/-]{4,}/giu;\n",
     ],
     [
+      "the product regex in a string literal",
+      'const pattern = "Bearer \\\\s+[A-Za-z0-9]+";\n',
+    ],
+    [
       "prose without a token-shaped value",
       "The client supports Bearer token-based authentication.\n",
+    ],
+    [
+      "prose after a colon",
+      "Authentication schemes: Bearer token-based authentication is supported.\n",
     ],
     [
       "quoted prose where Bearer occurs later",
