@@ -1,3 +1,9 @@
+import { asUserListId } from "../../src/domain/ids.js";
+import {
+  repositorySchema,
+  type RepositoryView,
+} from "../../src/domain/repository.js";
+
 export const repositoryInputFixture = {
   repositoryId: "R_1",
   repositoryDatabaseId: "42",
@@ -18,3 +24,9 @@ export const repositoryInputFixture = {
   pushedAt: "2026-07-16T00:00:00Z",
   updatedAt: "2026-07-16T01:00:00Z",
 } as const;
+
+export const repositoryViewFixture: RepositoryView = {
+  ...repositorySchema.parse(repositoryInputFixture),
+  starredAt: "2026-07-15T12:00:00Z",
+  listIds: [asUserListId("UL_1")],
+};
