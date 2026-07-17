@@ -1,3 +1,4 @@
+import { types as utilTypes } from "node:util";
 import type { StoragePort } from "../ports/storage-port.js";
 import {
   canonicalJsonClone,
@@ -20,16 +21,49 @@ import { redactSecrets } from "../../domain/redaction.js";
 import {
   parseChangeRun,
   parseRunOperation,
+  parseRunOperationAttempt,
+  parseRunOperationReconciliation,
   type ChangeRun,
   type RunOperation,
+  type RunOperationAttempt,
+  type RunOperationReconciliation,
 } from "../../domain/run.js";
 
-export type InspectInput = Readonly<{
-  kind: "plan" | "run";
+export type PlanInspectInput = Readonly<{
+  kind: "plan";
   id: string;
   limit?: number;
   cursor?: string | null;
 }>;
+
+export type RunInspectInput = Readonly<{
+  kind: "run";
+  id: string;
+  limit?: number;
+  cursor?: string | null;
+}>;
+
+export type AttemptsInspectInput = Readonly<{
+  kind: "attempts";
+  id: RunId;
+  operationId: string;
+  limit?: number;
+  cursor?: string | null;
+}>;
+
+export type ReconciliationsInspectInput = Readonly<{
+  kind: "reconciliations";
+  id: RunId;
+  operationId: string;
+  limit?: number;
+  cursor?: string | null;
+}>;
+
+export type InspectInput =
+  | PlanInspectInput
+  | RunInspectInput
+  | AttemptsInspectInput
+  | ReconciliationsInspectInput;
 
 export type PlanInspectionMetadata = Readonly<{
   id: PlanId;
@@ -70,29 +104,84 @@ export type RunInspectResult = Readonly<{
   nextCursor: string | null;
 }>;
 
-export type InspectResult = PlanInspectResult | RunInspectResult;
+export type AttemptsInspectResult = Readonly<{
+  kind: "attempts";
+  run: ChangeRun;
+  operationId: string;
+  attempts: readonly RunOperationAttempt[];
+  total: number;
+  nextCursor: string | null;
+}>;
+
+export type ReconciliationsInspectResult = Readonly<{
+  kind: "reconciliations";
+  run: ChangeRun;
+  operationId: string;
+  reconciliations: readonly RunOperationReconciliation[];
+  total: number;
+  nextCursor: string | null;
+}>;
+
+export type InspectResult =
+  | PlanInspectResult
+  | RunInspectResult
+  | AttemptsInspectResult
+  | ReconciliationsInspectResult;
 
 export type InspectStoragePort = Pick<
   StoragePort,
-  "getPlan" | "getRun" | "listRunOperationsPage"
+  | "getPlan"
+  | "getRun"
+  | "listRunOperationsPage"
+  | "listRunOperationAttemptsPage"
+  | "listRunOperationReconciliationsPage"
 >;
 
 type InspectKind = InspectInput["kind"];
 
-type ParsedInput = Readonly<{
-  kind: InspectKind;
-  id: string;
-  targetId: PlanId | RunId;
-  limit: number;
-  cursor: CursorPayload | null;
-}>;
-
-type CursorPayload = Readonly<{
+type SequenceCursor = Readonly<{
   version: 1;
-  kind: InspectKind;
+  kind: "plan" | "run";
   targetId: string;
   afterSequence: number;
 }>;
+
+type AttemptCursor = Readonly<{
+  version: 1;
+  kind: "attempts";
+  runId: string;
+  operationId: string;
+  afterAttempt: number;
+}>;
+
+type ReconciliationCursor = Readonly<{
+  version: 1;
+  kind: "reconciliations";
+  runId: string;
+  operationId: string;
+  afterEventSequence: number;
+}>;
+
+type CursorPayload = SequenceCursor | AttemptCursor | ReconciliationCursor;
+
+type ParsedPlanRunInput = Readonly<{
+  kind: "plan" | "run";
+  id: string;
+  targetId: PlanId | RunId;
+  limit: number;
+  cursor: SequenceCursor | null;
+}>;
+
+type ParsedHistoryInput = Readonly<{
+  kind: "attempts" | "reconciliations";
+  id: string;
+  targetId: RunId;
+  operationId: string;
+  limit: number;
+  cursor: AttemptCursor | ReconciliationCursor | null;
+}>;
+
+type ParsedInput = ParsedPlanRunInput | ParsedHistoryInput;
 
 type JsonObject = Readonly<Record<string, JsonValue>>;
 
@@ -100,9 +189,45 @@ const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 const MAX_ID_LENGTH = 128;
 const MAX_CURSOR_LENGTH = 4_096;
-const INPUT_KEYS = new Set(["kind", "id", "limit", "cursor"]);
-const CURSOR_KEYS = new Set(["version", "kind", "targetId", "afterSequence"]);
+const PLAN_RUN_INPUT_KEYS = new Set(["kind", "id", "limit", "cursor"]);
+const HISTORY_INPUT_KEYS = new Set([
+  "kind",
+  "id",
+  "operationId",
+  "limit",
+  "cursor",
+]);
+const SEQUENCE_CURSOR_KEYS = new Set([
+  "version",
+  "kind",
+  "targetId",
+  "afterSequence",
+]);
+const ATTEMPT_CURSOR_KEYS = new Set([
+  "version",
+  "kind",
+  "runId",
+  "operationId",
+  "afterAttempt",
+]);
+const RECONCILIATION_CURSOR_KEYS = new Set([
+  "version",
+  "kind",
+  "runId",
+  "operationId",
+  "afterEventSequence",
+]);
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
+
+const ARRAY_IS_ARRAY = Array.isArray;
+const ARRAY_PROTOTYPE = Array.prototype;
+const OBJECT_PROTOTYPE = Object.prototype;
+const GET_OWN_PROPERTY_DESCRIPTORS = Object.getOwnPropertyDescriptors;
+const GET_OWN_PROPERTY_DESCRIPTOR = Object.getOwnPropertyDescriptor;
+const HAS_OWN = Object.hasOwn;
+const REFLECT_GET_PROTOTYPE_OF = Reflect.getPrototypeOf;
+const REFLECT_OWN_KEYS = Reflect.ownKeys;
+const IS_PROXY = utilTypes.isProxy;
 
 function validation(message: string): never {
   throw new AppError("VALIDATION_ERROR", message, { retryable: false });
@@ -154,6 +279,18 @@ function boundedId(value: JsonValue, kind: InspectKind): PlanId | RunId {
   return kind === "plan" ? asPlanId(value) : asRunId(value);
 }
 
+function boundedOperationId(value: JsonValue): string {
+  if (
+    typeof value !== "string" ||
+    value.length < 1 ||
+    value.length > MAX_ID_LENGTH ||
+    value.trim() !== value
+  ) {
+    return validation("Inspection operation ID is invalid");
+  }
+  return value;
+}
+
 function boundedLimit(value: JsonValue | undefined): number {
   if (value === undefined) return DEFAULT_LIMIT;
   if (
@@ -165,6 +302,19 @@ function boundedLimit(value: JsonValue | undefined): number {
     return validation("Inspection limit must be an integer from 1 to 100");
   }
   return value;
+}
+
+function nonnegativeBoundary(value: JsonValue | undefined): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function boundedCursorText(value: JsonValue | undefined): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_ID_LENGTH &&
+    value.trim() === value
+  );
 }
 
 function decodeCursor(value: string): CursorPayload {
@@ -194,33 +344,82 @@ function decodeCursor(value: string): CursorPayload {
     return validation("Inspection cursor is invalid");
   }
 
-  const cloned = canonicalJsonClone(parsed);
-  if (
-    !isJsonObject(cloned) ||
-    !exactKeys(cloned, CURSOR_KEYS, [
-      "version",
-      "kind",
-      "targetId",
-      "afterSequence",
-    ]) ||
-    cloned.version !== 1 ||
-    (cloned.kind !== "plan" && cloned.kind !== "run") ||
-    typeof cloned.targetId !== "string" ||
-    cloned.targetId.length < 1 ||
-    cloned.targetId.length > MAX_ID_LENGTH ||
-    cloned.targetId.trim() !== cloned.targetId ||
-    typeof cloned.afterSequence !== "number" ||
-    !Number.isSafeInteger(cloned.afterSequence) ||
-    cloned.afterSequence < 0
-  ) {
+  let cloned: JsonValue;
+  try {
+    cloned = canonicalJsonClone(parsed);
+  } catch {
     return validation("Inspection cursor is invalid");
   }
-  return Object.freeze({
-    version: 1,
-    kind: cloned.kind,
-    targetId: cloned.targetId,
-    afterSequence: cloned.afterSequence,
-  });
+  if (!isJsonObject(cloned) || cloned.version !== 1) {
+    return validation("Inspection cursor is invalid");
+  }
+  if (cloned.kind === "plan" || cloned.kind === "run") {
+    if (
+      !exactKeys(cloned, SEQUENCE_CURSOR_KEYS, [
+        "version",
+        "kind",
+        "targetId",
+        "afterSequence",
+      ]) ||
+      !boundedCursorText(cloned.targetId) ||
+      !nonnegativeBoundary(cloned.afterSequence)
+    ) {
+      return validation("Inspection cursor is invalid");
+    }
+    return Object.freeze({
+      version: 1,
+      kind: cloned.kind,
+      targetId: cloned.targetId,
+      afterSequence: cloned.afterSequence,
+    });
+  }
+  if (cloned.kind === "attempts") {
+    if (
+      !exactKeys(cloned, ATTEMPT_CURSOR_KEYS, [
+        "version",
+        "kind",
+        "runId",
+        "operationId",
+        "afterAttempt",
+      ]) ||
+      !boundedCursorText(cloned.runId) ||
+      !boundedCursorText(cloned.operationId) ||
+      !nonnegativeBoundary(cloned.afterAttempt)
+    ) {
+      return validation("Inspection cursor is invalid");
+    }
+    return Object.freeze({
+      version: 1,
+      kind: "attempts",
+      runId: cloned.runId,
+      operationId: cloned.operationId,
+      afterAttempt: cloned.afterAttempt,
+    });
+  }
+  if (cloned.kind === "reconciliations") {
+    if (
+      !exactKeys(cloned, RECONCILIATION_CURSOR_KEYS, [
+        "version",
+        "kind",
+        "runId",
+        "operationId",
+        "afterEventSequence",
+      ]) ||
+      !boundedCursorText(cloned.runId) ||
+      !boundedCursorText(cloned.operationId) ||
+      !nonnegativeBoundary(cloned.afterEventSequence)
+    ) {
+      return validation("Inspection cursor is invalid");
+    }
+    return Object.freeze({
+      version: 1,
+      kind: "reconciliations",
+      runId: cloned.runId,
+      operationId: cloned.operationId,
+      afterEventSequence: cloned.afterEventSequence,
+    });
+  }
+  return validation("Inspection cursor is invalid");
 }
 
 function parseInput(input: InspectInput): ParsedInput {
@@ -232,13 +431,14 @@ function parseInput(input: InspectInput): ParsedInput {
   }
   if (
     !isJsonObject(cloned) ||
-    !exactKeys(cloned, INPUT_KEYS, ["kind", "id"]) ||
-    (cloned.kind !== "plan" && cloned.kind !== "run")
+    (cloned.kind !== "plan" &&
+      cloned.kind !== "run" &&
+      cloned.kind !== "attempts" &&
+      cloned.kind !== "reconciliations")
   ) {
     return validation("Inspection input is invalid");
   }
 
-  const targetId = boundedId(cloned.id as JsonValue, cloned.kind);
   const rawCursor = cloned.cursor;
   if (
     rawCursor !== undefined &&
@@ -248,9 +448,39 @@ function parseInput(input: InspectInput): ParsedInput {
     return validation("Inspection cursor is invalid");
   }
   const cursor = typeof rawCursor === "string" ? decodeCursor(rawCursor) : null;
+  if (cloned.kind === "plan" || cloned.kind === "run") {
+    if (!exactKeys(cloned, PLAN_RUN_INPUT_KEYS, ["kind", "id"])) {
+      return validation("Inspection input is invalid");
+    }
+    const targetId = boundedId(cloned.id as JsonValue, cloned.kind);
+    if (
+      cursor !== null &&
+      (cursor.kind !== cloned.kind ||
+        !("targetId" in cursor) ||
+        cursor.targetId !== String(targetId))
+    ) {
+      return validation("Inspection cursor does not match its target");
+    }
+    return Object.freeze({
+      kind: cloned.kind,
+      id: String(targetId),
+      targetId,
+      limit: boundedLimit(cloned.limit),
+      cursor,
+    });
+  }
+
+  if (!exactKeys(cloned, HISTORY_INPUT_KEYS, ["kind", "id", "operationId"])) {
+    return validation("Inspection input is invalid");
+  }
+  const targetId = boundedId(cloned.id as JsonValue, cloned.kind) as RunId;
+  const operationId = boundedOperationId(cloned.operationId as JsonValue);
   if (
     cursor !== null &&
-    (cursor.kind !== cloned.kind || cursor.targetId !== String(targetId))
+    (cursor.kind !== cloned.kind ||
+      !("runId" in cursor) ||
+      cursor.runId !== String(targetId) ||
+      cursor.operationId !== operationId)
   ) {
     return validation("Inspection cursor does not match its target");
   }
@@ -258,6 +488,7 @@ function parseInput(input: InspectInput): ParsedInput {
     kind: cloned.kind,
     id: String(targetId),
     targetId,
+    operationId,
     limit: boundedLimit(cloned.limit),
     cursor,
   });
@@ -267,8 +498,8 @@ function encodeCursor(payload: CursorPayload): string {
   return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
 }
 
-function nextCursor(
-  kind: InspectKind,
+function sequenceCursor(
+  kind: "plan" | "run",
   targetId: string,
   afterSequence: number | null,
 ): string | null {
@@ -282,6 +513,262 @@ function nextCursor(
           afterSequence,
         }),
       );
+}
+
+function attemptCursor(
+  runId: string,
+  operationId: string,
+  afterAttempt: number | null,
+): string | null {
+  return afterAttempt === null
+    ? null
+    : encodeCursor(
+        Object.freeze({
+          version: 1,
+          kind: "attempts",
+          runId,
+          operationId,
+          afterAttempt,
+        }),
+      );
+}
+
+function reconciliationCursor(
+  runId: string,
+  operationId: string,
+  afterEventSequence: number | null,
+): string | null {
+  return afterEventSequence === null
+    ? null
+    : encodeCursor(
+        Object.freeze({
+          version: 1,
+          kind: "reconciliations",
+          runId,
+          operationId,
+          afterEventSequence,
+        }),
+      );
+}
+
+function dataRecord(
+  value: unknown,
+  expectedKeys: readonly string[],
+): ReadonlyMap<string, unknown> | null {
+  try {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      IS_PROXY(value) ||
+      ARRAY_IS_ARRAY(value)
+    ) {
+      return null;
+    }
+    const prototype = REFLECT_GET_PROTOTYPE_OF(value);
+    if (prototype !== OBJECT_PROTOTYPE && prototype !== null) return null;
+    const descriptors = GET_OWN_PROPERTY_DESCRIPTORS(value);
+    const keys = REFLECT_OWN_KEYS(descriptors);
+    if (
+      keys.length !== expectedKeys.length ||
+      keys.some((key) => typeof key !== "string" || !expectedKeys.includes(key))
+    ) {
+      return null;
+    }
+    const values = new Map<string, unknown>();
+    for (const key of expectedKeys) {
+      const descriptor = descriptors[key];
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !HAS_OWN(descriptor, "value")
+      ) {
+        return null;
+      }
+      values.set(key, descriptor.value as unknown);
+    }
+    return values;
+  } catch {
+    return null;
+  }
+}
+
+function denseDataArray(
+  value: unknown,
+  maximum: number,
+): readonly unknown[] | null {
+  try {
+    if (
+      value === null ||
+      typeof value !== "object" ||
+      IS_PROXY(value) ||
+      !ARRAY_IS_ARRAY(value) ||
+      REFLECT_GET_PROTOTYPE_OF(value) !== ARRAY_PROTOTYPE
+    ) {
+      return null;
+    }
+    const lengthDescriptor = GET_OWN_PROPERTY_DESCRIPTOR(value, "length");
+    if (
+      lengthDescriptor === undefined ||
+      !HAS_OWN(lengthDescriptor, "value") ||
+      typeof lengthDescriptor.value !== "number" ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0 ||
+      lengthDescriptor.value > maximum
+    ) {
+      return null;
+    }
+    const length = lengthDescriptor.value;
+    const keys = REFLECT_OWN_KEYS(value);
+    if (
+      keys.length !== length + 1 ||
+      keys.some((key) => typeof key !== "string")
+    ) {
+      return null;
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = GET_OWN_PROPERTY_DESCRIPTOR(value, String(index));
+      if (
+        descriptor === undefined ||
+        descriptor.enumerable !== true ||
+        !HAS_OWN(descriptor, "value")
+      ) {
+        return null;
+      }
+      result[index] = descriptor.value as unknown;
+    }
+    return Object.freeze(result);
+  } catch {
+    return null;
+  }
+}
+
+function exactAppErrorCode(error: unknown): string | null {
+  try {
+    if (
+      error === null ||
+      typeof error !== "object" ||
+      IS_PROXY(error) ||
+      REFLECT_GET_PROTOTYPE_OF(error) !== AppError.prototype
+    ) {
+      return null;
+    }
+    const descriptor = GET_OWN_PROPERTY_DESCRIPTOR(error, "code");
+    return descriptor !== undefined &&
+      HAS_OWN(descriptor, "value") &&
+      typeof descriptor.value === "string"
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function invokeStoragePage<T>(action: () => T, cursorProvided: boolean): T {
+  try {
+    return action();
+  } catch (error) {
+    if (cursorProvided && exactAppErrorCode(error) === "VALIDATION_ERROR") {
+      return validation("Inspection cursor sequence exceeds its target");
+    }
+    return storageFailure();
+  }
+}
+
+type ValidatedPage<T> = Readonly<{
+  items: readonly T[];
+  total: number;
+  nextBoundary: number | null;
+}>;
+
+function validatedPage<T>(
+  rawPage: unknown,
+  input: Readonly<{
+    nextKey: "nextSequence" | "nextAttempt" | "nextEventSequence";
+    limit: number;
+    firstBoundary: 0 | 1;
+    afterBoundary: number | null;
+    cursorProvided: boolean;
+    parseItem: (value: unknown) => T;
+    itemBoundary: (item: T) => number;
+    itemMatchesTarget: (item: T) => boolean;
+  }>,
+): ValidatedPage<T> {
+  const record = dataRecord(rawPage, ["items", "total", input.nextKey]);
+  if (record === null) return storageFailure();
+  const rawItems = denseDataArray(record.get("items"), input.limit);
+  const total = record.get("total");
+  const nextBoundary = record.get(input.nextKey);
+  if (
+    rawItems === null ||
+    typeof total !== "number" ||
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    (nextBoundary !== null &&
+      (typeof nextBoundary !== "number" ||
+        !Number.isSafeInteger(nextBoundary) ||
+        nextBoundary < input.firstBoundary))
+  ) {
+    return storageFailure();
+  }
+
+  const consumedBefore =
+    input.afterBoundary === null
+      ? 0
+      : input.afterBoundary - input.firstBoundary + 1;
+  if (input.cursorProvided && (total === 0 || consumedBefore > total)) {
+    return validation("Inspection cursor sequence exceeds its target");
+  }
+  if (consumedBefore < 0 || consumedBefore > total) {
+    return storageFailure();
+  }
+  const expectedItemCount = Math.min(input.limit, total - consumedBefore);
+  if (rawItems.length !== expectedItemCount) return storageFailure();
+
+  let clonedItems: readonly JsonValue[];
+  try {
+    const clonedPage = canonicalJsonClone(rawPage);
+    if (
+      !isJsonObject(clonedPage) ||
+      !ARRAY_IS_ARRAY(clonedPage.items) ||
+      clonedPage.items.length !== rawItems.length
+    ) {
+      return storageFailure();
+    }
+    clonedItems = clonedPage.items;
+  } catch {
+    return storageFailure();
+  }
+
+  const items: T[] = [];
+  for (let index = 0; index < clonedItems.length; index += 1) {
+    let item: T;
+    try {
+      item = input.parseItem(clonedItems[index]);
+    } catch {
+      return storageFailure();
+    }
+    const expectedBoundary = input.firstBoundary + consumedBefore + index;
+    if (
+      input.itemBoundary(item) !== expectedBoundary ||
+      !input.itemMatchesTarget(item)
+    ) {
+      return storageFailure();
+    }
+    items.push(item);
+  }
+
+  const consumed = consumedBefore + items.length;
+  const hasMore = consumed < total;
+  const last = items.at(-1);
+  const expectedNext =
+    hasMore && last !== undefined ? input.itemBoundary(last) : null;
+  if (nextBoundary !== expectedNext) return storageFailure();
+  return Object.freeze({
+    items: Object.freeze(items),
+    total,
+    nextBoundary,
+  });
 }
 
 function sanitizedResult<T extends InspectResult>(value: T): T {
@@ -315,25 +802,63 @@ export class InspectService {
     this.#storage = storage;
   }
 
+  inspect(input: PlanInspectInput): Promise<PlanInspectResult>;
+  inspect(input: RunInspectInput): Promise<RunInspectResult>;
+  inspect(input: AttemptsInspectInput): Promise<AttemptsInspectResult>;
+  inspect(
+    input: ReconciliationsInspectInput,
+  ): Promise<ReconciliationsInspectResult>;
+  inspect(input: InspectInput): Promise<InspectResult>;
   inspect(input: InspectInput): Promise<InspectResult> {
     return Promise.resolve().then(() => {
       const parsed = parseInput(input);
-      return parsed.kind === "plan"
-        ? this.#inspectPlan(parsed)
-        : this.#inspectRun(parsed);
+      switch (parsed.kind) {
+        case "plan":
+          return this.#inspectPlan(parsed);
+        case "run":
+          return this.#inspectRun(parsed);
+        case "attempts":
+          return this.#inspectAttempts(parsed);
+        case "reconciliations":
+          return this.#inspectReconciliations(parsed);
+      }
     });
   }
 
-  #inspectPlan(input: ParsedInput): PlanInspectResult {
-    let plan: ChangePlan;
+  #loadPlan(id: PlanId): ChangePlan {
+    let stored: ReturnType<InspectStoragePort["getPlan"]>;
     try {
-      const stored = this.#storage.getPlan(input.targetId as PlanId);
-      if (stored === null) return notFound();
-      plan = parseChangePlan(stored);
-    } catch (error) {
-      if (error instanceof AppError && error.code === "NOT_FOUND") throw error;
+      stored = this.#storage.getPlan(id);
+    } catch {
       return storageFailure();
     }
+    if (stored === null) return notFound();
+    try {
+      const plan = parseChangePlan(stored);
+      return plan.id === id ? plan : storageFailure();
+    } catch {
+      return storageFailure();
+    }
+  }
+
+  #loadRun(id: RunId): ChangeRun {
+    let stored: ReturnType<InspectStoragePort["getRun"]>;
+    try {
+      stored = this.#storage.getRun(id);
+    } catch {
+      return storageFailure();
+    }
+    if (stored === null) return notFound();
+    try {
+      const run = parseChangeRun(stored);
+      return run.id === id ? run : storageFailure();
+    } catch {
+      return storageFailure();
+    }
+  }
+
+  #inspectPlan(input: ParsedPlanRunInput): PlanInspectResult {
+    const plan = this.#loadPlan(input.targetId as PlanId);
 
     const afterSequence = input.cursor?.afterSequence ?? 0;
     if (
@@ -361,7 +886,7 @@ export class InspectService {
         plan: planMetadata(plan),
         operations,
         total: plan.operations.length,
-        nextCursor: nextCursor(
+        nextCursor: sequenceCursor(
           "plan",
           input.id,
           consumed < plan.operations.length ? consumed : null,
@@ -370,59 +895,123 @@ export class InspectService {
     );
   }
 
-  #inspectRun(input: ParsedInput): RunInspectResult {
-    let run: ChangeRun;
-    try {
-      const stored = this.#storage.getRun(input.targetId as RunId);
-      if (stored === null) return notFound();
-      run = parseChangeRun(stored);
-    } catch (error) {
-      if (error instanceof AppError && error.code === "NOT_FOUND") throw error;
-      return storageFailure();
-    }
-
-    let page: ReturnType<InspectStoragePort["listRunOperationsPage"]>;
-    try {
-      page = this.#storage.listRunOperationsPage({
-        runId: run.id,
-        afterSequence: input.cursor?.afterSequence ?? null,
-        pageSize: input.limit,
-      });
-    } catch {
-      return storageFailure();
-    }
-    const lastSequence = page.total - 1;
-    if (
-      input.cursor !== null &&
-      (page.total === 0 || input.cursor.afterSequence > lastSequence)
-    ) {
-      return validation("Inspection cursor sequence exceeds its target");
-    }
-
-    let operations: readonly RunOperation[];
-    try {
-      operations = Object.freeze(page.items.map(parseRunOperation));
-    } catch {
-      return storageFailure();
-    }
-    if (
-      !Number.isSafeInteger(page.total) ||
-      page.total < 0 ||
-      (page.nextSequence !== null &&
-        (!Number.isSafeInteger(page.nextSequence) ||
-          page.nextSequence < 0 ||
-          page.nextSequence >= page.total))
-    ) {
-      return storageFailure();
-    }
+  #inspectRun(input: ParsedPlanRunInput): RunInspectResult {
+    const run = this.#loadRun(input.targetId as RunId);
+    const afterSequence = input.cursor?.afterSequence ?? null;
+    const rawPage = invokeStoragePage(
+      () =>
+        this.#storage.listRunOperationsPage({
+          runId: run.id,
+          afterSequence,
+          pageSize: input.limit,
+        }),
+      input.cursor !== null,
+    );
+    const page = validatedPage(rawPage, {
+      nextKey: "nextSequence",
+      limit: input.limit,
+      firstBoundary: 0,
+      afterBoundary: afterSequence,
+      cursorProvided: input.cursor !== null,
+      parseItem: parseRunOperation,
+      itemBoundary: (operation) => operation.sequence,
+      itemMatchesTarget: (operation) => operation.runId === run.id,
+    });
 
     return sanitizedResult(
       Object.freeze({
         kind: "run",
         run,
-        operations,
+        operations: page.items,
         total: page.total,
-        nextCursor: nextCursor("run", input.id, page.nextSequence),
+        nextCursor: sequenceCursor("run", input.id, page.nextBoundary),
+      }),
+    );
+  }
+
+  #inspectAttempts(input: ParsedHistoryInput): AttemptsInspectResult {
+    const run = this.#loadRun(input.targetId);
+    const cursor = input.cursor?.kind === "attempts" ? input.cursor : null;
+    const afterAttempt = cursor?.afterAttempt ?? null;
+    const rawPage = invokeStoragePage(
+      () =>
+        this.#storage.listRunOperationAttemptsPage({
+          runId: run.id,
+          operationId: input.operationId,
+          afterAttempt,
+          pageSize: input.limit,
+        }),
+      cursor !== null,
+    );
+    const page = validatedPage(rawPage, {
+      nextKey: "nextAttempt",
+      limit: input.limit,
+      firstBoundary: 1,
+      afterBoundary: afterAttempt,
+      cursorProvided: cursor !== null,
+      parseItem: parseRunOperationAttempt,
+      itemBoundary: (attempt) => attempt.attempt,
+      itemMatchesTarget: (attempt) =>
+        attempt.runId === run.id && attempt.operationId === input.operationId,
+    });
+
+    return sanitizedResult(
+      Object.freeze({
+        kind: "attempts",
+        run,
+        operationId: input.operationId,
+        attempts: page.items,
+        total: page.total,
+        nextCursor: attemptCursor(
+          input.id,
+          input.operationId,
+          page.nextBoundary,
+        ),
+      }),
+    );
+  }
+
+  #inspectReconciliations(
+    input: ParsedHistoryInput,
+  ): ReconciliationsInspectResult {
+    const run = this.#loadRun(input.targetId);
+    const cursor =
+      input.cursor?.kind === "reconciliations" ? input.cursor : null;
+    const afterEventSequence = cursor?.afterEventSequence ?? null;
+    const rawPage = invokeStoragePage(
+      () =>
+        this.#storage.listRunOperationReconciliationsPage({
+          runId: run.id,
+          operationId: input.operationId,
+          afterEventSequence,
+          pageSize: input.limit,
+        }),
+      cursor !== null,
+    );
+    const page = validatedPage(rawPage, {
+      nextKey: "nextEventSequence",
+      limit: input.limit,
+      firstBoundary: 1,
+      afterBoundary: afterEventSequence,
+      cursorProvided: cursor !== null,
+      parseItem: parseRunOperationReconciliation,
+      itemBoundary: (event) => event.eventSequence,
+      itemMatchesTarget: (event) =>
+        event.runId === run.id && event.operationId === input.operationId,
+    });
+
+    return sanitizedResult(
+      Object.freeze({
+        kind: "reconciliations",
+        run,
+        operationId: input.operationId,
+        reconciliations: page.items,
+        total: page.total,
+        nextCursor: reconciliationCursor(
+          input.id,
+          input.operationId,
+          page.nextBoundary,
+        ),
       }),
     );
   }
