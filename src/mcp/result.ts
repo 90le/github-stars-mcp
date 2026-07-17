@@ -6,6 +6,7 @@ import {
   freezeJsonValue,
 } from "../domain/canonical-json.js";
 import {
+  APP_ERROR_CODES,
   AppError,
   serializeError,
   type AppErrorCode,
@@ -72,6 +73,21 @@ const FAILURE_OMITTED_KEYS = new Set([
 ]);
 const TOKEN_PATTERN = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/gu;
 const TOKEN_PATTERN_TEST = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/u;
+const APP_ERROR_CODE_SET = new Set<string>(APP_ERROR_CODES);
+const INTRINSICS = Object.freeze({
+  appErrorPrototype: AppError.prototype,
+  arrayIsArray: Array.isArray,
+  arrayPrototype: Array.prototype,
+  objectGetOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
+  objectHasOwn: Object.hasOwn,
+  reflectApply: Reflect.apply,
+  reflectGetPrototypeOf: Reflect.getPrototypeOf,
+  reflectOwnKeys: Reflect.ownKeys,
+  // The intrinsic is invoked only through the captured Reflect.apply.
+  // eslint-disable-next-line @typescript-eslint/unbound-method
+  setHas: Set.prototype.has,
+  utilIsProxy: utilTypes.isProxy,
+});
 
 function invalidInput(): never {
   throw new AppError(
@@ -445,14 +461,20 @@ function sanitizedFailureMessage(value: string): string {
 function snapshotDescriptorStrings(
   value: unknown,
 ): readonly string[] | undefined {
-  if (utilTypes.isProxy(value) || !Array.isArray(value)) return undefined;
+  if (
+    INTRINSICS.utilIsProxy(value) ||
+    !INTRINSICS.arrayIsArray(value) ||
+    INTRINSICS.reflectGetPrototypeOf(value) !== INTRINSICS.arrayPrototype
+  ) {
+    return undefined;
+  }
 
   const descriptors: Record<string, PropertyDescriptor> =
-    Object.getOwnPropertyDescriptors(value);
+    INTRINSICS.objectGetOwnPropertyDescriptors(value);
   const lengthDescriptor = descriptors.length;
   if (
     lengthDescriptor === undefined ||
-    !("value" in lengthDescriptor) ||
+    !INTRINSICS.objectHasOwn(lengthDescriptor, "value") ||
     typeof lengthDescriptor.value !== "number" ||
     !Number.isInteger(lengthDescriptor.value) ||
     lengthDescriptor.value < 0 ||
@@ -462,7 +484,7 @@ function snapshotDescriptorStrings(
   }
 
   const length = lengthDescriptor.value;
-  for (const key of Reflect.ownKeys(descriptors)) {
+  for (const key of INTRINSICS.reflectOwnKeys(descriptors)) {
     if (typeof key !== "string") return undefined;
     if (key === "length") continue;
     if (!/^(?:0|[1-9]\d*)$/u.test(key)) return undefined;
@@ -475,7 +497,7 @@ function snapshotDescriptorStrings(
     const descriptor = descriptors[String(index)];
     if (
       descriptor === undefined ||
-      !("value" in descriptor) ||
+      !INTRINSICS.objectHasOwn(descriptor, "value") ||
       typeof descriptor.value !== "string"
     ) {
       return undefined;
@@ -485,15 +507,78 @@ function snapshotDescriptorStrings(
   return Object.freeze(snapshot);
 }
 
-function safeFailureSecretRegistry(
-  error: unknown,
-): readonly string[] | undefined {
-  if (utilTypes.isProxy(error)) return undefined;
-  if (!(error instanceof AppError)) return Object.freeze([]);
+type InspectedAppError = Readonly<{
+  error: AppError;
+  secrets: readonly string[];
+}>;
 
-  const descriptor = Object.getOwnPropertyDescriptor(error, "secrets");
-  if (descriptor === undefined || !("value" in descriptor)) return undefined;
-  return snapshotDescriptorStrings(descriptor.value);
+function hasSafeAppErrorPrototype(value: object): boolean {
+  let current: object | null = value;
+  while (current !== null) {
+    if (INTRINSICS.utilIsProxy(current)) return false;
+    const prototype = INTRINSICS.reflectGetPrototypeOf(current);
+    if (prototype === INTRINSICS.appErrorPrototype) return true;
+    current = prototype;
+  }
+  return false;
+}
+
+function isAppErrorCode(value: unknown): value is AppErrorCode {
+  return (
+    typeof value === "string" &&
+    INTRINSICS.reflectApply(INTRINSICS.setHas, APP_ERROR_CODE_SET, [value])
+  );
+}
+
+function inspectAppError(error: unknown): InspectedAppError | undefined {
+  try {
+    if (
+      typeof error !== "object" ||
+      error === null ||
+      !hasSafeAppErrorPrototype(error)
+    ) {
+      return undefined;
+    }
+
+    const descriptors = INTRINSICS.objectGetOwnPropertyDescriptors(error);
+    const codeDescriptor = descriptors.code;
+    const detailsDescriptor = descriptors.details;
+    const messageDescriptor = descriptors.message;
+    const retryableDescriptor = descriptors.retryable;
+    const secretsDescriptor = descriptors.secrets;
+    if (
+      codeDescriptor === undefined ||
+      detailsDescriptor === undefined ||
+      messageDescriptor === undefined ||
+      retryableDescriptor === undefined ||
+      secretsDescriptor === undefined ||
+      !INTRINSICS.objectHasOwn(codeDescriptor, "value") ||
+      !INTRINSICS.objectHasOwn(detailsDescriptor, "value") ||
+      !INTRINSICS.objectHasOwn(messageDescriptor, "value") ||
+      !INTRINSICS.objectHasOwn(retryableDescriptor, "value") ||
+      !INTRINSICS.objectHasOwn(secretsDescriptor, "value") ||
+      !isAppErrorCode(codeDescriptor.value) ||
+      typeof messageDescriptor.value !== "string" ||
+      typeof retryableDescriptor.value !== "boolean"
+    ) {
+      return undefined;
+    }
+
+    const details = canonicalJsonClone(detailsDescriptor.value);
+    const secrets = snapshotDescriptorStrings(secretsDescriptor.value);
+    if (secrets === undefined) return undefined;
+
+    return Object.freeze({
+      error: new AppError(codeDescriptor.value, messageDescriptor.value, {
+        details,
+        retryable: retryableDescriptor.value,
+        secrets,
+      }),
+      secrets,
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 function safeFailureRequestId(
@@ -603,16 +688,14 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
 
 export function toolFailure(error: unknown, requestId: string): CallToolResult {
   try {
-    const registeredSecrets = safeFailureSecretRegistry(error);
-    const serialized = utilTypes.isProxy(error)
-      ? serializeError(undefined)
-      : serializeError(error);
+    const inspected = inspectAppError(error);
+    const serialized = serializeError(inspected?.error);
     return createFailureResult(
       serialized.code,
       sanitizedFailureMessage(serialized.message),
       serialized.retryable,
       sanitizedFailureDetails(serialized.details),
-      safeFailureRequestId(requestId, registeredSecrets),
+      safeFailureRequestId(requestId, inspected?.secrets),
     );
   } catch {
     return TOTAL_FAILURE_RESULT;

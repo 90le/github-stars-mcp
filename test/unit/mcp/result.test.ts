@@ -694,16 +694,16 @@ describe("failure totality", () => {
     revocable.revoke();
 
     const failures: readonly (readonly [unknown, string])[] = [
-      [undefined, "req_total"],
-      [null, "req_total"],
-      [true, "req_total"],
-      [42, "req_total"],
-      [1n, "req_total"],
-      ["string", "req_total"],
-      [Symbol("failure"), "req_total"],
-      [() => "failure", "req_total"],
-      [cyclic, "req_total"],
-      [accessor, "req_total"],
+      [undefined, "req_redacted"],
+      [null, "req_redacted"],
+      [true, "req_redacted"],
+      [42, "req_redacted"],
+      [1n, "req_redacted"],
+      ["string", "req_redacted"],
+      [Symbol("failure"), "req_redacted"],
+      [() => "failure", "req_redacted"],
+      [cyclic, "req_redacted"],
+      [accessor, "req_redacted"],
       [proxy, "req_redacted"],
       [revocable.proxy, "req_redacted"],
     ];
@@ -748,8 +748,8 @@ describe("failure totality", () => {
   });
 
   it.each([
-    ["valid lower", "a", "a"],
-    ["valid upper", "x".repeat(128), "x".repeat(128)],
+    ["valid lower", "a", "req_redacted"],
+    ["valid upper", "x".repeat(128), "req_redacted"],
     ["empty", "", "req_invalid"],
     ["too long", "x".repeat(129), "req_invalid"],
     ["trimmed", " invalid", "req_invalid"],
@@ -883,6 +883,143 @@ describe("failure totality", () => {
     expect(failureEnvelope(result).request_id).toBe("req_redacted");
     expect(proxyCalls).toBe(0);
     expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("does not invoke traps on a proxied AppError secret registry", () => {
+    let proxyCalls = 0;
+    const secret = "req_nested_proxied_registry";
+    const registry = new Proxy([secret], {
+      get: (target, key, receiver) => {
+        proxyCalls += 1;
+        return Reflect.get(target, key, receiver) as unknown;
+      },
+      getOwnPropertyDescriptor: (target, key) => {
+        proxyCalls += 1;
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+      getPrototypeOf: (target) => {
+        proxyCalls += 1;
+        return Reflect.getPrototypeOf(target);
+      },
+      ownKeys: (target) => {
+        proxyCalls += 1;
+        return Reflect.ownKeys(target);
+      },
+    });
+    const malformed = Object.create(AppError.prototype) as AppError;
+    Object.defineProperties(malformed, {
+      code: { value: "AUTH_REQUIRED" },
+      details: { value: {} },
+      message: { value: "authentication failed" },
+      retryable: { value: false },
+      secrets: { value: registry },
+    });
+
+    const result = toolFailure(malformed, secret);
+
+    expect(proxyCalls).toBe(0);
+    expect(failureEnvelope(result)).toMatchObject({
+      request_id: "req_redacted",
+      error: { code: "INTERNAL_ERROR", details: {} },
+    });
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("does not invoke traps on top-level or nested proxies in AppError details", () => {
+    let proxyCalls = 0;
+    const createDetailsProxy = () =>
+      new Proxy(
+        { value: "safe" },
+        {
+          get: (target, key, receiver) => {
+            proxyCalls += 1;
+            return Reflect.get(target, key, receiver) as unknown;
+          },
+          getOwnPropertyDescriptor: (target, key) => {
+            proxyCalls += 1;
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+          getPrototypeOf: (target) => {
+            proxyCalls += 1;
+            return Reflect.getPrototypeOf(target);
+          },
+          ownKeys: (target) => {
+            proxyCalls += 1;
+            return Reflect.ownKeys(target);
+          },
+        },
+      );
+    const candidates = [
+      createDetailsProxy(),
+      { nested: createDetailsProxy() },
+    ] as const;
+
+    for (const details of candidates) {
+      const result = toolFailure(
+        new AppError("AUTH_REQUIRED", "authentication failed", {
+          details: details as never,
+        }),
+        "req_proxied_details",
+      );
+      expect(failureEnvelope(result)).toMatchObject({
+        request_id: "req_redacted",
+        error: { code: "INTERNAL_ERROR", details: {} },
+      });
+    }
+
+    expect(proxyCalls).toBe(0);
+  });
+
+  it("does not invoke traps while rejecting a Proxy in an error prototype chain", () => {
+    let proxyCalls = 0;
+    const hostilePrototype = new Proxy(
+      {},
+      {
+        getPrototypeOf: () => {
+          proxyCalls += 1;
+          throw new Error("prototype trap invoked");
+        },
+      },
+    );
+    const hostile = Object.create(hostilePrototype) as object;
+
+    const result = toolFailure(hostile, "req_hostile_prototype");
+
+    expect(proxyCalls).toBe(0);
+    expect(failureEnvelope(result)).toMatchObject({
+      request_id: "req_redacted",
+      error: { code: "INTERNAL_ERROR", details: {} },
+    });
+  });
+
+  it("falls back without invoking accessors for revoked Proxy, cycle, and accessor details", () => {
+    let getterCalls = 0;
+    const accessor = Object.defineProperty({}, "secret", {
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return "ghp_accessor_secret";
+      },
+    });
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const revocable = Proxy.revocable({ safe: true }, {});
+    revocable.revoke();
+    const error = new AppError("AUTH_REQUIRED", "authentication failed", {
+      details: {
+        accessor,
+        cyclic,
+        revoked: revocable.proxy,
+      } as never,
+    });
+
+    const result = toolFailure(error, "req_hostile_details");
+
+    expect(getterCalls).toBe(0);
+    expect(failureEnvelope(result)).toMatchObject({
+      request_id: "req_redacted",
+      error: { code: "INTERNAL_ERROR", details: {} },
+    });
   });
 
   it("falls back to empty details when serialized details exceed the safe clone bound", () => {
