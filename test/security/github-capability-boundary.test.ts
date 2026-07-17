@@ -1,22 +1,14 @@
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import * as ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { GITHUB_MUTATION_METHOD_NAMES } from "../../src/github/allowed-operations.js";
 
-const APPROVED_MUTATION_CAPABILITIES = Object.freeze(
-  [
-    "star",
-    "unstar",
-    "createUserList",
-    "updateUserList",
-    "deleteUserList",
-    "setRepositoryListIds",
-  ].sort(),
-);
 const APPROVED_GITHUB_CAPABILITIES = Object.freeze(
   [
-    ...APPROVED_MUTATION_CAPABILITIES,
     "checkStar",
+    "createUserList",
+    "deleteUserList",
     "getReadme",
     "getRepositoryIdentity",
     "getRepositoryListIds",
@@ -27,12 +19,65 @@ const APPROVED_GITHUB_CAPABILITIES = Object.freeze(
     "listUserLists",
     "probeCapabilities",
     "searchRepositories",
+    "setRepositoryListIds",
+    "star",
+    "unstar",
+    "updateUserList",
   ].sort(),
 );
-const UNRESOLVED_PUBLIC_NAME = "<unresolved-public-name>";
+
+const APPROVED_PORT_EXPORTS = Object.freeze(
+  [
+    "AccountBinding",
+    "CapabilityState",
+    "CreateUserListInput",
+    "GitHubCapabilities",
+    "GitHubDiscoveryReadPort",
+    "GitHubEvidenceReadPort",
+    "GitHubListItem",
+    "GitHubListReadPort",
+    "GitHubLiveReadPort",
+    "GitHubMutationPort",
+    "GitHubPort",
+    "GitHubReadme",
+    "GitHubRepository",
+    "GitHubSearchInput",
+    "GitHubSearchPage",
+    "GitHubStar",
+    "GitHubStarReadPort",
+    "GitHubStatusReadPort",
+    "GitHubSyncReadPort",
+    "GitHubUserList",
+    "MutationReceipt",
+    "Page",
+    "RateLimitState",
+    "RepositoryCoordinates",
+    "RepositoryIdentity",
+    "UpdateUserListInput",
+    "UserListMutationResult",
+  ].sort(),
+);
+
+const APPROVED_ADAPTER_EXPORTS = Object.freeze(["OctokitGitHubAdapter"]);
+const UNRESOLVED_COMPUTED_MEMBER = "<computed-public-member>";
+const FORBIDDEN_PUBLIC_MEMBERS = new Set([
+  "request",
+  "graphql",
+  "deleteRepository",
+  "archiveRepository",
+  "transferRepository",
+  "updateRepository",
+  "updateFile",
+  "createOrUpdateFile",
+  "rawRequest",
+]);
+
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const PROJECT_CONFIG = fileURLToPath(
   new URL("../../tsconfig.json", import.meta.url),
+);
+const CONTRACT_PROBE_FILE = fileURLToPath(
+  new URL("./github-capability-contract.probe.ts", import.meta.url),
 );
 const GITHUB_PORT_FILE = fileURLToPath(
   new URL("../../src/app/ports/github-port.ts", import.meta.url),
@@ -40,158 +85,50 @@ const GITHUB_PORT_FILE = fileURLToPath(
 const GITHUB_ADAPTER_FILE = fileURLToPath(
   new URL("../../src/github/octokit-github-adapter.ts", import.meta.url),
 );
-const VIRTUAL_LIB_NAME = "github-capability-lib.d.ts";
-const VIRTUAL_LIB_SOURCE = `
-  interface Array<T> {
-    readonly length: number;
-    readonly [index: number]: T;
-  }
-  interface Boolean {}
-  interface CallableFunction extends Function {}
-  interface Function {}
-  interface IArguments {}
-  interface NewableFunction extends Function {}
-  interface Number {}
-  interface Object {}
-  interface RegExp {}
-  interface String {}
-  interface Promise<T> {}
-  interface PromiseConstructor {
-    readonly prototype: Promise<unknown>;
-  }
-  declare const Promise: PromiseConstructor;
-  interface Error {}
-  interface ErrorConstructor {
-    new (message?: string): Error;
-  }
-  declare const Error: ErrorConstructor;
-  interface ObjectConstructor {
-    assign<T extends object, U extends object>(target: T, source: U): T & U;
-  }
-  declare const Object: ObjectConstructor;
-  type Readonly<T> = {
-    readonly [P in keyof T]: T[P];
-  };
-  type Uppercase<S extends string> = intrinsic;
-`;
+const ALLOWED_OPERATIONS_FILE = fileURLToPath(
+  new URL("../../src/github/allowed-operations.ts", import.meta.url),
+);
+
+const GITHUB_PORT_SOURCE = readFileSync(GITHUB_PORT_FILE, "utf8");
+const GITHUB_ADAPTER_SOURCE = readFileSync(GITHUB_ADAPTER_FILE, "utf8");
+
+type BoundaryIssue =
+  | "compiler-contract"
+  | "port-module-exports"
+  | "adapter-module-exports"
+  | "port-public-members"
+  | "adapter-public-members"
+  | "forbidden-public-member";
+
+type BoundaryProof = Readonly<{
+  issues: readonly BoundaryIssue[];
+  diagnostics: readonly ts.Diagnostic[];
+  portExports: readonly string[];
+  adapterExports: readonly string[];
+  portMembers: readonly string[];
+  adapterMembers: readonly string[];
+  forbiddenMembers: readonly string[];
+}>;
+
+type SourceOverrides = Readonly<Record<string, string>>;
+type ProofOptions = Readonly<{ forceCompiler?: boolean }>;
 
 function canonicalFileName(fileName: string): string {
   return fileName.replaceAll("\\", "/").toLowerCase();
 }
 
-function compilerDiagnosticsWithMutation(
-  member: string | null,
-): readonly ts.Diagnostic[] {
-  const virtualFile = fileURLToPath(
-    new URL("./github-mutation-exhaustiveness.probe.ts", import.meta.url),
-  );
-  const config = ts.readConfigFile(PROJECT_CONFIG, (fileName) =>
-    ts.sys.readFile(fileName),
-  );
-  if (config.error !== undefined) return [config.error];
-  const parsed = ts.parseJsonConfigFileContent(
-    config.config,
-    ts.sys,
-    PROJECT_ROOT,
-    { noEmit: true },
-    PROJECT_CONFIG,
-  );
-  if (parsed.errors.length > 0) return parsed.errors;
-  const contents =
-    member === null
-      ? 'import "../../src/github/allowed-operations.js";\n'
-      : `
-          import "../../src/github/allowed-operations.js";
-          declare module "../../src/app/ports/github-port.js" {
-            interface GitHubMutationPort {
-              ${member}
-            }
-          }
-        `;
-  const canonicalVirtualFile = canonicalFileName(virtualFile);
-  const host = ts.createCompilerHost(parsed.options, true);
-  const defaultFileExists = host.fileExists.bind(host);
-  const defaultGetSourceFile = host.getSourceFile.bind(host);
-  const defaultReadFile = host.readFile.bind(host);
-  host.fileExists = (fileName) =>
-    canonicalFileName(fileName) === canonicalVirtualFile ||
-    defaultFileExists(fileName);
-  host.readFile = (fileName) =>
-    canonicalFileName(fileName) === canonicalVirtualFile
-      ? contents
-      : defaultReadFile(fileName);
-  host.getSourceFile = (
-    fileName,
-    languageVersionOrOptions,
-    onError,
-    shouldCreateNewSourceFile,
-  ) =>
-    canonicalFileName(fileName) === canonicalVirtualFile
-      ? ts.createSourceFile(
-          fileName,
-          contents,
-          languageVersionOrOptions,
-          true,
-          ts.ScriptKind.TS,
-        )
-      : defaultGetSourceFile(
-          fileName,
-          languageVersionOrOptions,
-          onError,
-          shouldCreateNewSourceFile,
-        );
-  const program = ts.createProgram({
-    rootNames: [virtualFile],
-    options: parsed.options,
-    host,
-  });
-  return ts.getPreEmitDiagnostics(program);
+function requiredReplacement(
+  source: string,
+  needle: string,
+  replacement: string,
+): string {
+  if (!source.includes(needle)) {
+    throw new Error(`Mutation anchor was not found: ${needle}`);
+  }
+  return source.replace(needle, replacement);
 }
 
-function staticPropertyName(expression: ts.Expression): string | null {
-  if (
-    ts.isStringLiteralLike(expression) ||
-    ts.isNumericLiteral(expression) ||
-    ts.isNoSubstitutionTemplateLiteral(expression)
-  ) {
-    return expression.text;
-  }
-  if (ts.isParenthesizedExpression(expression)) {
-    return staticPropertyName(expression.expression);
-  }
-  if (
-    ts.isBinaryExpression(expression) &&
-    expression.operatorToken.kind === ts.SyntaxKind.PlusToken
-  ) {
-    const left = staticPropertyName(expression.left);
-    const right = staticPropertyName(expression.right);
-    return left === null || right === null ? null : `${left}${right}`;
-  }
-  return null;
-}
-
-function hasModifier(
-  node: ts.Node,
-  modifier:
-    | ts.SyntaxKind.PublicKeyword
-    | ts.SyntaxKind.PrivateKeyword
-    | ts.SyntaxKind.ProtectedKeyword,
-): boolean {
-  return (
-    ts.canHaveModifiers(node) &&
-    ts.getModifiers(node)?.some(({ kind }) => kind === modifier) === true
-  );
-}
-
-type ProgramSurface = Readonly<{
-  program: ts.Program;
-  sourceFiles: readonly ts.SourceFile[];
-}>;
-
-let cachedProjectProgram: ts.Program | undefined;
-
-function projectProgram(): ts.Program {
-  if (cachedProjectProgram !== undefined) return cachedProjectProgram;
+function compilerOptions(): ts.CompilerOptions {
   const config = ts.readConfigFile(PROJECT_CONFIG, (fileName) =>
     ts.sys.readFile(fileName),
   );
@@ -216,62 +153,23 @@ function projectProgram(): ts.Program {
         .join("; "),
     );
   }
-  cachedProjectProgram = ts.createProgram({
-    rootNames: [GITHUB_PORT_FILE, GITHUB_ADAPTER_FILE],
-    options: parsed.options,
-  });
-  return cachedProjectProgram;
+  return parsed.options;
 }
 
-function projectSurface(fileName: string): ProgramSurface {
-  const program = projectProgram();
-  const sourceFile = program.getSourceFile(fileName);
-  if (sourceFile === undefined) {
-    throw new Error(`Project source was not loaded: ${fileName}`);
-  }
-  return { program, sourceFiles: [sourceFile] };
-}
+const PROJECT_COMPILER_OPTIONS = compilerOptions();
 
-function virtualFileName(name: string): string {
-  return fileURLToPath(new URL(`./${name}`, import.meta.url));
-}
-
-function virtualSurface(
-  modules: Readonly<Record<string, string>>,
-  entryNames: readonly string[],
-): ProgramSurface {
-  const options: ts.CompilerOptions = {
-    module: ts.ModuleKind.NodeNext,
-    moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    noLib: true,
-    noEmit: true,
-    skipLibCheck: true,
-    strict: true,
-    target: ts.ScriptTarget.ES2023,
-    types: [],
-  };
-  const virtualFiles = new Map<
-    string,
-    Readonly<{ fileName: string; contents: string }>
-  >();
-  const virtualLibFile = virtualFileName(VIRTUAL_LIB_NAME);
-  virtualFiles.set(canonicalFileName(virtualLibFile), {
-    fileName: virtualLibFile,
-    contents: VIRTUAL_LIB_SOURCE,
-  });
-  for (const [name, contents] of Object.entries(modules)) {
-    const fileName = virtualFileName(name);
-    virtualFiles.set(canonicalFileName(fileName), { fileName, contents });
-  }
-  const host = ts.createCompilerHost(options, true);
-  const defaultFileExists = host.fileExists.bind(host);
-  const defaultGetSourceFile = host.getSourceFile.bind(host);
+function productionProgram(overrides: SourceOverrides = {}): ts.Program {
+  const overriddenSources = new Map(
+    Object.entries(overrides).map(([fileName, source]) => [
+      canonicalFileName(fileName),
+      source,
+    ]),
+  );
+  const host = ts.createCompilerHost(PROJECT_COMPILER_OPTIONS, true);
   const defaultReadFile = host.readFile.bind(host);
-  host.fileExists = (fileName) =>
-    virtualFiles.has(canonicalFileName(fileName)) ||
-    defaultFileExists(fileName);
+  const defaultGetSourceFile = host.getSourceFile.bind(host);
   host.readFile = (fileName) =>
-    virtualFiles.get(canonicalFileName(fileName))?.contents ??
+    overriddenSources.get(canonicalFileName(fileName)) ??
     defaultReadFile(fileName);
   host.getSourceFile = (
     fileName,
@@ -279,8 +177,8 @@ function virtualSurface(
     onError,
     shouldCreateNewSourceFile,
   ) => {
-    const virtual = virtualFiles.get(canonicalFileName(fileName));
-    return virtual === undefined
+    const source = overriddenSources.get(canonicalFileName(fileName));
+    return source === undefined
       ? defaultGetSourceFile(
           fileName,
           languageVersionOrOptions,
@@ -288,24 +186,93 @@ function virtualSurface(
           shouldCreateNewSourceFile,
         )
       : ts.createSourceFile(
-          virtual.fileName,
-          virtual.contents,
+          fileName,
+          source,
           languageVersionOrOptions,
           true,
           ts.ScriptKind.TS,
         );
   };
-  const rootNames = [...virtualFiles.values()].map(({ fileName }) => fileName);
-  const program = ts.createProgram({ rootNames, options, host });
-  const sourceFiles = entryNames.map((name) => {
-    const fileName = virtualFileName(name);
-    const sourceFile = program.getSourceFile(fileName);
-    if (sourceFile === undefined) {
-      throw new Error(`Virtual source was not loaded: ${name}`);
-    }
-    return sourceFile;
+  return ts.createProgram({
+    rootNames: [CONTRACT_PROBE_FILE],
+    options: PROJECT_COMPILER_OPTIONS,
+    host,
   });
-  return { program, sourceFiles };
+}
+
+function requiredSourceFile(
+  program: ts.Program,
+  fileName: string,
+): ts.SourceFile {
+  const sourceFile = program.getSourceFile(fileName);
+  if (sourceFile === undefined) {
+    throw new Error(`Production source was not loaded: ${fileName}`);
+  }
+  return sourceFile;
+}
+
+function moduleExports(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+): readonly ts.Symbol[] {
+  const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
+  if (moduleSymbol === undefined) {
+    throw new Error(`Module symbol was not resolved: ${sourceFile.fileName}`);
+  }
+  return checker.getExportsOfModule(moduleSymbol);
+}
+
+function moduleExportNames(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+): readonly string[] {
+  return Object.freeze(
+    moduleExports(checker, sourceFile)
+      .map((symbol) => symbol.getName())
+      .sort(),
+  );
+}
+
+function resolveAlias(checker: ts.TypeChecker, symbol: ts.Symbol): ts.Symbol {
+  let resolved = symbol;
+  const seen = new Set<ts.Symbol>();
+  while ((resolved.flags & ts.SymbolFlags.Alias) !== 0) {
+    if (seen.has(resolved)) {
+      throw new Error(`Cyclic export alias: ${symbol.getName()}`);
+    }
+    seen.add(resolved);
+    resolved = checker.getAliasedSymbol(resolved);
+  }
+  return resolved;
+}
+
+function requiredExport(
+  checker: ts.TypeChecker,
+  sourceFile: ts.SourceFile,
+  exportName: string,
+): ts.Symbol {
+  const exported = moduleExports(checker, sourceFile).find(
+    (symbol) => symbol.getName() === exportName,
+  );
+  if (exported === undefined) {
+    throw new Error(`Required export was not resolved: ${exportName}`);
+  }
+  return resolveAlias(checker, exported);
+}
+
+function hasModifier(
+  node: ts.Node,
+  modifier:
+    | ts.SyntaxKind.PrivateKeyword
+    | ts.SyntaxKind.ProtectedKeyword
+    | ts.SyntaxKind.PublicKeyword
+    | ts.SyntaxKind.ReadonlyKeyword
+    | ts.SyntaxKind.StaticKeyword,
+): boolean {
+  return (
+    ts.canHaveModifiers(node) &&
+    ts.getModifiers(node)?.some(({ kind }) => kind === modifier) === true
+  );
 }
 
 function isPrivateOrProtected(node: ts.Node): boolean {
@@ -317,580 +284,291 @@ function isPrivateOrProtected(node: ts.Node): boolean {
   );
 }
 
-function recordComputedName(
-  name: ts.DeclarationName | undefined,
-  names: Set<string>,
-): void {
-  if (name === undefined || !ts.isComputedPropertyName(name)) return;
-  names.add(staticPropertyName(name.expression) ?? UNRESOLVED_PUBLIC_NAME);
+function publicTypeMemberNames(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+): readonly string[] {
+  const type = checker.getDeclaredTypeOfSymbol(symbol);
+  return Object.freeze(
+    checker
+      .getPropertiesOfType(type)
+      .filter((property) => {
+        const declarations = property.getDeclarations() ?? [];
+        return (
+          declarations.length === 0 ||
+          declarations.some((declaration) => !isPrivateOrProtected(declaration))
+        );
+      })
+      .map((property) => property.getName())
+      .sort(),
+  );
 }
 
-function scanComputedTypeNode(node: ts.TypeNode, names: Set<string>): void {
-  if (ts.isTypeLiteralNode(node)) {
-    scanComputedMembers(node.members, names);
-    return;
+function adapterDeclarationMemberNames(
+  sourceFile: ts.SourceFile,
+): readonly string[] {
+  const declaration = sourceFile.statements.find(
+    (statement): statement is ts.ClassDeclaration =>
+      ts.isClassDeclaration(statement) &&
+      statement.name?.text === "OctokitGitHubAdapter",
+  );
+  if (declaration === undefined) {
+    throw new Error("OctokitGitHubAdapter declaration was not resolved");
   }
-  if (ts.isUnionTypeNode(node) || ts.isIntersectionTypeNode(node)) {
-    for (let index = 0; index < node.types.length; index += 1) {
-      const nested = node.types[index];
-      if (nested !== undefined) scanComputedTypeNode(nested, names);
+  const names = new Set<string>();
+  for (const member of declaration.members) {
+    if (ts.isConstructorDeclaration(member)) {
+      for (const parameter of member.parameters) {
+        if (!isPublicConstructorParameterProperty(parameter)) continue;
+        const name = staticDeclarationName(parameter.name);
+        if (name !== null) names.add(name);
+      }
+      continue;
     }
-    return;
-  }
-  if (ts.isParenthesizedTypeNode(node) || ts.isTypeOperatorNode(node)) {
-    scanComputedTypeNode(node.type, names);
-    return;
-  }
-  if (ts.isTypeReferenceNode(node)) {
-    for (let index = 0; index < (node.typeArguments?.length ?? 0); index += 1) {
-      const nested = node.typeArguments?.[index];
-      if (nested !== undefined) scanComputedTypeNode(nested, names);
+    if (
+      isPrivateOrProtected(member) ||
+      hasModifier(member, ts.SyntaxKind.StaticKeyword)
+    ) {
+      continue;
     }
-    return;
+    const name = staticDeclarationName((member as ts.NamedDeclaration).name);
+    names.add(name ?? UNRESOLVED_COMPUTED_MEMBER);
   }
-  if (ts.isArrayTypeNode(node)) {
-    scanComputedTypeNode(node.elementType, names);
-  }
+  return Object.freeze([...names].sort());
 }
 
-function scanComputedExpression(
-  expression: ts.Expression,
-  names: Set<string>,
-): void {
+function adapterPublicMemberNames(
+  checker: ts.TypeChecker,
+  symbol: ts.Symbol,
+  sourceFile: ts.SourceFile,
+): readonly string[] {
+  return Object.freeze(
+    [
+      ...new Set([
+        ...publicTypeMemberNames(checker, symbol),
+        ...adapterDeclarationMemberNames(sourceFile),
+      ]),
+    ].sort(),
+  );
+}
+
+function staticPropertyExpression(expression: ts.Expression): string | null {
+  if (
+    ts.isStringLiteralLike(expression) ||
+    ts.isNumericLiteral(expression) ||
+    ts.isNoSubstitutionTemplateLiteral(expression)
+  ) {
+    return expression.text;
+  }
   if (
     ts.isParenthesizedExpression(expression) ||
     ts.isAsExpression(expression) ||
     ts.isSatisfiesExpression(expression) ||
     ts.isNonNullExpression(expression)
   ) {
-    scanComputedExpression(expression.expression, names);
-    return;
-  }
-  if (ts.isObjectLiteralExpression(expression)) {
-    for (let index = 0; index < expression.properties.length; index += 1) {
-      const property = expression.properties[index];
-      if (property === undefined) continue;
-      if (ts.isSpreadAssignment(property)) {
-        scanComputedExpression(property.expression, names);
-        continue;
-      }
-      if (!isPrivateOrProtected(property)) {
-        recordComputedName(property.name, names);
-      }
-      if (ts.isPropertyAssignment(property)) {
-        scanComputedExpression(property.initializer, names);
-      }
-    }
-    return;
-  }
-  if (ts.isCallExpression(expression) || ts.isNewExpression(expression)) {
-    for (
-      let index = 0;
-      index < (expression.arguments?.length ?? 0);
-      index += 1
-    ) {
-      const argument = expression.arguments?.[index];
-      if (argument !== undefined) scanComputedExpression(argument, names);
-    }
-    return;
-  }
-  if (ts.isClassExpression(expression)) {
-    scanComputedMembers(expression.members, names);
-  }
-}
-
-function scanComputedMembers(
-  members: ts.NodeArray<ts.ClassElement | ts.TypeElement>,
-  names: Set<string>,
-): void {
-  for (let index = 0; index < members.length; index += 1) {
-    const member = members[index];
-    if (member === undefined || isPrivateOrProtected(member)) continue;
-    if (ts.isIndexSignatureDeclaration(member)) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      continue;
-    }
-    recordComputedName((member as ts.NamedDeclaration).name, names);
-    if (
-      (ts.isPropertyDeclaration(member) || ts.isPropertySignature(member)) &&
-      member.type !== undefined
-    ) {
-      scanComputedTypeNode(member.type, names);
-    }
-    if (ts.isPropertyDeclaration(member) && member.initializer !== undefined) {
-      scanComputedExpression(member.initializer, names);
-    }
-  }
-}
-
-function scanComputedDeclaration(
-  declaration: ts.Declaration,
-  names: Set<string>,
-): void {
-  if (
-    ts.isClassDeclaration(declaration) ||
-    ts.isClassExpression(declaration) ||
-    ts.isInterfaceDeclaration(declaration)
-  ) {
-    scanComputedMembers(declaration.members, names);
-    return;
-  }
-  if (ts.isTypeAliasDeclaration(declaration)) {
-    scanComputedTypeNode(declaration.type, names);
-    return;
+    return staticPropertyExpression(expression.expression);
   }
   if (
-    ts.isVariableDeclaration(declaration) &&
-    declaration.initializer !== undefined
+    ts.isBinaryExpression(expression) &&
+    expression.operatorToken.kind === ts.SyntaxKind.PlusToken
   ) {
-    scanComputedExpression(declaration.initializer, names);
+    const left = staticPropertyExpression(expression.left);
+    const right = staticPropertyExpression(expression.right);
+    return left === null || right === null ? null : `${left}${right}`;
   }
+  return null;
 }
 
-function symbolIsNonPublic(symbol: ts.Symbol): boolean {
-  const declarations = symbol.getDeclarations();
+function staticDeclarationName(
+  name: ts.DeclarationName | undefined,
+): string | null {
+  if (name === undefined || ts.isPrivateIdentifier(name)) return null;
+  if (
+    ts.isIdentifier(name) ||
+    ts.isStringLiteralLike(name) ||
+    ts.isNumericLiteral(name)
+  ) {
+    return name.text;
+  }
+  return ts.isComputedPropertyName(name)
+    ? staticPropertyExpression(name.expression)
+    : null;
+}
+
+function isClassInterfaceOrTypeMember(node: ts.Node): boolean {
+  if (
+    !(
+      ts.isMethodDeclaration(node) ||
+      ts.isPropertyDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node) ||
+      ts.isMethodSignature(node) ||
+      ts.isPropertySignature(node)
+    )
+  ) {
+    return false;
+  }
+  const { parent } = node;
   return (
-    declarations !== undefined &&
-    declarations.length > 0 &&
-    declarations.every(isPrivateOrProtected)
+    ts.isClassDeclaration(parent) ||
+    ts.isClassExpression(parent) ||
+    ts.isInterfaceDeclaration(parent) ||
+    ts.isTypeLiteralNode(parent)
   );
 }
 
-function isExternalDeclaration(declaration: ts.Declaration): boolean {
-  const sourceFile = declaration.getSourceFile();
-  return (
-    sourceFile.isDeclarationFile ||
-    canonicalFileName(sourceFile.fileName).includes("/node_modules/")
-  );
-}
-
-function typeHasSourceDeclaration(type: ts.Type): boolean {
-  const symbols = [type.aliasSymbol, type.getSymbol()];
-  for (let symbolIndex = 0; symbolIndex < symbols.length; symbolIndex += 1) {
-    const symbol = symbols[symbolIndex];
-    if (
-      symbol
-        ?.getDeclarations()
-        ?.some((declaration) => !isExternalDeclaration(declaration)) === true
-    ) {
-      return true;
-    }
+function isPublicConstructorParameterProperty(node: ts.Node): boolean {
+  if (!ts.isParameter(node) || !ts.isConstructorDeclaration(node.parent)) {
+    return false;
   }
-  return symbols.every((symbol) => symbol === undefined);
+  const isParameterProperty =
+    hasModifier(node, ts.SyntaxKind.PublicKeyword) ||
+    hasModifier(node, ts.SyntaxKind.PrivateKeyword) ||
+    hasModifier(node, ts.SyntaxKind.ProtectedKeyword) ||
+    hasModifier(node, ts.SyntaxKind.ReadonlyKeyword);
+  return isParameterProperty && !isPrivateOrProtected(node);
 }
 
-const CLOSED_LEAF_TYPE_FLAGS =
-  ts.TypeFlags.String |
-  ts.TypeFlags.Number |
-  ts.TypeFlags.BigInt |
-  ts.TypeFlags.Boolean |
-  ts.TypeFlags.ESSymbol |
-  ts.TypeFlags.StringLiteral |
-  ts.TypeFlags.NumberLiteral |
-  ts.TypeFlags.BigIntLiteral |
-  ts.TypeFlags.BooleanLiteral |
-  ts.TypeFlags.UniqueESSymbol |
-  ts.TypeFlags.EnumLiteral |
-  ts.TypeFlags.Void |
-  ts.TypeFlags.Undefined |
-  ts.TypeFlags.Null |
-  ts.TypeFlags.Never;
-const CLOSED_OBJECT_SHAPE_FLAGS =
-  ts.ObjectFlags.Class |
-  ts.ObjectFlags.Interface |
-  ts.ObjectFlags.Reference |
-  ts.ObjectFlags.Tuple |
-  ts.ObjectFlags.Anonymous |
-  ts.ObjectFlags.Mapped |
-  ts.ObjectFlags.ObjectLiteral;
-const OBJECT_FLAG_PRIMITIVE_UNION = 1 << 15;
-const OBJECT_FLAG_CONTAINS_WIDENING_TYPE = 1 << 16;
-const OBJECT_FLAG_CONTAINS_OBJECT_OR_ARRAY_LITERAL = 1 << 17;
-const OBJECT_FLAG_NON_INFERRABLE_TYPE = 1 << 18;
-const OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES_COMPUTED = 1 << 19;
-const OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES = 1 << 20;
-const OBJECT_FLAG_IS_CLASS_INSTANCE_CLONE = 1 << 24;
-const OBJECT_FLAG_IDENTICAL_BASE_TYPE_CALCULATED = 1 << 25;
-const OBJECT_FLAG_IDENTICAL_BASE_TYPE_EXISTS = 1 << 26;
-const CLOSED_OBJECT_METADATA_FLAGS =
-  ts.ObjectFlags.Instantiated |
-  ts.ObjectFlags.FreshLiteral |
-  ts.ObjectFlags.ArrayLiteral |
-  OBJECT_FLAG_CONTAINS_WIDENING_TYPE |
-  OBJECT_FLAG_CONTAINS_OBJECT_OR_ARRAY_LITERAL |
-  OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES_COMPUTED |
-  OBJECT_FLAG_COULD_CONTAIN_TYPE_VARIABLES |
-  OBJECT_FLAG_IDENTICAL_BASE_TYPE_CALCULATED |
-  ts.ObjectFlags.SingleSignatureType;
-const UNRESOLVED_OBJECT_FLAGS =
-  ts.ObjectFlags.EvolvingArray |
-  ts.ObjectFlags.ObjectLiteralPatternWithComputedProperties |
-  ts.ObjectFlags.ReverseMapped |
-  ts.ObjectFlags.JsxAttributes |
-  ts.ObjectFlags.JSLiteral |
-  OBJECT_FLAG_PRIMITIVE_UNION |
-  OBJECT_FLAG_NON_INFERRABLE_TYPE |
-  ts.ObjectFlags.ContainsSpread |
-  ts.ObjectFlags.ObjectRestType |
-  ts.ObjectFlags.InstantiationExpressionType |
-  OBJECT_FLAG_IS_CLASS_INSTANCE_CLONE |
-  OBJECT_FLAG_IDENTICAL_BASE_TYPE_EXISTS;
-const CLASSIFIED_OBJECT_FLAGS =
-  CLOSED_OBJECT_SHAPE_FLAGS |
-  CLOSED_OBJECT_METADATA_FLAGS |
-  UNRESOLVED_OBJECT_FLAGS;
-
-function collectCapabilityNames(surface: ProgramSurface): readonly string[] {
-  const { program, sourceFiles } = surface;
-  const checker = program.getTypeChecker();
+function forbiddenPublicMemberNames(
+  sourceFile: ts.SourceFile,
+): readonly string[] {
   const names = new Set<string>();
-  const visitedTypes = new Set<ts.Type>();
-  const visitedModules = new Set<ts.Symbol>();
-
-  const visitType = (type: ts.Type, force: boolean): void => {
+  const visit = (node: ts.Node): void => {
     if (
-      (type.flags &
-        (ts.TypeFlags.Any |
-          ts.TypeFlags.Unknown |
-          ts.TypeFlags.TypeParameter)) !==
-      0
+      (isClassInterfaceOrTypeMember(node) && !isPrivateOrProtected(node)) ||
+      isPublicConstructorParameterProperty(node)
     ) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      return;
-    }
-    if (
-      (type.flags & CLOSED_LEAF_TYPE_FLAGS) !== 0 &&
-      (type.flags & ~CLOSED_LEAF_TYPE_FLAGS) === 0
-    ) {
-      return;
-    }
-    if (visitedTypes.has(type)) return;
-    visitedTypes.add(type);
-
-    if (type.isUnionOrIntersection()) {
-      for (let index = 0; index < type.types.length; index += 1) {
-        const nested = type.types[index];
-        if (nested !== undefined) visitType(nested, force);
-      }
-      return;
-    }
-    if ((type.flags & ts.TypeFlags.Object) === 0) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      return;
-    }
-    if (!force && !typeHasSourceDeclaration(type)) return;
-    const objectFlags = (type as ts.ObjectType).objectFlags;
-    if (
-      (objectFlags & CLOSED_OBJECT_SHAPE_FLAGS) === 0 ||
-      (objectFlags & UNRESOLVED_OBJECT_FLAGS) !== 0 ||
-      (objectFlags & ~CLASSIFIED_OBJECT_FLAGS) !== 0
-    ) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      return;
-    }
-    const aliasTypeArguments = type.aliasTypeArguments ?? [];
-    for (let index = 0; index < aliasTypeArguments.length; index += 1) {
-      const argument = aliasTypeArguments[index];
-      if (argument !== undefined) visitType(argument, true);
-    }
-    for (const declaration of type.aliasSymbol?.getDeclarations() ?? []) {
-      if (!ts.isTypeAliasDeclaration(declaration)) continue;
-      const parameters = declaration.typeParameters ?? [];
-      for (
-        let index = aliasTypeArguments.length;
-        index < parameters.length;
-        index += 1
-      ) {
-        const parameter = parameters[index];
-        if (parameter?.default === undefined) {
-          names.add(UNRESOLVED_PUBLIC_NAME);
-          continue;
-        }
-        try {
-          visitType(checker.getTypeFromTypeNode(parameter.default), true);
-        } catch {
-          names.add(UNRESOLVED_PUBLIC_NAME);
-        }
+      const name = staticDeclarationName((node as ts.NamedDeclaration).name);
+      if (name !== null && FORBIDDEN_PUBLIC_MEMBERS.has(name)) {
+        names.add(name);
       }
     }
-    if ((objectFlags & ts.ObjectFlags.Reference) !== 0) {
-      let referenceArguments: readonly ts.Type[];
-      try {
-        referenceArguments = checker.getTypeArguments(type as ts.TypeReference);
-      } catch {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-        return;
-      }
-      for (let index = 0; index < referenceArguments.length; index += 1) {
-        const argument = referenceArguments[index];
-        if (argument !== undefined) visitType(argument, true);
-      }
-    }
-
-    for (const symbol of [type.aliasSymbol, type.getSymbol()]) {
-      for (const declaration of symbol?.getDeclarations() ?? []) {
-        scanComputedDeclaration(declaration, names);
-      }
-    }
-    if (
-      checker.getIndexInfoOfType(type, ts.IndexKind.String) !== undefined ||
-      checker.getIndexInfoOfType(type, ts.IndexKind.Number) !== undefined
-    ) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-    }
-
-    const interfaceType = type as ts.InterfaceType;
-    if (
-      (interfaceType.objectFlags &
-        (ts.ObjectFlags.Class | ts.ObjectFlags.Interface)) !==
-      0
-    ) {
-      for (const base of checker.getBaseTypes(interfaceType) ?? []) {
-        visitType(base, true);
-      }
-    }
-
-    const properties = checker.getPropertiesOfType(type);
-    for (let index = 0; index < properties.length; index += 1) {
-      const property = properties[index];
-      if (property === undefined || symbolIsNonPublic(property)) continue;
-      const propertyName = property.getName();
-      if (propertyName.startsWith("#")) continue;
-      if (
-        propertyName.startsWith("__@") ||
-        propertyName.includes("__computed")
-      ) {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-        continue;
-      }
-      const declarations = property.getDeclarations() ?? [];
-      const location =
-        property.valueDeclaration ?? declarations[0] ?? sourceFiles[0];
-      if (location === undefined) {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-        continue;
-      }
-      let propertyType: ts.Type;
-      try {
-        propertyType = checker.getTypeOfSymbolAtLocation(property, location);
-      } catch {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-        continue;
-      }
-      if (
-        (propertyType.flags &
-          (ts.TypeFlags.Any |
-            ts.TypeFlags.Unknown |
-            ts.TypeFlags.TypeParameter)) !==
-        0
-      ) {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-        continue;
-      }
-      const declaredCapability = declarations.some(
-        (declaration) =>
-          ts.isMethodDeclaration(declaration) ||
-          ts.isMethodSignature(declaration) ||
-          ts.isGetAccessorDeclaration(declaration) ||
-          ts.isSetAccessorDeclaration(declaration),
-      );
-      if (
-        declaredCapability ||
-        checker.getSignaturesOfType(propertyType, ts.SignatureKind.Call)
-          .length > 0
-      ) {
-        names.add(propertyName);
-        continue;
-      }
-      if (propertyName !== "prototype") visitType(propertyType, false);
-    }
+    ts.forEachChild(node, visit);
   };
-
-  const resolveAlias = (symbol: ts.Symbol): ts.Symbol | null => {
-    const seen = new Set<ts.Symbol>();
-    let current = symbol;
-    while ((current.flags & ts.SymbolFlags.Alias) !== 0) {
-      if (seen.has(current)) return null;
-      seen.add(current);
-      try {
-        current = checker.getAliasedSymbol(current);
-      } catch {
-        return null;
-      }
-    }
-    return current;
-  };
-
-  const visitTypeReferenceArguments = (
-    reference: ts.TypeReferenceNode,
-  ): void => {
-    const referenced = checker.getSymbolAtLocation(reference.typeName);
-    if (referenced === undefined) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      return;
-    }
-    const target = resolveAlias(referenced);
-    if (target === null) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      return;
-    }
-    const parameters: ts.TypeParameterDeclaration[] = [];
-    for (const declaration of target.getDeclarations() ?? []) {
-      const declaredParameters =
-        ts.isTypeAliasDeclaration(declaration) ||
-        ts.isInterfaceDeclaration(declaration) ||
-        ts.isClassDeclaration(declaration)
-          ? declaration.typeParameters
-          : undefined;
-      for (const parameter of declaredParameters ?? []) {
-        parameters.push(parameter);
-      }
-    }
-    const arguments_ = reference.typeArguments ?? [];
-    for (let index = 0; index < arguments_.length; index += 1) {
-      const argument = arguments_[index];
-      if (argument === undefined) continue;
-      try {
-        visitType(checker.getTypeFromTypeNode(argument), true);
-      } catch {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-      }
-    }
-    for (let index = arguments_.length; index < parameters.length; index += 1) {
-      const parameter = parameters[index];
-      if (parameter?.default === undefined) {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-        continue;
-      }
-      try {
-        visitType(checker.getTypeFromTypeNode(parameter.default), true);
-      } catch {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-      }
-    }
-  };
-
-  const visitExport = (exported: ts.Symbol): void => {
-    const target = resolveAlias(exported);
-    if (target === null) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      return;
-    }
-    for (const declaration of target.getDeclarations() ?? []) {
-      scanComputedDeclaration(declaration, names);
-      if (
-        ts.isTypeAliasDeclaration(declaration) &&
-        ts.isTypeReferenceNode(declaration.type)
-      ) {
-        visitTypeReferenceArguments(declaration.type);
-      }
-    }
-
-    if ((target.flags & ts.SymbolFlags.Module) !== 0) {
-      if (visitedModules.has(target)) return;
-      visitedModules.add(target);
-      for (const nested of checker.getExportsOfModule(target)) {
-        visitExport(nested);
-      }
-    }
-
-    const location =
-      target.valueDeclaration ??
-      target.getDeclarations()?.[0] ??
-      sourceFiles[0];
-    let inspected = false;
-    if (
-      (target.flags &
-        (ts.SymbolFlags.Class |
-          ts.SymbolFlags.Interface |
-          ts.SymbolFlags.TypeAlias |
-          ts.SymbolFlags.TypeParameter |
-          ts.SymbolFlags.Enum)) !==
-      0
-    ) {
-      inspected = true;
-      try {
-        visitType(checker.getDeclaredTypeOfSymbol(target), true);
-      } catch {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-      }
-    }
-    if ((target.flags & ts.SymbolFlags.Value) !== 0) {
-      inspected = true;
-      if (location === undefined) {
-        names.add(UNRESOLVED_PUBLIC_NAME);
-      } else {
-        try {
-          const valueType = checker.getTypeOfSymbolAtLocation(target, location);
-          if (
-            (valueType.flags &
-              (ts.TypeFlags.Any |
-                ts.TypeFlags.Unknown |
-                ts.TypeFlags.TypeParameter)) !==
-            0
-          ) {
-            names.add(UNRESOLVED_PUBLIC_NAME);
-          } else if (
-            checker.getSignaturesOfType(valueType, ts.SignatureKind.Call)
-              .length > 0
-          ) {
-            names.add(exported.getName());
-          } else {
-            visitType(valueType, true);
-          }
-        } catch {
-          names.add(UNRESOLVED_PUBLIC_NAME);
-        }
-      }
-    }
-    if (!inspected) names.add(UNRESOLVED_PUBLIC_NAME);
-  };
-
-  for (let index = 0; index < sourceFiles.length; index += 1) {
-    const sourceFile = sourceFiles[index];
-    if (sourceFile === undefined) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-      continue;
-    }
-    const diagnostics = [
-      ...program.getSyntacticDiagnostics(sourceFile),
-      ...program.getSemanticDiagnostics(sourceFile),
-    ];
-    if (
-      diagnostics.some(
-        ({ category }) => category === ts.DiagnosticCategory.Error,
-      )
-    ) {
-      names.add(UNRESOLVED_PUBLIC_NAME);
-    }
-    const moduleSymbol = checker.getSymbolAtLocation(sourceFile);
-    if (moduleSymbol === undefined) {
-      continue;
-    }
-    for (const exported of checker.getExportsOfModule(moduleSymbol)) {
-      visitExport(exported);
-    }
-  }
+  visit(sourceFile);
   return Object.freeze([...names].sort());
 }
 
-function publicCapabilityNames(contents: string): readonly string[] {
-  return collectCapabilityNames(
-    virtualSurface({ "github-capability-fixture.ts": contents }, [
-      "github-capability-fixture.ts",
-    ]),
+function sameNames(
+  actual: readonly string[],
+  expected: readonly string[],
+): boolean {
+  return (
+    actual.length === expected.length &&
+    actual.every((name, index) => name === expected[index])
   );
 }
 
-function publicCapabilityNamesFromModules(
-  modules: Readonly<Record<string, string>>,
-  entryName = "github-capability-fixture.ts",
-): readonly string[] {
-  return collectCapabilityNames(virtualSurface(modules, [entryName]));
+function boundaryCompilerDiagnostics(
+  program: ts.Program,
+): readonly ts.Diagnostic[] {
+  const boundarySources = [
+    CONTRACT_PROBE_FILE,
+    GITHUB_PORT_FILE,
+    GITHUB_ADAPTER_FILE,
+    ALLOWED_OPERATIONS_FILE,
+  ].map((fileName) => requiredSourceFile(program, fileName));
+  return [
+    ...program.getOptionsDiagnostics(),
+    ...program.getGlobalDiagnostics(),
+    ...boundarySources.flatMap((sourceFile) => [
+      ...program.getSyntacticDiagnostics(sourceFile),
+      ...program.getSemanticDiagnostics(sourceFile),
+    ]),
+  ].filter(({ category }) => category === ts.DiagnosticCategory.Error);
+}
+
+function proveProductionBoundary(
+  overrides: SourceOverrides = {},
+  options: ProofOptions = {},
+): BoundaryProof {
+  const program = productionProgram(overrides);
+  const checker = program.getTypeChecker();
+  const portSource = requiredSourceFile(program, GITHUB_PORT_FILE);
+  const adapterSource = requiredSourceFile(program, GITHUB_ADAPTER_FILE);
+  const portExports = moduleExportNames(checker, portSource);
+  const adapterExports = moduleExportNames(checker, adapterSource);
+  const issues = new Set<BoundaryIssue>();
+  if (!sameNames(portExports, APPROVED_PORT_EXPORTS)) {
+    issues.add("port-module-exports");
+  }
+  if (!sameNames(adapterExports, APPROVED_ADAPTER_EXPORTS)) {
+    issues.add("adapter-module-exports");
+  }
+  let portMembers: readonly string[] = Object.freeze([]);
+  let adapterMembers: readonly string[] = Object.freeze([]);
+  let forbiddenMembers: readonly string[] = Object.freeze([]);
+  if (issues.size === 0) {
+    portMembers = publicTypeMemberNames(
+      checker,
+      requiredExport(checker, portSource, "GitHubPort"),
+    );
+    adapterMembers = adapterPublicMemberNames(
+      checker,
+      requiredExport(checker, adapterSource, "OctokitGitHubAdapter"),
+      adapterSource,
+    );
+    forbiddenMembers = Object.freeze(
+      [
+        ...forbiddenPublicMemberNames(portSource),
+        ...forbiddenPublicMemberNames(adapterSource),
+      ]
+        .filter((name, index, names) => names.indexOf(name) === index)
+        .sort(),
+    );
+    if (!sameNames(portMembers, APPROVED_GITHUB_CAPABILITIES)) {
+      issues.add("port-public-members");
+    }
+    if (!sameNames(adapterMembers, APPROVED_GITHUB_CAPABILITIES)) {
+      issues.add("adapter-public-members");
+    }
+    if (forbiddenMembers.length > 0) {
+      issues.add("forbidden-public-member");
+    }
+  }
+  const diagnostics =
+    issues.size === 0 || options.forceCompiler === true
+      ? boundaryCompilerDiagnostics(program)
+      : [];
+  if (diagnostics.length > 0) {
+    issues.add("compiler-contract");
+  }
+  return Object.freeze({
+    issues: Object.freeze([...issues]),
+    diagnostics: Object.freeze(diagnostics),
+    portExports,
+    adapterExports,
+    portMembers,
+    adapterMembers,
+    forbiddenMembers,
+  });
+}
+
+function withPortSource(source: string): SourceOverrides {
+  return { [GITHUB_PORT_FILE]: source };
+}
+
+function withAdapterSource(source: string): SourceOverrides {
+  return { [GITHUB_ADAPTER_FILE]: source };
+}
+
+function withAdapterMembers(members: string): string {
+  const classEnd = GITHUB_ADAPTER_SOURCE.lastIndexOf("\n}");
+  if (classEnd < 0) throw new Error("Adapter class closing brace is missing");
+  return `${GITHUB_ADAPTER_SOURCE.slice(0, classEnd)}\n${members}\n${GITHUB_ADAPTER_SOURCE.slice(classEnd)}`;
+}
+
+function diagnosticTouches(proof: BoundaryProof, fileName: string): boolean {
+  const expected = canonicalFileName(fileName);
+  return proof.diagnostics.some(
+    (diagnostic) =>
+      diagnostic.file !== undefined &&
+      canonicalFileName(diagnostic.file.fileName) === expected,
+  );
 }
 
 describe("GitHub capability boundary", () => {
-  it("publishes exactly the six reviewed Star and User List mutations", () => {
+  it("publishes exactly the frozen six-name mutation tuple", () => {
     expect(GITHUB_MUTATION_METHOD_NAMES).toEqual([
       "star",
       "unstar",
@@ -902,330 +580,225 @@ describe("GitHub capability boundary", () => {
     expect(Object.isFrozen(GITHUB_MUTATION_METHOD_NAMES)).toBe(true);
   });
 
-  it("keeps each complete public GitHub capability surface on the exact reviewed allowlist", () => {
-    for (const fileName of [GITHUB_PORT_FILE, GITHUB_ADAPTER_FILE]) {
-      expect(collectCapabilityNames(projectSurface(fileName))).toEqual(
-        APPROVED_GITHUB_CAPABILITIES,
-      );
-    }
-  }, 90_000);
+  it("proves the unchanged production contract, exports, and public members", () => {
+    const proof = proveProductionBoundary();
+
+    expect({
+      issues: proof.issues,
+      diagnosticCount: proof.diagnostics.length,
+      portExports: proof.portExports,
+      adapterExports: proof.adapterExports,
+      portMembers: proof.portMembers,
+      adapterMembers: proof.adapterMembers,
+      forbiddenMembers: proof.forbiddenMembers,
+    }).toEqual({
+      issues: [],
+      diagnosticCount: 0,
+      portExports: APPROVED_PORT_EXPORTS,
+      adapterExports: APPROVED_ADAPTER_EXPORTS,
+      portMembers: APPROVED_GITHUB_CAPABILITIES,
+      adapterMembers: APPROVED_GITHUB_CAPABILITIES,
+      forbiddenMembers: [],
+    });
+  });
+
+  it("rejects a seventh port method and proves the mutation tuple is exhaustive", () => {
+    const changed = requiredReplacement(
+      GITHUB_PORT_SOURCE,
+      "export interface GitHubMutationPort {",
+      `export interface GitHubMutationPort {
+  seventhMutation(
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt>;`,
+    );
+    const proof = proveProductionBoundary(withPortSource(changed), {
+      forceCompiler: true,
+    });
+
+    expect(proof.issues).toContain("compiler-contract");
+    expect(proof.issues).toContain("port-public-members");
+    expect(diagnosticTouches(proof, ALLOWED_OPERATIONS_FILE)).toBe(true);
+  });
+
+  it("rejects a changed existing return type that exposes a client shape", () => {
+    const changed = requiredReplacement(
+      GITHUB_PORT_SOURCE,
+      "getViewer(signal?: AbortSignal): Promise<AccountBinding>;",
+      "getViewer(signal?: AbortSignal): Promise<AccountBinding & { readonly client: { request<T>(input: T): T } }>;",
+    );
+    const proof = proveProductionBoundary(withPortSource(changed), {
+      forceCompiler: true,
+    });
+
+    expect(proof.issues).toContain("compiler-contract");
+    expect(proof.portMembers).toEqual(APPROVED_GITHUB_CAPABILITIES);
+  });
+
+  it("rejects a changed existing parameter contract", () => {
+    const changed = requiredReplacement(
+      GITHUB_PORT_SOURCE,
+      "getViewer(signal?: AbortSignal): Promise<AccountBinding>;",
+      "getViewer(signal: AbortSignal): Promise<AccountBinding>;",
+    );
+    const proof = proveProductionBoundary(withPortSource(changed));
+
+    expect(proof.issues).toContain("compiler-contract");
+    expect(proof.portMembers).toEqual(APPROVED_GITHUB_CAPABILITIES);
+  });
+
+  it.each([
+    ["method", "  public boundaryMethod(): void {}"],
+    ["property", "  public readonly boundaryProperty = true;"],
+    ["accessor", "  public get boundaryAccessor(): boolean { return true; }"],
+    ["computed member", '  public ["boundary" + "Computed"](): void {}'],
+  ])("rejects an extra public adapter %s", (_label, member) => {
+    const proof = proveProductionBoundary(
+      withAdapterSource(withAdapterMembers(member)),
+    );
+
+    expect(proof.issues).toContain("adapter-public-members");
+  });
+
+  it("rejects a public adapter constructor parameter property", () => {
+    const changed = requiredReplacement(
+      GITHUB_ADAPTER_SOURCE,
+      "constructor(transport: GitHubTransport) {",
+      "constructor(transport: GitHubTransport, public readonly boundaryParameter: unknown) {",
+    );
+    const proof = proveProductionBoundary(withAdapterSource(changed));
+
+    expect(proof.issues).toContain("adapter-public-members");
+  });
 
   it.each([
     [
-      "generic method",
-      "request",
-      "export class Escape { public async request<T>(input: unknown): Promise<T> { throw input; } }",
+      "port helper",
+      GITHUB_PORT_FILE,
+      GITHUB_PORT_SOURCE,
+      "\nexport function boundaryHelper(): void {}\n",
+      "port-module-exports",
     ],
     [
-      "static method",
+      "port object",
+      GITHUB_PORT_FILE,
+      GITHUB_PORT_SOURCE,
+      "\nexport const boundaryObject = Object.freeze({ safe: true });\n",
+      "port-module-exports",
+    ],
+    [
+      "port alias",
+      GITHUB_PORT_FILE,
+      GITHUB_PORT_SOURCE,
+      "\nexport type BoundaryAlias = GitHubPort;\n",
+      "port-module-exports",
+    ],
+    [
+      "port re-export",
+      GITHUB_PORT_FILE,
+      GITHUB_PORT_SOURCE,
+      '\nexport { AppError as BoundaryReexport } from "../../domain/errors.js";\n',
+      "port-module-exports",
+    ],
+    [
+      "adapter helper",
+      GITHUB_ADAPTER_FILE,
+      GITHUB_ADAPTER_SOURCE,
+      "\nexport function boundaryHelper(): void {}\n",
+      "adapter-module-exports",
+    ],
+    [
+      "adapter object",
+      GITHUB_ADAPTER_FILE,
+      GITHUB_ADAPTER_SOURCE,
+      "\nexport const boundaryObject = Object.freeze({ safe: true });\n",
+      "adapter-module-exports",
+    ],
+    [
+      "adapter alias",
+      GITHUB_ADAPTER_FILE,
+      GITHUB_ADAPTER_SOURCE,
+      "\nexport type BoundaryAlias = OctokitGitHubAdapter;\n",
+      "adapter-module-exports",
+    ],
+    [
+      "adapter re-export",
+      GITHUB_ADAPTER_FILE,
+      GITHUB_ADAPTER_SOURCE,
+      '\nexport { AppError as BoundaryReexport } from "../domain/errors.js";\n',
+      "adapter-module-exports",
+    ],
+    [
+      "exported client object",
+      GITHUB_PORT_FILE,
+      GITHUB_PORT_SOURCE,
+      "\nexport const boundaryClient = { request(): void {} };\n",
+      "port-module-exports",
+    ],
+    [
+      "exported construct value",
+      GITHUB_ADAPTER_FILE,
+      GITHUB_ADAPTER_SOURCE,
+      "\nexport class BoundaryConstructor {}\n",
+      "adapter-module-exports",
+    ],
+  ] as const)(
+    "rejects an extra %s before inspecting its nested surface",
+    (_label, fileName, source, addition, expectedIssue) => {
+      const proof = proveProductionBoundary({
+        [fileName]: `${source}${addition}`,
+      });
+
+      expect(proof.issues).toContain(expectedIssue);
+      expect(proof.diagnostics).toEqual([]);
+      expect(proof.portMembers).toEqual([]);
+      expect(proof.adapterMembers).toEqual([]);
+    },
+  );
+
+  it.each([
+    [
+      "direct request",
+      "  public request<T>(input: T): T { return input; }",
+      "request",
+    ],
+    [
+      "direct graphql",
+      "  public graphql<T>(input: T): T { return input; }",
       "graphql",
-      "export class Escape { public static graphql<T>(input: T): T { return input; } }",
     ],
+    ["computed request", '  public ["re" + "quest"](): void {}', "request"],
+    ["computed graphql", '  public ["graph" + "ql"](): void {}', "graphql"],
     [
-      "public property",
-      "request",
-      "export class Escape { public request = (input: unknown): unknown => input; }",
-    ],
-    [
-      "interface generic method",
-      "graphql",
-      "export interface Escape { graphql<T>(input: unknown): T; }",
-    ],
-    [
-      "interface generic function property",
-      "request",
-      "export interface Escape { request: <T>(input: T) => T; }",
-    ],
-    [
-      "computed public property",
-      "request",
-      'export class Escape { public ["request"] = (input: unknown): unknown => input; }',
-    ],
-    [
-      "constructor parameter property",
-      "request",
-      "export class Escape { constructor(public readonly request: (input: unknown) => unknown) {} }",
-    ],
-    [
-      "default-public readonly constructor parameter property",
-      "graphql",
-      "export class Escape { constructor(readonly graphql: (input: unknown) => unknown) {} }",
-    ],
-    [
-      "public type-literal method",
-      "graphql",
-      "export type Escape = { graphql<T>(input: unknown): T };",
-    ],
-    [
-      "public type-literal function property",
-      "request",
-      "export type Escape = { request: <T>(input: T) => T };",
-    ],
-    [
-      "forbidden administration method",
+      "repository administration",
+      "  public deleteRepository(): void {}",
       "deleteRepository",
-      "export class Escape { deleteRepository(): void {} }",
     ],
-  ])("detects a public %s structurally", (_name, capability, contents) => {
-    expect(publicCapabilityNames(contents)).toContain(capability);
-  });
-
-  it("resolves static computed names and rejects unresolvable public computed names", () => {
-    expect(
-      publicCapabilityNames(
-        'export class Escape { public ["re" + "quest"](): void {} }',
-      ),
-    ).toEqual(["request"]);
-    expect(
-      publicCapabilityNames(
-        "declare const key: string; export class Escape { public [key]<T>(): T { throw new Error(); } }",
-      ),
-    ).toEqual([UNRESOLVED_PUBLIC_NAME]);
-  });
-
-  it("collects the complete mutation surface so seventh and administration mutations cannot hide", () => {
-    const approved = `
-      export interface GitHubMutationPort {
-        star(): void;
-        unstar(): void;
-        createUserList(): void;
-        updateUserList(): void;
-        deleteUserList(): void;
-        setRepositoryListIds(): void;
-      }
-    `;
-    const seventh = approved.replace(
-      "\n      }",
-      "\n        renameUserList(): void;\n      }",
-    );
-    const administration = approved.replace(
-      "\n      }",
-      "\n        deleteRepository(): void;\n      }",
+  ])("rejects a %s member in production source", (_label, member, name) => {
+    const proof = proveProductionBoundary(
+      withAdapterSource(withAdapterMembers(member)),
     );
 
-    expect(publicCapabilityNames(approved)).toEqual(
-      APPROVED_MUTATION_CAPABILITIES,
-    );
-    expect(publicCapabilityNames(seventh)).toEqual(
-      [...APPROVED_MUTATION_CAPABILITIES, "renameUserList"].sort(),
-    );
-    expect(publicCapabilityNames(administration)).toEqual(
-      [...APPROVED_MUTATION_CAPABILITIES, "deleteRepository"].sort(),
-    );
+    expect(proof.issues).toContain("adapter-public-members");
+    expect(proof.issues).toContain("forbidden-public-member");
+    expect(proof.forbiddenMembers).toContain(name);
   });
 
-  it("includes callable properties from exported object literals", () => {
-    expect(
-      publicCapabilityNames(`
-        const internal = { request(): void {} };
-        export const escape = {
-          request<T>(input: T): T { return input; },
-        };
-        void internal;
-      `),
-    ).toEqual(["request"]);
-  });
+  it("ignores comments, strings, private, protected, and #private controls", () => {
+    const changed = `${withAdapterMembers(`
+  private request<T>(input: T): T { return input; }
+  protected graphql<T>(input: T): T { return input; }
+  private deleteRepository(): void {}
+  #rawRequest(): void {}
+`)}
+// request(), graphql(), deleteRepository(), updateFile(), and rawRequest().
+const boundaryWords =
+  "archiveRepository transferRepository createOrUpdateFile request graphql";
+void boundaryWords;
+`;
+    const proof = proveProductionBoundary(withAdapterSource(changed));
 
-  it.each([
-    ["Readonly type aliases", "export type E = Readonly<{ request<T>(): T }>;"],
-    [
-      "intersection type aliases",
-      "export type E = { safe: true } & { request<T>(): T };",
-    ],
-    [
-      "export-list aliases",
-      `
-        const E = {
-          request<T>(): T { throw new Error(); },
-        };
-        export { E };
-      `,
-    ],
-    [
-      "Object.assign compositions",
-      `
-        export const E = Object.assign({}, {
-          request<T>(): T { throw new Error(); },
-        });
-      `,
-    ],
-  ])("resolves callable capabilities through %s", (_name, contents) => {
-    expect(publicCapabilityNames(contents)).toContain("request");
-  });
-
-  it("resolves callable capabilities through re-exports", () => {
-    expect(
-      publicCapabilityNamesFromModules({
-        "github-capability-base.ts": "export interface E { request<T>(): T; }",
-        "github-capability-fixture.ts":
-          'export { E } from "./github-capability-base.js";',
-      }),
-    ).toEqual(["request"]);
-  });
-
-  it("fails closed for an unresolved public re-export", () => {
-    expect(
-      publicCapabilityNames(
-        'export { E } from "./missing-capability-module.js";',
-      ),
-    ).toEqual([UNRESOLVED_PUBLIC_NAME]);
-  });
-
-  it("resolves inherited and nested callable export surfaces without exposing container keys", () => {
-    expect(
-      publicCapabilityNames(`
-        interface Base {
-          request<T>(): T;
-        }
-        export interface E extends Base {
-          nested: {
-            graphql<T>(): T;
-          };
-        }
-      `),
-    ).toEqual(["graphql", "request"]);
-  });
-
-  it("fails closed when an exported capability surface has type any", () => {
-    expect(
-      publicCapabilityNames(`
-        declare const unresolved: any;
-        export { unresolved as E };
-      `),
-    ).toEqual([UNRESOLVED_PUBLIC_NAME]);
-  });
-
-  it.each([
-    [
-      "conditional",
-      "export type E<T> = T extends string ? { request(): void } : {};",
-    ],
-    [
-      "nested conditional",
-      `
-        export type E<T> = {
-          nested: T extends string
-            ? T extends "safe" ? { request(): void } : {}
-            : {};
-        };
-      `,
-    ],
-    ["keyof/index", "export type E<T> = keyof T;"],
-    ["indexed access", "export type E<T, K extends keyof T> = T[K];"],
-    [
-      "infer-dependent substitution",
-      "export type E<T> = T extends { value: infer U } ? U : never;",
-    ],
-    ["type parameter", "export type E<T> = T;"],
-    ["string mapping", "export type E<T extends string> = Uppercase<T>;"],
-    ["non-primitive keyword", "export type E = object;"],
-    ["template literal", "export type E = `prefix-${string}`;"],
-  ])(
-    "fails closed for the unresolved TypeFlags family %s",
-    (_name, contents) => {
-      expect(publicCapabilityNames(contents)).toEqual([UNRESOLVED_PUBLIC_NAME]);
-    },
-  );
-
-  it.each([
-    ["open mapped", "export type E<T> = { [K in keyof T]: T[K] };"],
-    [
-      "callable open mapped",
-      "export type E<T> = { [K in keyof T]: () => T[K] };",
-    ],
-    [
-      "generic reference",
-      "type Box<T> = { value: T }; export type E<T> = Box<T>;",
-    ],
-    [
-      "default-any instantiation",
-      "type Box<T = any> = {}; export type E = Box;",
-    ],
-    [
-      "instantiated open mapped alias",
-      "type Mapper<T> = { [K in keyof T]: () => void }; export type E<T> = Mapper<T>;",
-    ],
-    ["open callable", "export type E<T> = () => T;"],
-    ["array/indexed", "export type E = readonly string[];"],
-    ["tuple/reference", "export type E = readonly [string];"],
-    ["unresolved alias", "export type E = MissingCapabilityAlias;"],
-  ])(
-    "fails closed for the unresolved ObjectFlags family %s",
-    (_name, contents) => {
-      expect(publicCapabilityNames(contents)).toContain(UNRESOLVED_PUBLIC_NAME);
-    },
-  );
-
-  it("accepts only closed primitive, literal, object, wrapper, intersection, and callable controls", () => {
-    expect(
-      publicCapabilityNames(`
-        export type Primitive =
-          | string | number | bigint | boolean | symbol
-          | "safe" | 42 | 42n | true
-          | never | void | null | undefined;
-        export type ClosedObject = {
-          nested: {
-            value: string;
-          };
-        };
-        export type ClosedReadonly = Readonly<{
-          nested: {
-            value: number;
-          };
-        }>;
-        export type ClosedIntersection =
-          { left: string } & { right: number };
-        export type ClosedMapped = {
-          readonly [K in keyof { safe: string }]:
-            { safe: string }[K];
-        };
-        export type ClosedCall = () => string;
-      `),
-    ).toEqual([]);
-    expect(
-      publicCapabilityNames(
-        "export type ClosedCallable = { request<T>(): T };",
-      ),
-    ).toEqual(["request"]);
-  });
-
-  it("makes the mutation manifest fail compilation when GitHubMutationPort grows", () => {
-    expect(compilerDiagnosticsWithMutation(null)).toEqual([]);
-    expect(
-      compilerDiagnosticsWithMutation(
-        "seventhMutation(operationId: string): Promise<void>;",
-      ).length,
-    ).toBeGreaterThan(0);
-    expect(
-      compilerDiagnosticsWithMutation(
-        "deleteRepository(operationId: string): Promise<void>;",
-      ).length,
-    ).toBeGreaterThan(0);
-  }, 90_000);
-
-  it("ignores comments, strings, non-exported object literals, and non-public class members", () => {
-    const contents = `
-      // deleteRepository, updateFile, request(, and graphql( are forbidden prose.
-      const text = "archiveRepository transferRepository rawRequest request(";
-      const template = \`
-        createOrUpdateFile
-        graphql(input)
-      \`;
-      const helper = {
-        request(input: unknown): unknown { return input; },
-        updateRepositoryMetadata: true,
-      };
-      class Safe {
-        private request<T>(input: T): T { return input; }
-        protected graphql<T>(input: T): T { return input; }
-        #rawRequest(): void {}
-      }
-      void text;
-      void template;
-      void helper;
-      void Safe;
-    `;
-
-    expect(publicCapabilityNames(contents)).toEqual([]);
+    expect(proof.issues).toEqual([]);
+    expect(proof.forbiddenMembers).toEqual([]);
   });
 });
