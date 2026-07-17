@@ -3,10 +3,12 @@ import {
   asPlanId,
   asRepositoryDatabaseId,
   asRepositoryId,
+  asRunId,
   asSnapshotId,
   asUserListId,
   type PlanId,
   type RepositoryId,
+  type RunId,
   type UserListId,
 } from "../../src/domain/ids.js";
 import type { ChangePlan, PlanRequest } from "../../src/domain/plan.js";
@@ -32,9 +34,30 @@ import { PlanService } from "../../src/app/services/plan-service.js";
 import type { Clock, IdGenerator } from "../../src/app/ports/runtime-port.js";
 import { AppError } from "../../src/domain/errors.js";
 import type {
+  GitHubCapabilities,
+  GitHubStatusReadPort,
+  MutationReceipt,
+  RepositoryIdentity,
+  UserListMutationResult,
+} from "../../src/app/ports/github-port.js";
+import type {
+  AcquireLeaseInput,
+  Lease,
+  LeaseGuard,
   StoragePort,
   StorageTransaction,
 } from "../../src/app/ports/storage-port.js";
+import { MutationExecutor } from "../../src/app/services/mutation-executor.js";
+import {
+  MutationPacer,
+  type MutationPacerRuntime,
+} from "../../src/app/services/mutation-pacer.js";
+import type { LeaseScheduler } from "../../src/app/services/lease-scope.js";
+import {
+  ApplyService,
+  type ApplyInput,
+} from "../../src/app/services/apply-service.js";
+import type { FailureMode } from "../../src/domain/run.js";
 import { createMemoryStorage } from "../fixtures/memory-storage.js";
 
 const T0 = "2026-07-16T00:00:00.000Z";
@@ -360,6 +383,7 @@ function trackedStorage(
       const pending: ChangePlan[] = [];
       const result = storage.withTransaction((transaction) =>
         callback({
+          ...transaction,
           savePlan(plan: ChangePlan) {
             transaction.savePlan(plan);
             pending.push(plan);
@@ -369,7 +393,7 @@ function trackedStorage(
               });
             }
           },
-        } as StorageTransaction),
+        }),
       );
       tracking.savedPlans.push(...pending);
       return result;
@@ -391,6 +415,7 @@ export function plannerFixture(
     }>[];
     snapshotStatus?: Snapshot["status"];
     starredRepositoryIds?: readonly RepositoryId[];
+    binding?: AccountBinding;
     failSave?: boolean;
     cyclicResolver?: boolean;
     membershipSelectorMismatch?: "repository" | "list";
@@ -431,6 +456,7 @@ export function plannerFixture(
   });
   const memoryStorage = createMemoryStorage();
   const snapshot = seedCompleteSnapshot(memoryStorage, {
+    binding: options.binding ?? plannerBinding,
     listCoverage: options.listCoverage ?? "complete",
     repositories: options.repositories ?? [keep, remove],
     lists: options.lists ?? [existing, add],
@@ -535,6 +561,7 @@ export function plannerFixture(
   return Object.freeze({
     service,
     storage,
+    rawStorage: memoryStorage,
     snapshot,
     repositories: Object.freeze({ keep, remove }),
     lists: Object.freeze({ existing, add }),
@@ -544,7 +571,572 @@ export function plannerFixture(
   });
 }
 
-export const applyFixture = plannerFixture;
+const APPLY_CAPABILITIES: GitHubCapabilities = Object.freeze({
+  starRead: "available",
+  starWrite: "available",
+  listRead: "available",
+  listWrite: "available",
+});
+
+const APPLY_NOW = "2026-07-16T02:00:00.000Z";
+const APPLY_INTERVAL_MS = 1_000;
+
+function aborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted === true) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+}
+
+class ApplyRuntime implements Clock, IdGenerator, MutationPacerRuntime {
+  #wallMs: number;
+  #monotonic = 0;
+  #runSequence = 0;
+  readonly events: string[] = [];
+  waitGate: Promise<void> | null = null;
+  onWait: (() => void) | null = null;
+
+  constructor(now: string) {
+    this.#wallMs = Date.parse(now);
+  }
+
+  now(): string {
+    const value = new Date(this.#wallMs).toISOString();
+    this.#wallMs += 1;
+    return value;
+  }
+
+  setNow(now: string): void {
+    this.#wallMs = Date.parse(now);
+  }
+
+  monotonicMs(): number {
+    return this.#monotonic;
+  }
+
+  async wait(delayMs: number, signal?: AbortSignal): Promise<void> {
+    this.events.push(`wait:${String(delayMs)}`);
+    this.onWait?.();
+    aborted(signal);
+    if (this.waitGate !== null) await this.waitGate;
+    aborted(signal);
+    this.#monotonic += delayMs;
+  }
+
+  snapshotId() {
+    return asSnapshotId("snap_apply_unused");
+  }
+
+  planId() {
+    return asPlanId("plan_apply_unused");
+  }
+
+  runId(): RunId {
+    this.#runSequence += 1;
+    return asRunId(`run_apply_${String(this.#runSequence)}`);
+  }
+
+  requestId(): string {
+    return "request_apply_fixture";
+  }
+
+  operationId(): string {
+    return "op_apply_unused";
+  }
+}
+
+class ManualLeaseScheduler implements LeaseScheduler {
+  readonly intervals: Array<
+    Readonly<{ callback: () => void; intervalMs: number; active: boolean }>
+  > = [];
+
+  setInterval(callback: () => void, intervalMs: number): unknown {
+    const interval = { callback, intervalMs, active: true };
+    this.intervals.push(interval);
+    return interval;
+  }
+
+  clearInterval(handle: unknown): void {
+    (handle as { active: boolean }).active = false;
+  }
+
+  tick(): void {
+    for (const interval of this.intervals) {
+      if (interval.active) interval.callback();
+    }
+  }
+}
+
+type ApplyMutationCall = Readonly<{
+  kind:
+    | "star"
+    | "unstar"
+    | "createUserList"
+    | "updateUserList"
+    | "deleteUserList"
+    | "setRepositoryListIds";
+  operationId: string;
+}>;
+
+type ApplyMutationFailure = {
+  readonly kind: ApplyMutationCall["kind"] | null;
+  readonly error: Error;
+  readonly afterApply: boolean;
+};
+
+class ApplyGitHub implements GitHubStatusReadPort {
+  binding: AccountBinding;
+  capabilities: GitHubCapabilities;
+  starred = true;
+  mutationGate: Promise<void> | null = null;
+  onMutation: ((call: ApplyMutationCall) => void) | null = null;
+  readonly statusCalls: string[] = [];
+  readonly mutationCalls: ApplyMutationCall[] = [];
+  readonly events: string[];
+  readonly #repositories = new Map<string, RepositoryView>();
+  readonly #stars = new Map<string, boolean>();
+  readonly #lists = new Map<UserListId, UserList>();
+  readonly #memberships = new Map<RepositoryId, readonly UserListId[]>();
+  readonly #failures: ApplyMutationFailure[] = [];
+  #createdSequence = 0;
+
+  constructor(input: {
+    binding: AccountBinding;
+    capabilities: GitHubCapabilities;
+    repositories: readonly RepositoryView[];
+    lists: readonly UserList[];
+    memberships: readonly Readonly<{
+      repositoryId: RepositoryId;
+      listId: UserListId;
+    }>[];
+    events: string[];
+  }) {
+    this.binding = input.binding;
+    this.capabilities = input.capabilities;
+    this.events = input.events;
+    for (const repository of input.repositories) {
+      const key = `${repository.owner}/${repository.name}`;
+      this.#repositories.set(key, repository);
+      this.#stars.set(key, repository.starredAt !== null);
+    }
+    for (const list of input.lists) this.#lists.set(list.listId, list);
+    for (const membership of input.memberships) {
+      const current = this.#memberships.get(membership.repositoryId) ?? [];
+      this.#memberships.set(
+        membership.repositoryId,
+        Object.freeze([...current, membership.listId]),
+      );
+    }
+  }
+
+  failNextMutation(
+    error: Error,
+    options: Readonly<{
+      kind?: ApplyMutationCall["kind"];
+      afterApply?: boolean;
+    }> = {},
+  ): void {
+    this.#failures.push({
+      kind: options.kind ?? null,
+      error,
+      afterApply: options.afterApply ?? false,
+    });
+  }
+
+  failEveryMutation(
+    error: Error,
+    kind: ApplyMutationCall["kind"] | null = null,
+  ): void {
+    for (let index = 0; index < 5_000; index += 1) {
+      this.#failures.push({ kind, error, afterApply: false });
+    }
+  }
+
+  getViewer(signal?: AbortSignal): Promise<AccountBinding> {
+    aborted(signal);
+    this.statusCalls.push("getViewer");
+    return Promise.resolve(this.binding);
+  }
+
+  probeCapabilities(signal?: AbortSignal): Promise<GitHubCapabilities> {
+    aborted(signal);
+    this.statusCalls.push("probeCapabilities");
+    return Promise.resolve(this.capabilities);
+  }
+
+  getRepositoryIdentity(
+    coordinates: Readonly<{ owner: string; name: string }>,
+    signal?: AbortSignal,
+  ): Promise<RepositoryIdentity | null> {
+    aborted(signal);
+    const repository = this.#repositories.get(
+      `${coordinates.owner}/${coordinates.name}`,
+    );
+    if (repository === undefined) return Promise.resolve(null);
+    return Promise.resolve(
+      Object.freeze({
+        repositoryId: repository.repositoryId,
+        repositoryDatabaseId: repository.repositoryDatabaseId,
+        coordinates: Object.freeze({
+          owner: repository.owner,
+          name: repository.name,
+        }),
+      }),
+    );
+  }
+
+  checkStar(
+    coordinates: Readonly<{ owner: string; name: string }>,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    aborted(signal);
+    return Promise.resolve(
+      this.#stars.get(`${coordinates.owner}/${coordinates.name}`) ?? false,
+    );
+  }
+
+  getUserList(
+    listId: UserListId,
+    signal?: AbortSignal,
+  ): Promise<UserList | null> {
+    aborted(signal);
+    return Promise.resolve(this.#lists.get(listId) ?? null);
+  }
+
+  getRepositoryListIds(
+    repositoryId: RepositoryId,
+    signal?: AbortSignal,
+  ): Promise<readonly UserListId[]> {
+    aborted(signal);
+    return Promise.resolve(this.#memberships.get(repositoryId) ?? []);
+  }
+
+  async #beginMutation(
+    kind: ApplyMutationCall["kind"],
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<
+    Readonly<{
+      receipt: MutationReceipt;
+      afterApplyError: Error | null;
+    }>
+  > {
+    aborted(signal);
+    const call = Object.freeze({ kind, operationId });
+    this.mutationCalls.push(call);
+    this.events.push(`mutation:${kind}`);
+    this.onMutation?.(call);
+    if (this.mutationGate !== null) await this.mutationGate;
+    aborted(signal);
+    const failureIndex = this.#failures.findIndex(
+      (failure) => failure.kind === null || failure.kind === kind,
+    );
+    const failure =
+      failureIndex < 0 ? undefined : this.#failures.splice(failureIndex, 1)[0];
+    if (failure !== undefined && !failure.afterApply) throw failure.error;
+    return Object.freeze({
+      receipt: Object.freeze({
+        requestId: `REQ-${String(this.mutationCalls.length)}`,
+        clientMutationId: operationId,
+      }),
+      afterApplyError: failure?.error ?? null,
+    });
+  }
+
+  async star(
+    coordinates: Readonly<{ owner: string; name: string }>,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const result = await this.#beginMutation("star", operationId, signal);
+    this.#stars.set(`${coordinates.owner}/${coordinates.name}`, true);
+    this.starred = true;
+    if (result.afterApplyError !== null) throw result.afterApplyError;
+    return result.receipt;
+  }
+
+  async unstar(
+    coordinates: Readonly<{ owner: string; name: string }>,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const result = await this.#beginMutation("unstar", operationId, signal);
+    this.#stars.set(`${coordinates.owner}/${coordinates.name}`, false);
+    this.starred = false;
+    if (result.afterApplyError !== null) throw result.afterApplyError;
+    return result.receipt;
+  }
+
+  async createUserList(
+    _input: Readonly<{
+      name: string;
+      description: string | null;
+      isPrivate: boolean;
+    }>,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<UserListMutationResult> {
+    const result = await this.#beginMutation(
+      "createUserList",
+      operationId,
+      signal,
+    );
+    this.#createdSequence += 1;
+    const list = userListFixture({
+      listId: asUserListId(`UL_created_${String(this.#createdSequence)}`),
+      name: _input.name,
+      slug: _input.name.toLowerCase().replaceAll(" ", "-"),
+      description: _input.description,
+      isPrivate: _input.isPrivate,
+    });
+    this.#lists.set(list.listId, list);
+    if (result.afterApplyError !== null) throw result.afterApplyError;
+    return Object.freeze({ list, receipt: result.receipt });
+  }
+
+  async updateUserList(
+    listId: UserListId,
+    _input: Readonly<{
+      name?: string;
+      description?: string | null;
+      isPrivate?: boolean;
+    }>,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<UserListMutationResult> {
+    const result = await this.#beginMutation(
+      "updateUserList",
+      operationId,
+      signal,
+    );
+    const current = this.#lists.get(listId) ?? userListFixture({ listId });
+    const list = userListFixture({
+      ...current,
+      ..._input,
+      listId,
+      updatedAt: "2026-07-16T00:02:00.000Z",
+    });
+    this.#lists.set(listId, list);
+    if (result.afterApplyError !== null) throw result.afterApplyError;
+    return Object.freeze({
+      list,
+      receipt: result.receipt,
+    });
+  }
+
+  async deleteUserList(
+    listId: UserListId,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const result = await this.#beginMutation(
+      "deleteUserList",
+      operationId,
+      signal,
+    );
+    this.#lists.delete(listId);
+    if (result.afterApplyError !== null) throw result.afterApplyError;
+    return result.receipt;
+  }
+
+  async setRepositoryListIds(
+    repositoryId: RepositoryId,
+    listIds: readonly UserListId[],
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const result = await this.#beginMutation(
+      "setRepositoryListIds",
+      operationId,
+      signal,
+    );
+    this.#memberships.set(repositoryId, Object.freeze([...listIds]));
+    if (result.afterApplyError !== null) throw result.afterApplyError;
+    return result.receipt;
+  }
+}
+
+export interface ApplyFixtureOptions {
+  readonly readOnly?: boolean;
+  readonly now?: string;
+  readonly planTtlMinutes?: number;
+  readonly planState?: "expired" | "failed" | "superseded";
+  readonly binding?: AccountBinding;
+  readonly capabilities?: GitHubCapabilities;
+  readonly instanceId?: string;
+  readonly expectedHash?: string;
+  readonly transformLoadedPlan?: (plan: ChangePlan) => ChangePlan;
+  readonly planBinding?: AccountBinding;
+  readonly leaseScheduler?: LeaseScheduler;
+}
+
+interface ApplyTracking {
+  readonly events: string[];
+  readonly acquireLease: AcquireLeaseInput[];
+  readonly renewLease: AcquireLeaseInput[];
+  readonly releaseLease: Array<Readonly<{ name: string; ownerId: string }>>;
+  readonly recovery: Array<
+    Readonly<{ binding: AccountBinding; lease: LeaseGuard }>
+  >;
+  globalRecoveries: number;
+  loseLeaseOnNextRenew: boolean;
+  transactions: number;
+}
+
+function trackedApplyStorage(
+  raw: StoragePort,
+  tracking: ApplyTracking,
+  transformLoadedPlan: ((plan: ChangePlan) => ChangePlan) | undefined,
+): StoragePort {
+  return Object.freeze({
+    ...raw,
+    getPlan(id: PlanId): ChangePlan | null {
+      const plan = raw.getPlan(id);
+      return plan === null || transformLoadedPlan === undefined
+        ? plan
+        : transformLoadedPlan(plan);
+    },
+    acquireLease(input: AcquireLeaseInput): Lease | null {
+      tracking.acquireLease.push(input);
+      tracking.events.push("lease:acquire");
+      return raw.acquireLease(input);
+    },
+    renewLease(input: AcquireLeaseInput): Lease {
+      tracking.renewLease.push(input);
+      tracking.events.push("lease:renew");
+      if (tracking.loseLeaseOnNextRenew) {
+        tracking.loseLeaseOnNextRenew = false;
+        raw.releaseLease({ name: input.name, ownerId: input.ownerId });
+        raw.acquireLease({
+          name: input.name,
+          ownerId: "takeover-process",
+          now: input.now,
+          expiresAt: new Date(
+            Date.parse(input.expiresAt) + 60_000,
+          ).toISOString(),
+        });
+      }
+      return raw.renewLease(input);
+    },
+    releaseLease(input: { readonly name: string; readonly ownerId: string }) {
+      tracking.releaseLease.push(input);
+      tracking.events.push("lease:release");
+      return raw.releaseLease(input);
+    },
+    recoverAbandonedRuns(input: {
+      readonly binding: AccountBinding;
+      readonly lease: LeaseGuard;
+    }): readonly RunId[] {
+      tracking.recovery.push(input);
+      tracking.events.push("run:recover");
+      return raw.recoverAbandonedRuns(input);
+    },
+    recoverInterruptedRuns(now: string): readonly RunId[] {
+      tracking.globalRecoveries += 1;
+      return raw.recoverInterruptedRuns(now);
+    },
+    withTransaction<T>(callback: (transaction: StorageTransaction) => T): T {
+      tracking.transactions += 1;
+      return raw.withTransaction(callback);
+    },
+  });
+}
+
+export async function applyFixture(options: ApplyFixtureOptions = {}) {
+  const planner = plannerFixture({
+    ...(options.planTtlMinutes === undefined
+      ? {}
+      : { planTtlMinutes: options.planTtlMinutes }),
+    ...(options.planBinding === undefined
+      ? {}
+      : { binding: options.planBinding }),
+  });
+  const created = await planner.service.create(planner.validInput);
+  if (options.planState !== undefined) {
+    if (options.planState === "failed") {
+      planner.rawStorage.compareAndSetPlanState({
+        planId: created.plan.id,
+        expected: ["ready"],
+        next: "applying",
+      });
+      planner.rawStorage.compareAndSetPlanState({
+        planId: created.plan.id,
+        expected: ["applying"],
+        next: "failed",
+      });
+    } else {
+      planner.rawStorage.compareAndSetPlanState({
+        planId: created.plan.id,
+        expected: ["ready"],
+        next: options.planState,
+      });
+    }
+  }
+  const plan = planner.rawStorage.getPlan(created.plan.id)!;
+  const runtime = new ApplyRuntime(options.now ?? APPLY_NOW);
+  const scheduler = new ManualLeaseScheduler();
+  const tracking: ApplyTracking = {
+    events: [],
+    acquireLease: [],
+    renewLease: [],
+    releaseLease: [],
+    recovery: [],
+    globalRecoveries: 0,
+    loseLeaseOnNextRenew: false,
+    transactions: 0,
+  };
+  const storage = trackedApplyStorage(
+    planner.rawStorage,
+    tracking,
+    options.transformLoadedPlan,
+  );
+  const github = new ApplyGitHub({
+    binding: options.binding ?? options.planBinding ?? plannerBinding,
+    capabilities: options.capabilities ?? APPLY_CAPABILITIES,
+    repositories: [planner.repositories.keep, planner.repositories.remove],
+    lists: [planner.lists.existing, planner.lists.add],
+    memberships: [
+      {
+        repositoryId: planner.ids.removeRepository,
+        listId: planner.ids.existingList,
+      },
+    ],
+    events: tracking.events,
+  });
+  const executor = new MutationExecutor(github, github);
+  const createService = (
+    instanceId = options.instanceId ?? "apply-instance-1",
+  ) =>
+    new ApplyService({
+      github,
+      storage,
+      runtime,
+      executor,
+      pacer: new MutationPacer(runtime, APPLY_INTERVAL_MS),
+      config: Object.freeze({ readOnly: options.readOnly ?? false }),
+      instanceId,
+      leaseScheduler: options.leaseScheduler ?? scheduler,
+    });
+  const input: ApplyInput = Object.freeze({
+    planId: plan.id,
+    expectedHash: options.expectedHash ?? plan.hash,
+    failureMode: "stop" satisfies FailureMode,
+  });
+
+  return {
+    service: createService(),
+    createService,
+    storage,
+    rawStorage: planner.rawStorage,
+    github,
+    runtime,
+    scheduler,
+    tracking,
+    plan,
+    input,
+    planner,
+  };
+}
+
 export const rollbackFixture = plannerFixture;
 export const inspectFixture = plannerFixture;
 
