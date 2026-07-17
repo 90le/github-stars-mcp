@@ -1,7 +1,9 @@
 import type { JsonValue } from "./json.js";
 import { redactSecrets, snapshotSecretRegistry } from "./redaction.js";
 
-export const APP_ERROR_CODES = Object.freeze([
+const freezeIntrinsic = Object.freeze;
+
+export const APP_ERROR_CODES = freezeIntrinsic([
   "AUTH_REQUIRED",
   "INSUFFICIENT_PERMISSION",
   "CAPABILITY_UNAVAILABLE",
@@ -24,9 +26,17 @@ export const APP_ERROR_CODES = Object.freeze([
 
 export type AppErrorCode = (typeof APP_ERROR_CODES)[number];
 
-const APP_ERROR_CODE_LOOKUP = Object.freeze(
+const APP_ERROR_CODE_LOOKUP = freezeIntrinsic(
   Object.fromEntries(APP_ERROR_CODES.map((code) => [code, true] as const)),
 ) as Readonly<Record<AppErrorCode, true>>;
+const INTRINSICS = freezeIntrinsic({
+  arrayIsArray: Array.isArray,
+  functionHasInstance: Function.prototype[Symbol.hasInstance],
+  objectDefineProperty: Object.defineProperty,
+  objectGetOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
+  objectHasOwn: Object.hasOwn,
+  reflectApply: Reflect.apply,
+});
 
 interface AppErrorOptions {
   readonly retryable?: boolean;
@@ -54,19 +64,24 @@ export class AppError extends Error {
     options: AppErrorOptions = {},
   ) {
     super(message);
-    this.name = "AppError";
+    INTRINSICS.objectDefineProperty(this, "name", {
+      configurable: true,
+      enumerable: false,
+      value: "AppError",
+      writable: true,
+    });
     this.code = code;
     this.retryable = options.retryable ?? false;
     this.details = options.details === undefined ? {} : options.details;
     this.secrets = snapshotSecretRegistry(options.secrets ?? []);
-    Object.defineProperty(this, "secrets", {
+    INTRINSICS.objectDefineProperty(this, "secrets", {
       configurable: false,
       enumerable: false,
       writable: false,
     });
 
     if (options.cause !== undefined) {
-      Object.defineProperty(this, "cause", {
+      INTRINSICS.objectDefineProperty(this, "cause", {
         configurable: true,
         value: options.cause,
         writable: true,
@@ -81,7 +96,8 @@ export class AppError extends Error {
 
 function isAppErrorCode(value: unknown): value is AppErrorCode {
   return (
-    typeof value === "string" && Object.hasOwn(APP_ERROR_CODE_LOOKUP, value)
+    typeof value === "string" &&
+    INTRINSICS.objectHasOwn(APP_ERROR_CODE_LOOKUP, value)
   );
 }
 
@@ -97,7 +113,7 @@ function internalError(): SerializedDomainError {
 function serializeAppError(error: AppError): SerializedDomainError {
   let descriptors: PropertyDescriptorMap;
   try {
-    descriptors = Object.getOwnPropertyDescriptors(error);
+    descriptors = INTRINSICS.objectGetOwnPropertyDescriptors(error);
   } catch {
     return internalError();
   }
@@ -111,7 +127,7 @@ function serializeAppError(error: AppError): SerializedDomainError {
     !isAppErrorCode(code) ||
     typeof message !== "string" ||
     typeof retryable !== "boolean" ||
-    !Array.isArray(secrets)
+    !INTRINSICS.arrayIsArray(secrets)
   ) {
     return internalError();
   }
@@ -127,11 +143,15 @@ function serializeAppError(error: AppError): SerializedDomainError {
   };
 }
 
+function isAppError(error: unknown): error is AppError {
+  return INTRINSICS.reflectApply(INTRINSICS.functionHasInstance, AppError, [
+    error,
+  ]);
+}
+
 export function serializeError(error: unknown): SerializedDomainError {
   try {
-    return error instanceof AppError
-      ? serializeAppError(error)
-      : internalError();
+    return isAppError(error) ? serializeAppError(error) : internalError();
   } catch {
     return internalError();
   }

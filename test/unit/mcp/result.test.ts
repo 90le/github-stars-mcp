@@ -668,6 +668,369 @@ describe("success input validation", () => {
   });
 });
 
+describe("captured result intrinsics", () => {
+  it("redacts success and failure secrets after string replacement methods are replaced", () => {
+    const secret = "arbitrary-intrinsic-secret-value";
+    const error = new AppError("AUTH_REQUIRED", `credential ${secret} leaked`, {
+      details: { echo: secret },
+      secrets: [secret],
+    });
+    const replaceDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      "replace",
+    );
+    const replaceAllDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      "replaceAll",
+    );
+    if (replaceDescriptor === undefined || replaceAllDescriptor === undefined) {
+      throw new Error("Expected mutable string replacement intrinsics");
+    }
+
+    let successJson = "";
+    let failureJson = "";
+    try {
+      Object.defineProperty(String.prototype, "replace", {
+        ...replaceDescriptor,
+        value(this: string) {
+          return String(this);
+        },
+      });
+      Object.defineProperty(String.prototype, "replaceAll", {
+        ...replaceAllDescriptor,
+        value(this: string) {
+          return String(this);
+        },
+      });
+
+      successJson = JSON.stringify(
+        toolSuccess(
+          { authorization: secret, echo: secret },
+          {
+            requestId: "req_intrinsic_redaction",
+            summary: `summary ${secret}`,
+            warnings: [`warning ${secret}`],
+            nextCursor: `cursor-${secret}`,
+          },
+        ),
+      );
+      failureJson = JSON.stringify(toolFailure(error, "req_intrinsic_failure"));
+    } finally {
+      Object.defineProperty(String.prototype, "replace", replaceDescriptor);
+      Object.defineProperty(
+        String.prototype,
+        "replaceAll",
+        replaceAllDescriptor,
+      );
+    }
+
+    expect(successJson).not.toContain(secret);
+    expect(failureJson).not.toContain(secret);
+  });
+
+  it("redacts without consulting mutable Symbol.replace hooks", () => {
+    const secret = "symbol-replace-secret-value";
+    const token = `ghp_${"R".repeat(36)}`;
+    const regexReplaceDescriptor = Object.getOwnPropertyDescriptor(
+      RegExp.prototype,
+      Symbol.replace,
+    );
+    const stringReplaceDescriptor = Object.getOwnPropertyDescriptor(
+      String.prototype,
+      Symbol.replace,
+    );
+    if (regexReplaceDescriptor === undefined) {
+      throw new Error("Expected RegExp Symbol.replace");
+    }
+
+    let successJson = "";
+    let failureJson = "";
+    const error = new AppError(
+      "AUTH_REQUIRED",
+      `credential ${secret} and ${token}`,
+      {
+        details: { echo: secret, tokenEcho: token },
+        secrets: [secret],
+      },
+    );
+    try {
+      Object.defineProperty(RegExp.prototype, Symbol.replace, {
+        configurable: true,
+        value(input: string) {
+          return input;
+        },
+        writable: true,
+      });
+      Object.defineProperty(String.prototype, Symbol.replace, {
+        configurable: true,
+        value(input: string) {
+          return input;
+        },
+        writable: true,
+      });
+      successJson = JSON.stringify(
+        toolSuccess(
+          { authorization: secret, echo: secret, tokenEcho: token },
+          {
+            requestId: "req_symbol_replace",
+            summary: `summary ${secret} and ${token}`,
+          },
+        ),
+      );
+      failureJson = JSON.stringify(
+        toolFailure(error, "req_symbol_replace_failure"),
+      );
+    } finally {
+      Object.defineProperty(
+        RegExp.prototype,
+        Symbol.replace,
+        regexReplaceDescriptor,
+      );
+      if (stringReplaceDescriptor === undefined) {
+        Reflect.deleteProperty(String.prototype, Symbol.replace);
+      } else {
+        Object.defineProperty(
+          String.prototype,
+          Symbol.replace,
+          stringReplaceDescriptor,
+        );
+      }
+    }
+
+    for (const serialized of [successJson, failureJson]) {
+      expect(serialized).not.toContain(secret);
+      expect(serialized).not.toContain(token);
+    }
+  });
+
+  it("rejects unknown keys after Set.prototype.has is replaced", () => {
+    const hasDescriptor = Object.getOwnPropertyDescriptor(Set.prototype, "has");
+    if (hasDescriptor === undefined) {
+      throw new Error("Expected a mutable Set.has intrinsic");
+    }
+
+    let thrown: unknown;
+    try {
+      Object.defineProperty(Set.prototype, "has", {
+        ...hasDescriptor,
+        value() {
+          return true;
+        },
+      });
+      try {
+        success(
+          {},
+          {
+            requestId: "req_unknown_intrinsic",
+            summary: "unknown option",
+            attackerControlled: true,
+          },
+        );
+      } catch (error) {
+        thrown = error;
+      }
+    } finally {
+      Object.defineProperty(Set.prototype, "has", hasDescriptor);
+    }
+
+    expect(thrown).toBeInstanceOf(AppError);
+    expect(serializeError(thrown).code).toBe("VALIDATION_ERROR");
+  });
+
+  it("deeply freezes success and failure results after Object.freeze is replaced", () => {
+    const freezeDescriptor = Object.getOwnPropertyDescriptor(Object, "freeze");
+    if (freezeDescriptor === undefined) {
+      throw new Error("Expected a mutable Object.freeze intrinsic");
+    }
+    const error = new AppError("NOT_FOUND", "missing", {
+      details: { nested: { value: true } },
+    });
+
+    let successResult: ReturnType<typeof toolSuccess> | undefined;
+    let failureResult: ReturnType<typeof toolFailure> | undefined;
+    try {
+      Object.defineProperty(Object, "freeze", {
+        ...freezeDescriptor,
+        value<T>(value: T): Readonly<T> {
+          return value;
+        },
+      });
+      successResult = toolSuccess(
+        { nested: { value: true } },
+        {
+          requestId: "req_freeze_intrinsic",
+          summary: "frozen",
+          warnings: ["warning"],
+          rateLimit: {
+            remaining: 1,
+            resetAt: "2026-07-16T08:00:00.000Z",
+          },
+        },
+      );
+      failureResult = toolFailure(error, "req_failure_freeze_intrinsic");
+    } finally {
+      Object.defineProperty(Object, "freeze", freezeDescriptor);
+    }
+
+    if (successResult === undefined || failureResult === undefined) {
+      throw new Error("Expected both MCP results");
+    }
+    const successContent = successResult.structuredContent as {
+      readonly data: { readonly nested: object };
+      readonly warnings: readonly string[];
+      readonly rate_limit: object;
+    };
+    const failureContent = failureEnvelope(failureResult);
+    const failureDetails = failureContent.error.details as {
+      readonly nested: object;
+    };
+    for (const value of [
+      successResult,
+      successResult.content,
+      successResult.content[0],
+      successResult.structuredContent,
+      successContent.data,
+      successContent.data.nested,
+      successContent.warnings,
+      successContent.rate_limit,
+      failureResult,
+      failureResult.content,
+      failureResult.content[0],
+      failureResult.structuredContent,
+      failureContent.error,
+      failureDetails,
+      failureDetails.nested,
+    ]) {
+      expect(Object.isFrozen(value)).toBe(true);
+    }
+  });
+
+  it("does not invoke inherited array index setters while building results", () => {
+    const indexDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "0",
+    );
+    const secret = "array-prototype-secret";
+    let setterCalls = 0;
+    let result: ReturnType<typeof toolSuccess> | undefined;
+    try {
+      Object.defineProperty(Array.prototype, "0", {
+        configurable: true,
+        set: () => {
+          setterCalls += 1;
+        },
+      });
+      result = toolSuccess(
+        { authorization: secret, echo: secret },
+        {
+          requestId: "req_array_setter",
+          summary: `summary ${secret}`,
+          warnings: [`warning ${secret}`],
+        },
+      );
+    } finally {
+      if (indexDescriptor === undefined) {
+        Reflect.deleteProperty(Array.prototype, "0");
+      } else {
+        Object.defineProperty(Array.prototype, "0", indexDescriptor);
+      }
+    }
+
+    expect(setterCalls).toBe(0);
+    expect(result).toMatchObject({
+      content: [{ type: "text", text: "summary [REDACTED]" }],
+      structuredContent: {
+        request_id: "req_array_setter",
+        data: {
+          authorization: "[REDACTED]",
+          echo: "[REDACTED]",
+        },
+        warnings: ["warning [REDACTED]"],
+      },
+    });
+  });
+
+  it("does not invoke setters added to AppError.prototype while snapshotting", () => {
+    const error = new AppError("RATE_LIMITED", "retry later", {
+      retryable: true,
+      details: { safe: true },
+    });
+    const nameDescriptor = Object.getOwnPropertyDescriptor(
+      AppError.prototype,
+      "name",
+    );
+    let setterCalls = 0;
+    let result: ReturnType<typeof toolFailure> | undefined;
+    try {
+      Object.defineProperty(AppError.prototype, "name", {
+        configurable: true,
+        set: () => {
+          setterCalls += 1;
+        },
+      });
+      result = toolFailure(error, "req_app_error_setter");
+    } finally {
+      if (nameDescriptor === undefined) {
+        delete (AppError.prototype as { name?: string }).name;
+      } else {
+        Object.defineProperty(AppError.prototype, "name", nameDescriptor);
+      }
+    }
+
+    expect(setterCalls).toBe(0);
+    expect(result).toMatchObject({
+      structuredContent: {
+        request_id: "req_app_error_setter",
+        error: {
+          code: "RATE_LIMITED",
+          message: "retry later",
+          retryable: true,
+          details: { safe: true },
+        },
+      },
+    });
+  });
+
+  it("does not invoke AppError prototype setters for validation failures", () => {
+    const nameDescriptor = Object.getOwnPropertyDescriptor(
+      AppError.prototype,
+      "name",
+    );
+    let setterCalls = 0;
+    let thrown: unknown;
+    try {
+      Object.defineProperty(AppError.prototype, "name", {
+        configurable: true,
+        set: () => {
+          setterCalls += 1;
+        },
+      });
+      try {
+        success(
+          {},
+          {
+            requestId: "req_validation_setter",
+            summary: "invalid",
+            unknown: true,
+          },
+        );
+      } catch (error) {
+        thrown = error;
+      }
+    } finally {
+      if (nameDescriptor === undefined) {
+        delete (AppError.prototype as { name?: string }).name;
+      } else {
+        Object.defineProperty(AppError.prototype, "name", nameDescriptor);
+      }
+    }
+
+    expect(setterCalls).toBe(0);
+    expect(thrown).toBeInstanceOf(AppError);
+    expect(serializeError(thrown).code).toBe("VALIDATION_ERROR");
+  });
+});
+
 describe("failure totality", () => {
   it("never throws for primitive, cyclic, accessor, proxy, or revoked failures", () => {
     let getterCalls = 0;
@@ -694,16 +1057,16 @@ describe("failure totality", () => {
     revocable.revoke();
 
     const failures: readonly (readonly [unknown, string])[] = [
-      [undefined, "req_redacted"],
-      [null, "req_redacted"],
-      [true, "req_redacted"],
-      [42, "req_redacted"],
-      [1n, "req_redacted"],
-      ["string", "req_redacted"],
-      [Symbol("failure"), "req_redacted"],
-      [() => "failure", "req_redacted"],
-      [cyclic, "req_redacted"],
-      [accessor, "req_redacted"],
+      [undefined, "req_total"],
+      [null, "req_total"],
+      [true, "req_total"],
+      [42, "req_total"],
+      [1n, "req_total"],
+      ["string", "req_total"],
+      [Symbol("failure"), "req_total"],
+      [() => "failure", "req_total"],
+      [cyclic, "req_total"],
+      [accessor, "req_total"],
       [proxy, "req_redacted"],
       [revocable.proxy, "req_redacted"],
     ];
@@ -748,8 +1111,8 @@ describe("failure totality", () => {
   });
 
   it.each([
-    ["valid lower", "a", "req_redacted"],
-    ["valid upper", "x".repeat(128), "req_redacted"],
+    ["valid lower", "a", "a"],
+    ["valid upper", "x".repeat(128), "x".repeat(128)],
     ["empty", "", "req_invalid"],
     ["too long", "x".repeat(129), "req_invalid"],
     ["trimmed", " invalid", "req_invalid"],
@@ -757,6 +1120,13 @@ describe("failure totality", () => {
     ["unpaired", "invalid-\ud800", "req_invalid"],
   ])("normalizes failure request IDs: %s", (_label, input, expected) => {
     expect(failureEnvelope(toolFailure(null, input)).request_id).toBe(expected);
+  });
+
+  it("preserves a valid request ID for an ordinary unknown Error", () => {
+    expect(
+      failureEnvelope(toolFailure(new Error("unknown"), "req_unknown"))
+        .request_id,
+    ).toBe("req_unknown");
   });
 
   it("normalizes non-string and hostile failure request IDs without reading them", () => {
@@ -962,8 +1332,13 @@ describe("failure totality", () => {
         "req_proxied_details",
       );
       expect(failureEnvelope(result)).toMatchObject({
-        request_id: "req_redacted",
-        error: { code: "INTERNAL_ERROR", details: {} },
+        request_id: "req_proxied_details",
+        error: {
+          code: "AUTH_REQUIRED",
+          message: "authentication failed",
+          retryable: false,
+          details: {},
+        },
       });
     }
 
@@ -1017,21 +1392,61 @@ describe("failure totality", () => {
 
     expect(getterCalls).toBe(0);
     expect(failureEnvelope(result)).toMatchObject({
-      request_id: "req_redacted",
-      error: { code: "INTERNAL_ERROR", details: {} },
+      request_id: "req_hostile_details",
+      error: {
+        code: "AUTH_REQUIRED",
+        message: "authentication failed",
+        retryable: false,
+        details: {},
+      },
     });
   });
 
-  it("falls back to empty details when serialized details exceed the safe clone bound", () => {
-    const error = new AppError("INTERNAL_ERROR", "bounded details", {
+  it("preserves AppError metadata without invoking a details accessor", () => {
+    let getterCalls = 0;
+    const error = new AppError("SECONDARY_RATE_LIMITED", "slow down", {
+      retryable: true,
+    });
+    Object.defineProperty(error, "details", {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        getterCalls += 1;
+        return { token: "ghp_accessor_must_not_run" };
+      },
+    });
+
+    const result = toolFailure(error, "req_details_accessor");
+
+    expect(getterCalls).toBe(0);
+    expect(failureEnvelope(result)).toMatchObject({
+      request_id: "req_details_accessor",
+      error: {
+        code: "SECONDARY_RATE_LIMITED",
+        message: "slow down",
+        retryable: true,
+        details: {},
+      },
+    });
+  });
+
+  it("preserves AppError metadata when details exceed the safe clone bound", () => {
+    const error = new AppError("RATE_LIMITED", "bounded details", {
+      retryable: true,
       details: {
         oversized: "x".repeat(1_048_577),
       },
     });
 
-    expect(
-      failureEnvelope(toolFailure(error, "req_details")).error.details,
-    ).toEqual({});
+    expect(failureEnvelope(toolFailure(error, "req_details"))).toMatchObject({
+      request_id: "req_details",
+      error: {
+        code: "RATE_LIMITED",
+        message: "bounded details",
+        retryable: true,
+        details: {},
+      },
+    });
   });
 
   it("detaches and deeply freezes the complete failure result", () => {

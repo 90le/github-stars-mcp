@@ -6,7 +6,6 @@ import {
   freezeJsonValue,
 } from "../domain/canonical-json.js";
 import {
-  APP_ERROR_CODES,
   AppError,
   serializeError,
   type AppErrorCode,
@@ -73,21 +72,82 @@ const FAILURE_OMITTED_KEYS = new Set([
 ]);
 const TOKEN_PATTERN = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/gu;
 const TOKEN_PATTERN_TEST = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/u;
-const APP_ERROR_CODE_SET = new Set<string>(APP_ERROR_CODES);
-const INTRINSICS = Object.freeze({
+const BEARER_PATTERN = /^Bearer[ \t]+(.+)$/iu;
+const ARRAY_INDEX_PATTERN = /^(?:0|[1-9]\d*)$/u;
+const freezeIntrinsic = Object.freeze;
+/* eslint-disable @typescript-eslint/unbound-method -- Method intrinsics are deliberately captured and invoked only through captured Reflect.apply. */
+const INTRINSICS = freezeIntrinsic({
   appErrorPrototype: AppError.prototype,
   arrayIsArray: Array.isArray,
   arrayPrototype: Array.prototype,
+  numberFromValue: Number,
+  numberIsInteger: Number.isInteger,
+  numberIsSafeInteger: Number.isSafeInteger,
+  objectCreate: Object.create,
+  objectDefineProperty: Object.defineProperty,
+  objectFreeze: freezeIntrinsic,
   objectGetOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
   objectHasOwn: Object.hasOwn,
+  objectKeys: Object.keys,
   reflectApply: Reflect.apply,
   reflectGetPrototypeOf: Reflect.getPrototypeOf,
   reflectOwnKeys: Reflect.ownKeys,
-  // The intrinsic is invoked only through the captured Reflect.apply.
-  // eslint-disable-next-line @typescript-eslint/unbound-method
+  regExpExec: RegExp.prototype.exec,
+  setAdd: Set.prototype.add,
+  setConstructor: Set,
   setHas: Set.prototype.has,
+  stringFromValue: String,
+  stringCharCodeAt: String.prototype.charCodeAt,
+  stringIncludes: String.prototype.includes,
+  stringSlice: String.prototype.slice,
+  stringToLowerCase: String.prototype.toLowerCase,
+  stringTrim: String.prototype.trim,
   utilIsProxy: utilTypes.isProxy,
 });
+/* eslint-enable @typescript-eslint/unbound-method */
+
+function pushValue<T>(target: T[], value: T): void {
+  INTRINSICS.objectDefineProperty(
+    target,
+    INTRINSICS.stringFromValue(target.length),
+    {
+      configurable: true,
+      enumerable: true,
+      value,
+      writable: true,
+    },
+  );
+}
+
+function hasSetValue<T>(target: ReadonlySet<T>, value: T): boolean {
+  return INTRINSICS.reflectApply(INTRINSICS.setHas, target, [value]);
+}
+
+function addSetValue<T>(target: Set<T>, value: T): void {
+  INTRINSICS.reflectApply(INTRINSICS.setAdd, target, [value]);
+}
+
+function charCodeAt(value: string, index: number): number {
+  return INTRINSICS.reflectApply(INTRINSICS.stringCharCodeAt, value, [index]);
+}
+
+function sliceText(value: string, start: number, end?: number): string {
+  return end === undefined
+    ? INTRINSICS.reflectApply(INTRINSICS.stringSlice, value, [start])
+    : INTRINSICS.reflectApply(INTRINSICS.stringSlice, value, [start, end]);
+}
+
+function lowerCase(value: string): string {
+  return INTRINSICS.reflectApply(INTRINSICS.stringToLowerCase, value, []);
+}
+
+function testPattern(pattern: RegExp, value: string): boolean {
+  return execPattern(pattern, value) !== null;
+}
+
+function execPattern(pattern: RegExp, value: string): RegExpExecArray | null {
+  return INTRINSICS.reflectApply(INTRINSICS.regExpExec, pattern, [value]);
+}
 
 function invalidInput(): never {
   throw new AppError(
@@ -105,7 +165,7 @@ function safeJsonClone(value: unknown): JsonValue {
 }
 
 function isJsonArray(value: JsonValue): value is readonly JsonValue[] {
-  return Array.isArray(value);
+  return INTRINSICS.arrayIsArray(value);
 }
 
 function isJsonObject(value: JsonValue): value is JsonObject {
@@ -122,21 +182,23 @@ function hasExactKeys(
   allowed: ReadonlySet<string>,
   required: readonly string[],
 ): boolean {
-  const keys = Object.keys(value);
-  for (const key of keys) {
-    if (!allowed.has(key)) return false;
+  const keys = INTRINSICS.objectKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined || !hasSetValue(allowed, key)) return false;
   }
-  for (const key of required) {
-    if (!Object.hasOwn(value, key)) return false;
+  for (let index = 0; index < required.length; index += 1) {
+    const key = required[index];
+    if (key === undefined || !INTRINSICS.objectHasOwn(value, key)) return false;
   }
   return true;
 }
 
 function isWellFormedText(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
+    const codeUnit = charCodeAt(value, index);
     if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
+      const next = charCodeAt(value, index + 1);
       if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
       index += 1;
       continue;
@@ -147,12 +209,12 @@ function isWellFormedText(value: string): boolean {
 }
 
 function toWellFormedText(value: string): string {
-  const fragments: string[] = [];
+  let result = "";
   let segmentStart = 0;
   for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
+    const codeUnit = charCodeAt(value, index);
     if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
+      const next = charCodeAt(value, index + 1);
       if (next >= 0xdc00 && next <= 0xdfff) {
         index += 1;
         continue;
@@ -160,17 +222,16 @@ function toWellFormedText(value: string): string {
     } else if (codeUnit < 0xdc00 || codeUnit > 0xdfff) {
       continue;
     }
-    fragments.push(value.slice(segmentStart, index), "\ufffd");
+    result += `${sliceText(value, segmentStart, index)}\ufffd`;
     segmentStart = index + 1;
   }
   if (segmentStart === 0) return value;
-  fragments.push(value.slice(segmentStart));
-  return fragments.join("");
+  return result + sliceText(value, segmentStart);
 }
 
 function hasControlCharacter(value: string, allowLineFeed: boolean): boolean {
   for (let index = 0; index < value.length; index += 1) {
-    const codeUnit = value.charCodeAt(index);
+    const codeUnit = charCodeAt(value, index);
     if (
       (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) &&
       !(allowLineFeed && codeUnit === 0x0a)
@@ -186,7 +247,7 @@ function isStructurallyValidRequestId(value: unknown): value is string {
     typeof value === "string" &&
     value.length >= 1 &&
     value.length <= MAX_REQUEST_ID_LENGTH &&
-    value.trim() === value &&
+    INTRINSICS.reflectApply(INTRINSICS.stringTrim, value, []) === value &&
     isWellFormedText(value) &&
     !hasControlCharacter(value, false)
   );
@@ -204,7 +265,7 @@ function validateSummary(value: unknown): string {
   }
   let lines = 1;
   for (let index = 0; index < value.length; index += 1) {
-    if (value.charCodeAt(index) === 0x0a) lines += 1;
+    if (charCodeAt(value, index) === 0x0a) lines += 1;
   }
   return lines <= MAX_SUMMARY_LINES ? value : invalidInput();
 }
@@ -224,7 +285,7 @@ function validateWarnings(value: JsonValue | undefined): readonly string[] {
     ) {
       return invalidInput();
     }
-    warnings.push(warning);
+    pushValue(warnings, warning);
   }
   return warnings;
 }
@@ -243,7 +304,7 @@ function validateRateLimit(
   const resetAt = value.resetAt;
   if (
     typeof remaining !== "number" ||
-    !Number.isSafeInteger(remaining) ||
+    !INTRINSICS.numberIsSafeInteger(remaining) ||
     remaining < 0 ||
     typeof resetAt !== "string"
   ) {
@@ -273,24 +334,31 @@ function validateCursor(value: JsonValue | undefined): string | null {
   return value;
 }
 
-function addSecret(secrets: Set<string>, value: string): void {
-  if (value.length === 0 || secrets.has(value)) return;
-  if (secrets.size >= MAX_REGISTERED_SECRETS) return invalidInput();
-  secrets.add(value);
+type SecretCollector = {
+  readonly lookup: Set<string>;
+  readonly values: string[];
+};
 
-  const bearer = /^Bearer[ \t]+(.+)$/iu.exec(value);
+function addSecret(secrets: SecretCollector, value: string): void {
+  if (value.length === 0 || hasSetValue(secrets.lookup, value)) return;
+  if (secrets.values.length >= MAX_REGISTERED_SECRETS) return invalidInput();
+  addSetValue(secrets.lookup, value);
+  pushValue(secrets.values, value);
+
+  const bearer = execPattern(BEARER_PATTERN, value);
   const credential = bearer?.[1];
   if (
     credential !== undefined &&
     credential.length > 0 &&
-    !secrets.has(credential)
+    !hasSetValue(secrets.lookup, credential)
   ) {
-    if (secrets.size >= MAX_REGISTERED_SECRETS) return invalidInput();
-    secrets.add(credential);
+    if (secrets.values.length >= MAX_REGISTERED_SECRETS) return invalidInput();
+    addSetValue(secrets.lookup, credential);
+    pushValue(secrets.values, credential);
   }
 }
 
-function collectStrings(value: JsonValue, secrets: Set<string>): void {
+function collectStrings(value: JsonValue, secrets: SecretCollector): void {
   if (typeof value === "string") {
     addSecret(secrets, value);
     return;
@@ -302,12 +370,18 @@ function collectStrings(value: JsonValue, secrets: Set<string>): void {
     }
     return;
   }
-  for (const key of Object.keys(value)) {
+  const keys = INTRINSICS.objectKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined) return invalidInput();
     collectStrings(value[key] as JsonValue, secrets);
   }
 }
 
-function visitRegisteredSecrets(value: JsonValue, secrets: Set<string>): void {
+function visitRegisteredSecrets(
+  value: JsonValue,
+  secrets: SecretCollector,
+): void {
   if (value === null || typeof value !== "object") return;
   if (isJsonArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
@@ -315,9 +389,12 @@ function visitRegisteredSecrets(value: JsonValue, secrets: Set<string>): void {
     }
     return;
   }
-  for (const key of Object.keys(value)) {
+  const keys = INTRINSICS.objectKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined) return invalidInput();
     const child = value[key] as JsonValue;
-    if (SENSITIVE_KEYS.has(key.toLowerCase())) {
+    if (hasSetValue(SENSITIVE_KEYS, lowerCase(key))) {
       collectStrings(child, secrets);
     } else {
       visitRegisteredSecrets(child, secrets);
@@ -326,9 +403,12 @@ function visitRegisteredSecrets(value: JsonValue, secrets: Set<string>): void {
 }
 
 function collectRegisteredSecrets(value: JsonValue): readonly string[] {
-  const secrets = new Set<string>();
+  const secrets: SecretCollector = {
+    lookup: new INTRINSICS.setConstructor<string>(),
+    values: [],
+  };
   visitRegisteredSecrets(value, secrets);
-  return [...secrets];
+  return INTRINSICS.objectFreeze(secrets.values);
 }
 
 function containsRegisteredSecret(
@@ -337,7 +417,11 @@ function containsRegisteredSecret(
 ): boolean {
   for (let index = 0; index < secrets.length; index += 1) {
     const secret = secrets[index];
-    if (secret !== undefined && secret.length > 0 && value.includes(secret)) {
+    if (
+      secret !== undefined &&
+      secret.length > 0 &&
+      INTRINSICS.reflectApply(INTRINSICS.stringIncludes, value, [secret])
+    ) {
       return true;
     }
   }
@@ -349,7 +433,8 @@ function isSensitiveRequestId(
   secrets: readonly string[],
 ): boolean {
   return (
-    TOKEN_PATTERN_TEST.test(value) || containsRegisteredSecret(value, secrets)
+    testPattern(TOKEN_PATTERN_TEST, value) ||
+    containsRegisteredSecret(value, secrets)
   );
 }
 
@@ -362,7 +447,32 @@ function safeSuccessRequestId(
 }
 
 function redactTokenPatterns(value: string): string {
-  return value.replace(TOKEN_PATTERN, REDACTED);
+  INTRINSICS.objectDefineProperty(TOKEN_PATTERN, "lastIndex", { value: 0 });
+  let result = "";
+  let start = 0;
+  let matched = false;
+  try {
+    while (true) {
+      const match = execPattern(TOKEN_PATTERN, value);
+      if (match === null) break;
+      const token = match[0];
+      if (
+        token === undefined ||
+        token.length === 0 ||
+        match.index < start ||
+        match.index > value.length - token.length
+      ) {
+        return invalidInput();
+      }
+      result += `${sliceText(value, start, match.index)}${REDACTED}`;
+      start = match.index + token.length;
+      matched = true;
+    }
+  } finally {
+    INTRINSICS.objectDefineProperty(TOKEN_PATTERN, "lastIndex", { value: 0 });
+  }
+  if (!matched) return value;
+  return result + sliceText(value, start);
 }
 
 function defineJsonProperty(
@@ -370,7 +480,7 @@ function defineJsonProperty(
   key: string,
   value: JsonValue,
 ): void {
-  Object.defineProperty(target, key, {
+  INTRINSICS.objectDefineProperty(target, key, {
     configurable: true,
     enumerable: true,
     value,
@@ -387,11 +497,23 @@ function sanitizeJsonValue(
   }
   if (value === null || typeof value !== "object") return value;
   if (isJsonArray(value)) {
-    return value.map((entry) => sanitizeJsonValue(entry, omittedKeys));
+    const result: JsonValue[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      pushValue(
+        result,
+        sanitizeJsonValue(value[index] as JsonValue, omittedKeys),
+      );
+    }
+    return result;
   }
   const result: Record<string, JsonValue> = {};
-  for (const key of Object.keys(value)) {
-    if (omittedKeys?.has(key.toLowerCase()) === true) continue;
+  const keys = INTRINSICS.objectKeys(value);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined) return invalidInput();
+    if (omittedKeys !== undefined && hasSetValue(omittedKeys, lowerCase(key))) {
+      continue;
+    }
     defineJsonProperty(
       result,
       toWellFormedText(redactTokenPatterns(key)),
@@ -413,9 +535,9 @@ function sanitizeSuccessValue(
 function boundedText(value: string, maximum: number): string {
   if (value.length <= maximum) return value;
   let end = maximum;
-  const last = value.charCodeAt(end - 1);
+  const last = charCodeAt(value, end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
-  return value.slice(0, end);
+  return sliceText(value, 0, end);
 }
 
 function sanitizeSuccessText(
@@ -429,9 +551,9 @@ function sanitizeSuccessText(
 }
 
 function createTextContent(text: string) {
-  const item = Object.freeze({ type: "text" as const, text });
+  const item = INTRINSICS.objectFreeze({ type: "text" as const, text });
   const content = [item];
-  Object.freeze(content);
+  INTRINSICS.objectFreeze(content);
   return content;
 }
 
@@ -446,7 +568,7 @@ function sanitizedFailureDetails(value: JsonValue): JsonValue {
     const sanitized = sanitizeJsonValue(redacted, FAILURE_OMITTED_KEYS);
     return frozenJson(canonicalJsonClone(sanitized));
   } catch {
-    return Object.freeze({});
+    return INTRINSICS.objectFreeze({});
   }
 }
 
@@ -476,7 +598,7 @@ function snapshotDescriptorStrings(
     lengthDescriptor === undefined ||
     !INTRINSICS.objectHasOwn(lengthDescriptor, "value") ||
     typeof lengthDescriptor.value !== "number" ||
-    !Number.isInteger(lengthDescriptor.value) ||
+    !INTRINSICS.numberIsInteger(lengthDescriptor.value) ||
     lengthDescriptor.value < 0 ||
     lengthDescriptor.value > MAX_REGISTERED_SECRETS
   ) {
@@ -484,17 +606,21 @@ function snapshotDescriptorStrings(
   }
 
   const length = lengthDescriptor.value;
-  for (const key of INTRINSICS.reflectOwnKeys(descriptors)) {
+  const descriptorKeys = INTRINSICS.reflectOwnKeys(descriptors);
+  for (let keyIndex = 0; keyIndex < descriptorKeys.length; keyIndex += 1) {
+    const key = descriptorKeys[keyIndex];
     if (typeof key !== "string") return undefined;
     if (key === "length") continue;
-    if (!/^(?:0|[1-9]\d*)$/u.test(key)) return undefined;
-    const index = Number(key);
-    if (!Number.isSafeInteger(index) || index >= length) return undefined;
+    if (!testPattern(ARRAY_INDEX_PATTERN, key)) return undefined;
+    const index = INTRINSICS.numberFromValue(key);
+    if (!INTRINSICS.numberIsSafeInteger(index) || index >= length) {
+      return undefined;
+    }
   }
 
   const snapshot: string[] = [];
   for (let index = 0; index < length; index += 1) {
-    const descriptor = descriptors[String(index)];
+    const descriptor = descriptors[INTRINSICS.stringFromValue(index)];
     if (
       descriptor === undefined ||
       !INTRINSICS.objectHasOwn(descriptor, "value") ||
@@ -502,45 +628,97 @@ function snapshotDescriptorStrings(
     ) {
       return undefined;
     }
-    snapshot.push(descriptor.value);
+    pushValue(snapshot, descriptor.value);
   }
-  return Object.freeze(snapshot);
+  return INTRINSICS.objectFreeze(snapshot);
+}
+
+function createAppErrorSnapshot(
+  code: string,
+  message: string,
+  retryable: boolean,
+  details: JsonValue,
+  secrets: readonly string[],
+): AppError {
+  const snapshot = INTRINSICS.objectCreate(
+    INTRINSICS.appErrorPrototype,
+  ) as AppError;
+  INTRINSICS.objectDefineProperty(snapshot, "code", {
+    configurable: true,
+    enumerable: true,
+    value: code,
+    writable: true,
+  });
+  INTRINSICS.objectDefineProperty(snapshot, "message", {
+    configurable: true,
+    enumerable: false,
+    value: message,
+    writable: true,
+  });
+  INTRINSICS.objectDefineProperty(snapshot, "retryable", {
+    configurable: true,
+    enumerable: true,
+    value: retryable,
+    writable: true,
+  });
+  INTRINSICS.objectDefineProperty(snapshot, "details", {
+    configurable: true,
+    enumerable: true,
+    value: details,
+    writable: true,
+  });
+  INTRINSICS.objectDefineProperty(snapshot, "secrets", {
+    configurable: false,
+    enumerable: false,
+    value: secrets,
+    writable: false,
+  });
+  return snapshot;
 }
 
 type InspectedAppError = Readonly<{
-  error: AppError;
-  secrets: readonly string[];
+  error: AppError | undefined;
+  secrets: readonly string[] | undefined;
 }>;
 
-function hasSafeAppErrorPrototype(value: object): boolean {
+const SAFE_NON_APP_ERROR = INTRINSICS.objectFreeze<InspectedAppError>({
+  error: undefined,
+  secrets: INTRINSICS.objectFreeze([]),
+});
+const UNSAFE_ERROR = INTRINSICS.objectFreeze<InspectedAppError>({
+  error: undefined,
+  secrets: undefined,
+});
+
+type PrototypeInspection = "app-error" | "not-app-error" | "unsafe";
+
+function inspectAppErrorPrototype(value: object): PrototypeInspection {
   let current: object | null = value;
   while (current !== null) {
-    if (INTRINSICS.utilIsProxy(current)) return false;
+    if (INTRINSICS.utilIsProxy(current)) return "unsafe";
     const prototype = INTRINSICS.reflectGetPrototypeOf(current);
-    if (prototype === INTRINSICS.appErrorPrototype) return true;
+    if (prototype === INTRINSICS.appErrorPrototype) return "app-error";
     current = prototype;
   }
-  return false;
+  return "not-app-error";
 }
 
-function isAppErrorCode(value: unknown): value is AppErrorCode {
-  return (
-    typeof value === "string" &&
-    INTRINSICS.reflectApply(INTRINSICS.setHas, APP_ERROR_CODE_SET, [value])
-  );
-}
-
-function inspectAppError(error: unknown): InspectedAppError | undefined {
+function inspectAppError(error: unknown): InspectedAppError {
   try {
     if (
-      typeof error !== "object" ||
-      error === null ||
-      !hasSafeAppErrorPrototype(error)
+      (typeof error !== "object" || error === null) &&
+      typeof error !== "function"
     ) {
-      return undefined;
+      return SAFE_NON_APP_ERROR;
     }
 
-    const descriptors = INTRINSICS.objectGetOwnPropertyDescriptors(error);
+    const prototype = inspectAppErrorPrototype(error);
+    if (prototype === "not-app-error") return SAFE_NON_APP_ERROR;
+    if (prototype === "unsafe") return UNSAFE_ERROR;
+
+    const descriptors = INTRINSICS.objectGetOwnPropertyDescriptors(
+      error,
+    ) as Record<string, PropertyDescriptor>;
     const codeDescriptor = descriptors.code;
     const detailsDescriptor = descriptors.details;
     const messageDescriptor = descriptors.message;
@@ -553,31 +731,40 @@ function inspectAppError(error: unknown): InspectedAppError | undefined {
       retryableDescriptor === undefined ||
       secretsDescriptor === undefined ||
       !INTRINSICS.objectHasOwn(codeDescriptor, "value") ||
-      !INTRINSICS.objectHasOwn(detailsDescriptor, "value") ||
       !INTRINSICS.objectHasOwn(messageDescriptor, "value") ||
       !INTRINSICS.objectHasOwn(retryableDescriptor, "value") ||
       !INTRINSICS.objectHasOwn(secretsDescriptor, "value") ||
-      !isAppErrorCode(codeDescriptor.value) ||
+      typeof codeDescriptor.value !== "string" ||
       typeof messageDescriptor.value !== "string" ||
       typeof retryableDescriptor.value !== "boolean"
     ) {
-      return undefined;
+      return UNSAFE_ERROR;
     }
 
-    const details = canonicalJsonClone(detailsDescriptor.value);
     const secrets = snapshotDescriptorStrings(secretsDescriptor.value);
-    if (secrets === undefined) return undefined;
+    if (secrets === undefined) return UNSAFE_ERROR;
 
-    return Object.freeze({
-      error: new AppError(codeDescriptor.value, messageDescriptor.value, {
+    let details: JsonValue = INTRINSICS.objectFreeze({});
+    if (INTRINSICS.objectHasOwn(detailsDescriptor, "value")) {
+      try {
+        details = canonicalJsonClone(detailsDescriptor.value);
+      } catch {
+        details = INTRINSICS.objectFreeze({});
+      }
+    }
+
+    return INTRINSICS.objectFreeze({
+      error: createAppErrorSnapshot(
+        codeDescriptor.value,
+        messageDescriptor.value,
+        retryableDescriptor.value,
         details,
-        retryable: retryableDescriptor.value,
         secrets,
-      }),
+      ),
       secrets,
     });
   } catch {
-    return undefined;
+    return UNSAFE_ERROR;
   }
 }
 
@@ -599,13 +786,13 @@ function createFailureResult(
   details: JsonValue,
   requestId: string,
 ): CallToolResult {
-  const error = Object.freeze({
+  const error = INTRINSICS.objectFreeze({
     code,
     message,
     retryable,
     details,
   });
-  const structuredContent = Object.freeze({
+  const structuredContent = INTRINSICS.objectFreeze({
     schema_version: "1",
     ok: false,
     request_id: requestId,
@@ -617,14 +804,14 @@ function createFailureResult(
     content: createTextContent(text),
     structuredContent,
   };
-  return Object.freeze(result);
+  return INTRINSICS.objectFreeze(result);
 }
 
 const TOTAL_FAILURE_RESULT = createFailureResult(
   "INTERNAL_ERROR",
   "An unexpected internal error occurred",
   false,
-  Object.freeze({}),
+  INTRINSICS.objectFreeze({}),
   INVALID_REQUEST_ID,
 );
 
@@ -654,12 +841,25 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
     sanitizeSuccessValue(clonedData, registeredSecrets),
   );
   if (!isJsonObject(sanitizedData)) return invalidInput();
-  const sanitizedWarnings = warnings.map((warning) =>
-    sanitizeSuccessText(warning, registeredSecrets, MAX_WARNING_LENGTH),
-  );
-  Object.freeze(sanitizedWarnings);
+  const sanitizedWarnings: string[] = [];
+  for (let index = 0; index < warnings.length; index += 1) {
+    pushValue(
+      sanitizedWarnings,
+      sanitizeSuccessText(
+        warnings[index] as string,
+        registeredSecrets,
+        MAX_WARNING_LENGTH,
+      ),
+    );
+  }
+  INTRINSICS.objectFreeze(sanitizedWarnings);
   const sanitizedRateLimit =
-    rateLimit === null ? null : Object.freeze({ ...rateLimit });
+    rateLimit === null
+      ? null
+      : INTRINSICS.objectFreeze({
+          remaining: rateLimit.remaining,
+          resetAt: rateLimit.resetAt,
+        });
   const sanitizedCursor =
     nextCursor === null
       ? null
@@ -670,7 +870,7 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
     MAX_SUMMARY_LENGTH,
   );
 
-  const structuredContent = Object.freeze({
+  const structuredContent = INTRINSICS.objectFreeze({
     schema_version: "1",
     ok: true,
     request_id: requestId,
@@ -683,19 +883,19 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
     content: createTextContent(sanitizedSummary),
     structuredContent,
   };
-  return Object.freeze(result);
+  return INTRINSICS.objectFreeze(result);
 }
 
 export function toolFailure(error: unknown, requestId: string): CallToolResult {
   try {
     const inspected = inspectAppError(error);
-    const serialized = serializeError(inspected?.error);
+    const serialized = serializeError(inspected.error);
     return createFailureResult(
       serialized.code,
       sanitizedFailureMessage(serialized.message),
       serialized.retryable,
       sanitizedFailureDetails(serialized.details),
-      safeFailureRequestId(requestId, inspected?.secrets),
+      safeFailureRequestId(requestId, inspected.secrets),
     );
   } catch {
     return TOTAL_FAILURE_RESULT;
