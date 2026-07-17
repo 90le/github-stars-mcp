@@ -835,19 +835,15 @@ async function validateGeneratedOutputManifest() {
 }
 
 function literalBearerValue(source) {
-  const pattern =
-    /\bbearer[ \t\r\n]+([A-Za-z0-9_~+/-](?:[A-Za-z0-9._~+/-]*[A-Za-z0-9_~+/-])?={0,2})(?=$|[\t\n\r "'`,;)}\]])/giu;
-  for (const match of source.matchAll(pattern)) {
-    const value = match[1]?.replace(/=+$/u, "");
-    if (
-      typeof value === "string" &&
-      value.length >= 4 &&
-      (/[0-9._~+/-]/u.test(value) || value.length >= 20)
-    ) {
-      return true;
-    }
-  }
-  return false;
+  return (
+    /["'`][ \t\r\n]*bearer[ \t\r\n]+(?:[A-Za-z0-9._~+/-]|\\)/iu.test(source) ||
+    /(?:^|[\r\n]|[:=])[ \t\r\n]*bearer[ \t\r\n]+(?:[A-Za-z0-9._~+/-]|\\)/iu.test(
+      source,
+    ) ||
+    /(?:^|[\r\n])[ \t]*[A-Za-z_][A-Za-z0-9_.-]*[ \t]+bearer[ \t]+(?:[A-Za-z0-9._~+/-]|\\)(?:[A-Za-z0-9._~+/-]*={0,2})?[ \t]*(?=$|[\r\n])/iu.test(
+      source,
+    )
+  );
 }
 
 function containsCredentialMaterial(contents) {

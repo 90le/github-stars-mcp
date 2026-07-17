@@ -520,6 +520,31 @@ const WAVE4_LEGITIMATE_SOURCE_MODULES = Object.freeze([
 
 const WAVE4_BEARER_ENCODINGS = Object.freeze([
   [
+    "short alphabetic quoted literal",
+    "AbCdEfGhIjKlMnOp",
+    'const value = "Bearer AbCdEfGhIjKlMnOp";',
+  ],
+  ["single-quoted one-character literal", "Z", "const value = 'bearer Z';"],
+  [
+    "template literal with leading whitespace and mixed case",
+    "xY",
+    "const value = `\t bEaReR \t xY`;",
+  ],
+  ["unquoted env with a short alphabetic value", "Ab", "TOKEN =   BeArEr Ab"],
+  ["unquoted YAML with a one-character value", "Q", "token:\tBEARER Q"],
+  [
+    "Headers.set with a short alphabetic value",
+    "Alpha",
+    'headers.set("Authorization", "  Bearer Alpha");',
+  ],
+  ["unterminated quoted literal", "Qq", 'const value = "Bearer Qq'],
+  [
+    "escaped nested literal",
+    "Yy",
+    'const value = "{\\"Authorization\\":\\"Bearer Yy\\"}";',
+  ],
+  ["escaped token character", "\\u0041", 'const value = "Bearer \\u0041";'],
+  [
     "double-quoted JSON",
     "eyJhbGciOiJIUzI1NiJ9.payload.signature",
     '{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"}',
@@ -1341,7 +1366,11 @@ describe("Codex plugin package", () => {
     ],
     [
       "prose without a token-shaped value",
-      "The client supports Bearer authentication.\n",
+      "The client supports Bearer token-based authentication.\n",
+    ],
+    [
+      "quoted prose where Bearer occurs later",
+      'const note = "The client supports Bearer token-based authentication.";\n',
     ],
   ])("accepts non-credential Bearer control: %s", async (_name, contents) => {
     await withPluginFixture(async (root) => {
