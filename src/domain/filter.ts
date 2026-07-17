@@ -1,7 +1,10 @@
+import { Buffer } from "node:buffer";
+import { types as utilTypes } from "node:util";
 import type { Clock } from "../app/ports/runtime-port.js";
 import { AppError } from "./errors.js";
 import type { RepositoryId, SnapshotId } from "./ids.js";
 import type { RepositoryView, UserList } from "./repository.js";
+import { canonicalUtcTimestamp } from "./timestamp.js";
 
 type StringFilterField =
   | "repository_id"
@@ -182,18 +185,48 @@ const SORT_FIELDS = new Set<RepositorySort["field"]>([
   "starred_at",
   "full_name",
 ]);
-const ISO_UTC_TIMESTAMP =
-  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/u;
-
 function validationError(message: string): never {
   throw new AppError("VALIDATION_ERROR", message);
 }
 
 function asRecord(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return validationError(`${label} must be an object`);
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      utilTypes.isProxy(value) ||
+      Array.isArray(value)
+    ) {
+      return validationError(`${label} must be a plain data object`);
+    }
+    const prototype = Reflect.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return validationError(`${label} must be a plain data object`);
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const result: Record<string, unknown> = Object.create(null) as Record<
+      string,
+      unknown
+    >;
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== "string") {
+        return validationError(`${label} contains unsupported properties`);
+      }
+      const descriptor = descriptors[key];
+      if (
+        descriptor === undefined ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.enumerable !== true
+      ) {
+        return validationError(`${label} properties must be plain data`);
+      }
+      result[key] = descriptor.value as unknown;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    return validationError(`${label} could not be inspected`);
   }
-  return value as Record<string, unknown>;
 }
 
 function requireExactKeys(
@@ -216,70 +249,82 @@ function requireExactKeys(
 }
 
 function normalizeTimestamp(value: unknown, label: string): string {
-  if (typeof value !== "string") {
-    return validationError(`${label} must be a UTC timestamp`);
+  return canonicalUtcTimestamp(value, label);
+}
+
+function denseArray(value: unknown, label: string): readonly unknown[] {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      utilTypes.isProxy(value) ||
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      return validationError(`${label} must be a dense plain array`);
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(
+      value,
+    ) as unknown as PropertyDescriptorMap;
+    const lengthDescriptor = descriptors.length;
+    if (
+      lengthDescriptor === undefined ||
+      !Object.hasOwn(lengthDescriptor, "value") ||
+      typeof lengthDescriptor.value !== "number" ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      return validationError(`${label} must be a dense plain array`);
+    }
+    const length = lengthDescriptor.value;
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.some((key) => typeof key !== "string") ||
+      keys.length !== length + 1
+    ) {
+      return validationError(`${label} must be a dense plain array`);
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (
+        descriptor === undefined ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.enumerable !== true
+      ) {
+        return validationError(`${label} must be a dense plain array`);
+      }
+      result.push(descriptor.value);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    return validationError(`${label} could not be inspected`);
   }
-  const match = ISO_UTC_TIMESTAMP.exec(value);
-  if (match === null) {
-    return validationError(`${label} must be an ISO UTC timestamp ending in Z`);
-  }
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const hour = Number(match[4]);
-  const minute = Number(match[5]);
-  const second = Number(match[6]);
-  const millisecond = Number((match[7] ?? "").slice(0, 3).padEnd(3, "0"));
-  const timestamp = new Date(value);
-  if (
-    !Number.isFinite(timestamp.getTime()) ||
-    timestamp.getUTCFullYear() !== year ||
-    timestamp.getUTCMonth() + 1 !== month ||
-    timestamp.getUTCDate() !== day ||
-    timestamp.getUTCHours() !== hour ||
-    timestamp.getUTCMinutes() !== minute ||
-    timestamp.getUTCSeconds() !== second ||
-    timestamp.getUTCMilliseconds() !== millisecond
-  ) {
-    return validationError(`${label} must be a valid UTC timestamp`);
-  }
-  return timestamp.toISOString();
 }
 
 function denseStringArray(value: unknown, label: string): readonly string[] {
-  if (!Array.isArray(value) || value.length === 0) {
+  const entries = denseArray(value, label);
+  if (
+    entries.length === 0 ||
+    entries.some((entry) => typeof entry !== "string")
+  ) {
     return validationError(`${label} must be a non-empty string array`);
   }
-  const result: string[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const entry: unknown = value[index];
-    if (!Object.hasOwn(value, index) || typeof entry !== "string") {
-      return validationError(`${label} must be a non-empty string array`);
-    }
-    result.push(entry);
-  }
-  return result;
+  return entries as readonly string[];
 }
 
 function denseNumberArray(value: unknown, label: string): readonly number[] {
-  if (!Array.isArray(value) || value.length === 0) {
+  const entries = denseArray(value, label);
+  if (
+    entries.length === 0 ||
+    entries.some(
+      (entry) => typeof entry !== "number" || !Number.isFinite(entry),
+    )
+  ) {
     return validationError(`${label} must be a non-empty finite-number array`);
   }
-  const result: number[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    const entry: unknown = value[index];
-    if (
-      !Object.hasOwn(value, index) ||
-      typeof entry !== "number" ||
-      !Number.isFinite(entry)
-    ) {
-      return validationError(
-        `${label} must be a non-empty finite-number array`,
-      );
-    }
-    result.push(entry);
-  }
-  return result;
+  return entries as readonly number[];
 }
 
 function daysInUtcMonth(year: number, month: number): number {
@@ -375,7 +420,14 @@ function normalizeRelativeTimestamp(
   if (!Number.isFinite(result.getTime())) {
     return validationError("relative timestamp is outside the supported range");
   }
-  return result.toISOString();
+  const resultYear = result.getUTCFullYear();
+  if (resultYear < 0 || resultYear > 9_999) {
+    return validationError("relative timestamp is outside the supported range");
+  }
+  return canonicalUtcTimestamp(
+    result.toISOString(),
+    "resolved relative timestamp",
+  );
 }
 
 function parseLeaf(
@@ -525,29 +577,25 @@ export function parseFilter(
     const record = asRecord(value, "filter expression");
     if (Object.hasOwn(record, "all")) {
       requireExactKeys(record, ["all"], "all filter");
-      if (!Array.isArray(record.all) || record.all.length === 0) {
+      const childValues = denseArray(record.all, "all filter children");
+      if (childValues.length === 0) {
         return validationError("all filter must contain at least one child");
       }
       const children: FilterExpression[] = [];
-      for (let index = 0; index < record.all.length; index += 1) {
-        if (!Object.hasOwn(record.all, index)) {
-          return validationError("all filter children must be dense");
-        }
-        children.push(parseNode(record.all[index], depth + 1));
+      for (const child of childValues) {
+        children.push(parseNode(child, depth + 1));
       }
       return { all: children };
     }
     if (Object.hasOwn(record, "any")) {
       requireExactKeys(record, ["any"], "any filter");
-      if (!Array.isArray(record.any) || record.any.length === 0) {
+      const childValues = denseArray(record.any, "any filter children");
+      if (childValues.length === 0) {
         return validationError("any filter must contain at least one child");
       }
       const children: FilterExpression[] = [];
-      for (let index = 0; index < record.any.length; index += 1) {
-        if (!Object.hasOwn(record.any, index)) {
-          return validationError("any filter children must be dense");
-        }
-        children.push(parseNode(record.any[index], depth + 1));
+      for (const child of childValues) {
+        children.push(parseNode(child, depth + 1));
       }
       return { any: children };
     }
@@ -699,8 +747,14 @@ export function matchesFilter(
       return (candidate === null) === temporalFilter.value;
     }
     if (candidate === null) return false;
-    const candidateTime = Date.parse(candidate);
-    const filterTime = Date.parse(temporalFilter.value as string);
+    const candidateTime = canonicalUtcTimestamp(
+      candidate,
+      `repository ${filter.field} timestamp`,
+    );
+    const filterTime = canonicalUtcTimestamp(
+      temporalFilter.value,
+      `filter ${filter.field} timestamp`,
+    );
     if (temporalFilter.op === "before") return candidateTime < filterTime;
     if (temporalFilter.op === "after") return candidateTime > filterTime;
     return candidateTime === filterTime;
@@ -739,24 +793,24 @@ export function matchesFilter(
 export function normalizeSort(
   sort: readonly RepositorySort[],
 ): readonly NormalizedRepositorySort[] {
-  if (!Array.isArray(sort)) {
-    return validationError("repository sort must be an array");
-  }
+  const terms = denseArray(sort, "repository sort");
   const normalized: NormalizedRepositorySort[] = [];
   const seen = new Set<RepositorySort["field"]>();
-  for (const term of sort) {
+  for (const term of terms) {
     const record = asRecord(term, "repository sort term");
     requireExactKeys(record, ["field", "direction"], "repository sort term");
+    const fieldValue = record.field;
+    const directionValue = record.direction;
     if (
-      typeof record.field !== "string" ||
-      !SORT_FIELDS.has(record.field as RepositorySort["field"]) ||
-      (record.direction !== "asc" && record.direction !== "desc")
+      typeof fieldValue !== "string" ||
+      !SORT_FIELDS.has(fieldValue as RepositorySort["field"]) ||
+      (directionValue !== "asc" && directionValue !== "desc")
     ) {
       return validationError("repository sort field or direction is invalid");
     }
-    const field = record.field as RepositorySort["field"];
+    const field = fieldValue as RepositorySort["field"];
     if (!seen.has(field)) {
-      normalized.push({ field, direction: record.direction });
+      normalized.push({ field, direction: directionValue });
       seen.add(field);
     }
   }
@@ -789,17 +843,15 @@ function repositorySortValue(
   }
 }
 
-function compareNonNull(
-  left: string | number,
-  right: string | number,
-  temporal: boolean,
-): number {
-  const normalizedLeft =
-    temporal && typeof left === "string" ? Date.parse(left) : left;
-  const normalizedRight =
-    temporal && typeof right === "string" ? Date.parse(right) : right;
-  if (normalizedLeft < normalizedRight) return -1;
-  if (normalizedLeft > normalizedRight) return 1;
+function compareNonNull(left: string | number, right: string | number): number {
+  if (typeof left === "string" && typeof right === "string") {
+    return Buffer.compare(
+      Buffer.from(left, "utf8"),
+      Buffer.from(right, "utf8"),
+    );
+  }
+  if (left < right) return -1;
+  if (left > right) return 1;
   return 0;
 }
 
@@ -814,13 +866,7 @@ export function compareRepositories(
     if (leftValue === null && rightValue === null) continue;
     if (leftValue === null) return 1;
     if (rightValue === null) return -1;
-    const comparison = compareNonNull(
-      leftValue,
-      rightValue,
-      term.field === "pushed_at" ||
-        term.field === "updated_at" ||
-        term.field === "starred_at",
-    );
+    const comparison = compareNonNull(leftValue, rightValue);
     if (comparison !== 0) {
       return term.direction === "asc" ? comparison : -comparison;
     }

@@ -1,5 +1,6 @@
 import { z } from "zod";
 import type { RepositoryDatabaseId, RepositoryId, UserListId } from "./ids.js";
+import { canonicalUtcTimestamp } from "./timestamp.js";
 
 export interface AccountBinding {
   readonly host: string;
@@ -79,7 +80,18 @@ const repositoryDatabaseIdSchema = z
   .transform((value) => value as RepositoryDatabaseId);
 
 const trimmedNameSchema = z.string().trim().min(1);
-const isoTimestampSchema = z.string().datetime({ offset: false });
+const isoTimestampSchema = z.string().transform((value, context) => {
+  try {
+    return canonicalUtcTimestamp(value);
+  } catch {
+    context.addIssue({
+      code: "custom",
+      message:
+        "timestamp must be a valid UTC value in YYYY-MM-DDTHH:mm:ss[.SSS]Z form",
+    });
+    return z.NEVER;
+  }
+});
 
 const httpsGitHubUrlSchema = z
   .string()

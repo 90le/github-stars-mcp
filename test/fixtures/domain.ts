@@ -21,12 +21,12 @@ export const repositoryInputFixture = {
   primaryLanguage: "TypeScript",
   topics: ["MCP", "mcp", " Agent "],
   licenseSpdxId: "Apache-2.0",
-  pushedAt: "2026-07-16T00:00:00Z",
-  updatedAt: "2026-07-16T01:00:00Z",
+  pushedAt: "2026-07-16T00:00:00.000Z",
+  updatedAt: "2026-07-16T01:00:00.000Z",
 } as const;
 
 export const repositoryViewFixture: RepositoryView = {
   ...repositorySchema.parse(repositoryInputFixture),
-  starredAt: "2026-07-15T12:00:00Z",
+  starredAt: "2026-07-15T12:00:00.000Z",
   listIds: [asUserListId("UL_1")],
 };

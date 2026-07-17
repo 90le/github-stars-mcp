@@ -1,7 +1,8 @@
 import {
-  decodeRepositoryCursorForSort,
+  assertValidatedRepositoryCursorPayload,
   hashRepositorySort,
   type CursorValue,
+  type ValidatedRepositoryCursorPayload,
 } from "../domain/cursor.js";
 import { AppError } from "../domain/errors.js";
 import {
@@ -11,6 +12,7 @@ import {
   type NormalizedRepositorySort,
   type RepositorySort,
 } from "../domain/filter.js";
+import { canonicalUtcTimestamp } from "../domain/timestamp.js";
 
 export interface SqlFragment {
   readonly sql: string;
@@ -304,7 +306,11 @@ function validateCursorValue(
   value: CursorValue,
 ): void {
   if (term.field === "stargazer_count") {
-    if (typeof value !== "number" || !Number.isFinite(value)) {
+    if (
+      typeof value !== "number" ||
+      !Number.isSafeInteger(value) ||
+      value < 0
+    ) {
       validationError("repository cursor stargazer value is invalid");
     }
     return;
@@ -317,7 +323,10 @@ function validateCursorValue(
     (term.field === "pushed_at" ||
       term.field === "updated_at" ||
       term.field === "starred_at") &&
-    !Number.isFinite(Date.parse(value))
+    canonicalUtcTimestamp(
+      value,
+      `repository cursor ${term.field} timestamp`,
+    ) !== value
   ) {
     validationError(`repository cursor ${term.field} timestamp is invalid`);
   }
@@ -377,47 +386,47 @@ function branch(
 
 export function compileCursor(
   sort: readonly RepositorySort[],
-  cursor: string | null,
+  cursor: ValidatedRepositoryCursorPayload | null,
 ): SqlFragment {
   if (cursor === null) return { sql: "1 = 1", params: [] };
 
+  assertValidatedRepositoryCursorPayload(cursor);
   const normalized = normalizeSort(sort);
   const valueTerms = normalized.filter(
     (term) => term.field !== "repository_id",
   );
-  const payload = decodeRepositoryCursorForSort(
-    cursor,
-    hashRepositorySort(sort),
-  );
+  if (cursor.sortHash !== hashRepositorySort(sort)) {
+    return validationError("repository cursor sort does not match");
+  }
   if (
-    payload.values.length !== valueTerms.length ||
-    payload.nulls.length !== valueTerms.length
+    cursor.values.length !== valueTerms.length ||
+    cursor.nulls.length !== valueTerms.length
   ) {
     return validationError(
       "repository cursor values do not match normalized sort",
     );
   }
   valueTerms.forEach((term, index) => {
-    validateCursorValue(term, payload.values[index]!);
+    validateCursorValue(term, cursor.values[index]!);
   });
 
   const branches: SqlFragment[] = [];
   valueTerms.forEach((term, index) => {
-    const value = payload.values[index]!;
+    const value = cursor.values[index]!;
     if (value !== null) {
       branches.push(
         branch(
           valueTerms.slice(0, index),
-          payload.values.slice(0, index),
+          cursor.values.slice(0, index),
           afterCondition(term, value),
         ),
       );
     }
   });
   branches.push(
-    branch(valueTerms, payload.values, {
+    branch(valueTerms, cursor.values, {
       sql: "ss.repository_id > ?",
-      params: [payload.repositoryId],
+      params: [cursor.repositoryId],
     }),
   );
   return combine("OR", branches);

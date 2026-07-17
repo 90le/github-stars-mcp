@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
-import { createHash } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { types as utilTypes } from "node:util";
 import { AppError } from "./errors.js";
 import {
   asRepositoryId,
@@ -14,8 +15,10 @@ import {
   normalizeSort,
   parseFilter,
   type FilterExpression,
+  type NormalizedRepositorySort,
   type RepositorySort,
 } from "./filter.js";
+import { canonicalUtcTimestamp } from "./timestamp.js";
 
 export type CursorValue = string | number | null;
 
@@ -30,22 +33,23 @@ export interface RepositoryCursorPayload {
   readonly repositoryId: RepositoryId;
 }
 
-export interface RepositoryCursorInput {
-  readonly v?: 1;
+declare const validatedRepositoryCursorBrand: unique symbol;
+
+export interface ValidatedRepositoryCursorPayload extends RepositoryCursorPayload {
+  readonly [validatedRepositoryCursorBrand]: true;
+}
+
+export interface RepositoryCursorContext {
   readonly kind: "repositories";
   readonly snapshotId: SnapshotId | string;
   readonly filterHash: string;
-  readonly sortHash: string;
+  readonly sort: readonly RepositorySort[];
+}
+
+export interface RepositoryCursorPositionInput {
   readonly values: readonly CursorValue[];
   readonly nulls: readonly boolean[];
   readonly repositoryId: RepositoryId | string;
-}
-
-export interface ExpectedRepositoryCursor {
-  readonly kind: "repositories";
-  readonly snapshotId: SnapshotId | string;
-  readonly filterHash: string;
-  readonly sortHash: string;
 }
 
 export interface ListCursorPayload {
@@ -57,32 +61,171 @@ export interface ListCursorPayload {
   readonly listId: UserListId;
 }
 
-export interface ListCursorInput {
-  readonly v?: 1;
+export interface ListCursorContext {
   readonly kind: "lists";
   readonly snapshotId: SnapshotId | string;
   readonly selectionHash: string;
+}
+
+export interface ListCursorPositionInput {
   readonly values: readonly CursorValue[];
   readonly listId: UserListId | string;
 }
 
-export interface ExpectedListCursor {
-  readonly kind: "lists";
-  readonly snapshotId: SnapshotId | string;
+export interface CursorCodec {
+  encodeRepository(
+    context: RepositoryCursorContext,
+    position: RepositoryCursorPositionInput,
+  ): string;
+  decodeRepository(
+    cursor: string,
+    context: RepositoryCursorContext,
+  ): ValidatedRepositoryCursorPayload;
+  encodeList(
+    context: ListCursorContext,
+    position: ListCursorPositionInput,
+  ): string;
+  decodeList(cursor: string, context: ListCursorContext): ListCursorPayload;
+}
+
+interface NormalizedRepositoryContext {
+  readonly snapshotId: SnapshotId;
+  readonly filterHash: string;
+  readonly sortHash: string;
+  readonly sort: readonly NormalizedRepositorySort[];
+}
+
+interface NormalizedListContext {
+  readonly snapshotId: SnapshotId;
   readonly selectionHash: string;
 }
 
 const MAX_CURSOR_BYTES = 4 * 1_024;
-const HASH_LENGTH = 64;
+const HASH = /^[a-f0-9]{64}$/u;
+const MAC = /^[a-f0-9]{64}$/u;
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
+const validatedRepositoryPayloads = new WeakSet<object>();
 
-function cursorError(message: string, cause?: unknown): never {
-  throw new AppError("VALIDATION_ERROR", message, {
-    ...(cause === undefined ? {} : { cause }),
-  });
+function cursorError(message: string): never {
+  throw new AppError("VALIDATION_ERROR", message);
 }
 
-function canonicalJson(value: unknown): string {
+function snapshotPlainObject(
+  value: unknown,
+  label: string,
+): Readonly<Record<string, unknown>> {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      utilTypes.isProxy(value) ||
+      Array.isArray(value)
+    ) {
+      return cursorError(`${label} must be a plain data object`);
+    }
+    const prototype = Reflect.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return cursorError(`${label} must be a plain data object`);
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const result: Record<string, unknown> = Object.create(null) as Record<
+      string,
+      unknown
+    >;
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== "string") {
+        return cursorError(`${label} cannot contain symbol properties`);
+      }
+      const descriptor = descriptors[key];
+      if (
+        descriptor === undefined ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.enumerable !== true
+      ) {
+        return cursorError(`${label} properties must be plain data values`);
+      }
+      result[key] = descriptor.value as unknown;
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    return cursorError(`${label} could not be inspected`);
+  }
+}
+
+function snapshotDenseArray(value: unknown, label: string): readonly unknown[] {
+  try {
+    if (
+      typeof value !== "object" ||
+      value === null ||
+      utilTypes.isProxy(value) ||
+      !Array.isArray(value) ||
+      Object.getPrototypeOf(value) !== Array.prototype
+    ) {
+      return cursorError(`${label} must be a dense plain array`);
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(
+      value,
+    ) as unknown as PropertyDescriptorMap;
+    const lengthDescriptor = descriptors.length;
+    if (
+      lengthDescriptor === undefined ||
+      !Object.hasOwn(lengthDescriptor, "value") ||
+      typeof lengthDescriptor.value !== "number" ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      return cursorError(`${label} must be a dense plain array`);
+    }
+    const length = lengthDescriptor.value;
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.some((key) => typeof key !== "string") ||
+      keys.length !== length + 1
+    ) {
+      return cursorError(`${label} must be a dense plain array`);
+    }
+    const result: unknown[] = [];
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      if (
+        descriptor === undefined ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.enumerable !== true
+      ) {
+        return cursorError(`${label} must be a dense plain array`);
+      }
+      result.push(descriptor.value);
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    return cursorError(`${label} could not be inspected`);
+  }
+}
+
+function exactKeys(
+  value: Readonly<Record<string, unknown>>,
+  expected: readonly string[],
+  label: string,
+): void {
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length !== expected.length ||
+    keys.some((key) => typeof key !== "string" || !expected.includes(key))
+  ) {
+    cursorError(`${label} has invalid properties`);
+  }
+}
+
+function canonicalJson(
+  value: unknown,
+  ancestors = new Set<object>(),
+  depth = 0,
+): string {
+  if (depth > 64) {
+    return cursorError("canonical JSON nesting must not exceed 64 levels");
+  }
   if (value === null) return "null";
   if (typeof value === "string" || typeof value === "boolean") {
     return JSON.stringify(value);
@@ -93,41 +236,41 @@ function canonicalJson(value: unknown): string {
     }
     return JSON.stringify(value);
   }
-  if (Array.isArray(value)) {
-    const entries: string[] = [];
-    for (let index = 0; index < value.length; index += 1) {
-      if (!Object.hasOwn(value, index)) {
-        return cursorError("canonical JSON arrays must be dense");
-      }
-      entries.push(canonicalJson(value[index]));
-    }
-    return `[${entries.join(",")}]`;
-  }
   if (typeof value !== "object" || value === undefined) {
     return cursorError("value is not canonical JSON");
   }
-  let keys: readonly PropertyKey[];
+  if (ancestors.has(value)) {
+    return cursorError("canonical JSON cannot contain cycles");
+  }
+
+  ancestors.add(value);
   try {
-    keys = Reflect.ownKeys(value);
-  } catch (error) {
-    return cursorError("canonical JSON value could not be inspected", error);
-  }
-  if (keys.some((key) => typeof key !== "string")) {
-    return cursorError("canonical JSON objects cannot contain symbol keys");
-  }
-  const stringKeys = [...(keys as readonly string[])].sort();
-  const entries = stringKeys.map((key) => {
-    const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (
-      descriptor === undefined ||
-      !Object.hasOwn(descriptor, "value") ||
-      descriptor.value === undefined
-    ) {
-      return cursorError("canonical JSON properties must be data values");
+    let isArray: boolean;
+    try {
+      isArray = Array.isArray(value);
+    } catch {
+      return cursorError("canonical JSON value could not be inspected");
     }
-    return `${JSON.stringify(key)}:${canonicalJson(descriptor.value)}`;
-  });
-  return `{${entries.join(",")}}`;
+    if (isArray) {
+      const entries = snapshotDenseArray(value, "canonical JSON array").map(
+        (entry) => canonicalJson(entry, ancestors, depth + 1),
+      );
+      return `[${entries.join(",")}]`;
+    }
+    const record = snapshotPlainObject(value, "canonical JSON object");
+    const keys = Object.keys(record).sort();
+    const entries = keys.map(
+      (key) =>
+        `${JSON.stringify(key)}:${canonicalJson(
+          record[key],
+          ancestors,
+          depth + 1,
+        )}`,
+    );
+    return `{${entries.join(",")}}`;
+  } finally {
+    ancestors.delete(value);
+  }
 }
 
 function hashCanonical(value: unknown): string {
@@ -146,49 +289,50 @@ export function hashListSelection(selection: JsonValue): string {
   return hashCanonical(selection);
 }
 
-function exactKeys(
-  value: Record<string, unknown>,
-  expected: readonly string[],
-  label: string,
-): void {
-  let keys: readonly PropertyKey[];
-  try {
-    keys = Reflect.ownKeys(value);
-  } catch (error) {
-    return cursorError(`${label} could not be inspected`, error);
-  }
-  if (
-    keys.length !== expected.length ||
-    keys.some((key) => typeof key !== "string" || !expected.includes(key))
-  ) {
-    cursorError(`${label} has invalid properties`);
-  }
-}
-
-function record(value: unknown, label: string): Record<string, unknown> {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return cursorError(`${label} must be an object`);
-  }
-  return value as Record<string, unknown>;
-}
-
 function validHash(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length !== HASH_LENGTH) {
-    return cursorError(`${label} must be a 64-character hash`);
+  if (typeof value !== "string" || !HASH.test(value)) {
+    return cursorError(`${label} must be a lowercase 64-hex hash`);
   }
   return value;
 }
 
-function cursorValues(value: unknown, label: string): readonly CursorValue[] {
-  if (!Array.isArray(value)) {
-    return cursorError(`${label} must be an array`);
+function stableSnapshotId(value: unknown, label: string): SnapshotId {
+  if (typeof value !== "string") {
+    return cursorError(`${label} must be a stable ID`);
   }
+  try {
+    return asSnapshotId(value);
+  } catch {
+    return cursorError(`${label} must be a stable ID`);
+  }
+}
+
+function stableRepositoryId(value: unknown): RepositoryId {
+  if (typeof value !== "string") {
+    return cursorError("repository cursor repository ID must be a stable ID");
+  }
+  try {
+    return asRepositoryId(value);
+  } catch {
+    return cursorError("repository cursor repository ID must be a stable ID");
+  }
+}
+
+function stableListId(value: unknown): UserListId {
+  if (typeof value !== "string") {
+    return cursorError("list cursor list ID must be a stable ID");
+  }
+  try {
+    return asUserListId(value);
+  } catch {
+    return cursorError("list cursor list ID must be a stable ID");
+  }
+}
+
+function cursorValues(value: unknown, label: string): readonly CursorValue[] {
+  const entries = snapshotDenseArray(value, label);
   const result: CursorValue[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    if (!Object.hasOwn(value, index)) {
-      return cursorError(`${label} must be dense`);
-    }
-    const entry: unknown = value[index];
+  for (const entry of entries) {
     if (
       entry !== null &&
       typeof entry !== "string" &&
@@ -202,25 +346,221 @@ function cursorValues(value: unknown, label: string): readonly CursorValue[] {
 }
 
 function booleanMarkers(value: unknown): readonly boolean[] {
-  if (!Array.isArray(value)) {
-    return cursorError("repository cursor null markers must be an array");
+  const entries = snapshotDenseArray(value, "repository cursor null markers");
+  if (entries.some((entry) => typeof entry !== "boolean")) {
+    return cursorError(
+      "repository cursor null markers must be a dense Boolean array",
+    );
   }
-  const result: boolean[] = [];
-  for (let index = 0; index < value.length; index += 1) {
-    if (!Object.hasOwn(value, index) || typeof value[index] !== "boolean") {
-      return cursorError(
-        "repository cursor null markers must be a dense Boolean array",
-      );
-    }
-    result.push(value[index] as boolean);
-  }
-  return result;
+  return entries as readonly boolean[];
 }
 
-function parseCursorJson(cursor: string): {
-  readonly parsed: unknown;
-  readonly text: string;
+function normalizeRepositoryContext(
+  context: unknown,
+): NormalizedRepositoryContext {
+  const record = snapshotPlainObject(context, "repository cursor context");
+  exactKeys(
+    record,
+    ["kind", "snapshotId", "filterHash", "sort"],
+    "repository cursor context",
+  );
+  if (record.kind !== "repositories") {
+    return cursorError("cursor resource kind does not match repositories");
+  }
+  const normalizedSort = normalizeSort(
+    record.sort as readonly RepositorySort[],
+  );
+  return {
+    snapshotId: stableSnapshotId(
+      record.snapshotId,
+      "repository cursor snapshot",
+    ),
+    filterHash: validHash(record.filterHash, "repository cursor filter hash"),
+    sortHash: hashCanonical(normalizedSort),
+    sort: normalizedSort,
+  };
+}
+
+function normalizeListContext(context: unknown): NormalizedListContext {
+  const record = snapshotPlainObject(context, "list cursor context");
+  exactKeys(
+    record,
+    ["kind", "snapshotId", "selectionHash"],
+    "list cursor context",
+  );
+  if (record.kind !== "lists") {
+    return cursorError("cursor resource kind does not match lists");
+  }
+  return {
+    snapshotId: stableSnapshotId(record.snapshotId, "list cursor snapshot"),
+    selectionHash: validHash(
+      record.selectionHash,
+      "list cursor selection hash",
+    ),
+  };
+}
+
+function validateRepositoryValues(
+  sort: readonly NormalizedRepositorySort[],
+  values: readonly CursorValue[],
+  nulls: readonly boolean[],
+): void {
+  const valueTerms = sort.filter((term) => term.field !== "repository_id");
+  if (
+    values.length !== valueTerms.length ||
+    nulls.length !== valueTerms.length ||
+    values.some((entry, index) => (entry === null) !== nulls[index])
+  ) {
+    return cursorError(
+      "repository cursor values do not match normalized sort and null markers",
+    );
+  }
+
+  valueTerms.forEach((term, index) => {
+    const value = values[index]!;
+    if (term.field === "stargazer_count") {
+      if (
+        typeof value !== "number" ||
+        !Number.isSafeInteger(value) ||
+        value < 0
+      ) {
+        cursorError(
+          "repository cursor stargazer value must be a nonnegative safe integer",
+        );
+      }
+      return;
+    }
+    if (term.field === "pushed_at" && value === null) return;
+    if (typeof value !== "string") {
+      cursorError(`repository cursor ${term.field} value is invalid`);
+    }
+    if (
+      term.field === "pushed_at" ||
+      term.field === "updated_at" ||
+      term.field === "starred_at"
+    ) {
+      let canonical: string;
+      try {
+        canonical = canonicalUtcTimestamp(
+          value,
+          `repository cursor ${term.field} timestamp`,
+        );
+      } catch {
+        return cursorError(
+          `repository cursor ${term.field} timestamp is invalid`,
+        );
+      }
+      if (canonical !== value) {
+        return cursorError(
+          `repository cursor ${term.field} timestamp must be canonical`,
+        );
+      }
+    }
+  });
+}
+
+function repositoryPosition(
+  input: unknown,
+  sort: readonly NormalizedRepositorySort[],
+): {
+  readonly values: readonly CursorValue[];
+  readonly nulls: readonly boolean[];
+  readonly repositoryId: RepositoryId;
 } {
+  const record = snapshotPlainObject(input, "repository cursor position");
+  exactKeys(
+    record,
+    ["values", "nulls", "repositoryId"],
+    "repository cursor position",
+  );
+  const values = cursorValues(record.values, "repository cursor values");
+  const nulls = booleanMarkers(record.nulls);
+  validateRepositoryValues(sort, values, nulls);
+  return {
+    values: Object.freeze([...values]),
+    nulls: Object.freeze([...nulls]),
+    repositoryId: stableRepositoryId(record.repositoryId),
+  };
+}
+
+function listPosition(input: unknown): {
+  readonly values: readonly CursorValue[];
+  readonly listId: UserListId;
+} {
+  const record = snapshotPlainObject(input, "list cursor position");
+  exactKeys(record, ["values", "listId"], "list cursor position");
+  return {
+    values: Object.freeze([
+      ...cursorValues(record.values, "list cursor values"),
+    ]),
+    listId: stableListId(record.listId),
+  };
+}
+
+function signingKeyCopy(signingKey: Uint8Array): Buffer {
+  try {
+    if (
+      typeof signingKey !== "object" ||
+      signingKey === null ||
+      utilTypes.isProxy(signingKey) ||
+      !(signingKey instanceof Uint8Array) ||
+      signingKey.byteLength < 32
+    ) {
+      return cursorError(
+        "cursor signing key must be a Uint8Array of at least 32 bytes",
+      );
+    }
+    return Buffer.from(signingKey);
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    return cursorError(
+      "cursor signing key must be a Uint8Array of at least 32 bytes",
+    );
+  }
+}
+
+function authenticate(payloadText: string, mac: string, key: Buffer): void {
+  if (!MAC.test(mac)) {
+    return cursorError("cursor authentication code is invalid");
+  }
+  let expected: Buffer;
+  try {
+    expected = createHmac("sha256", key).update(payloadText).digest();
+  } catch {
+    return cursorError("cursor authentication failed");
+  }
+  const supplied = Buffer.from(mac, "hex");
+  if (
+    supplied.length !== expected.length ||
+    !timingSafeEqual(supplied, expected)
+  ) {
+    return cursorError("cursor authentication failed");
+  }
+}
+
+function encodedEnvelope(payload: unknown, key: Buffer): string {
+  const payloadText = canonicalJson(payload);
+  let mac: string;
+  try {
+    mac = createHmac("sha256", key).update(payloadText).digest("hex");
+  } catch {
+    return cursorError("cursor authentication failed");
+  }
+  const text = canonicalJson({ mac, payload });
+  const cursor = Buffer.from(text, "utf8").toString("base64url");
+  if (
+    Buffer.byteLength(text, "utf8") > MAX_CURSOR_BYTES ||
+    Buffer.byteLength(cursor, "utf8") > MAX_CURSOR_BYTES
+  ) {
+    return cursorError("cursor must not exceed 4 KiB");
+  }
+  return cursor;
+}
+
+function decodedEnvelope(
+  cursor: string,
+  key: Buffer,
+): Readonly<Record<string, unknown>> {
   if (
     typeof cursor !== "string" ||
     cursor.length === 0 ||
@@ -229,11 +569,12 @@ function parseCursorJson(cursor: string): {
   ) {
     return cursorError("cursor must be at most 4 KiB of base64url text");
   }
+
   let bytes: Buffer;
   try {
     bytes = Buffer.from(cursor, "base64url");
-  } catch (error) {
-    return cursorError("cursor base64url is invalid", error);
+  } catch {
+    return cursorError("cursor base64url is invalid");
   }
   if (
     bytes.toString("base64url") !== cursor ||
@@ -245,23 +586,33 @@ function parseCursorJson(cursor: string): {
   if (!Buffer.from(text, "utf8").equals(bytes)) {
     return cursorError("cursor is not valid UTF-8");
   }
+
   let parsed: unknown;
   try {
     parsed = JSON.parse(text) as unknown;
-  } catch (error) {
-    return cursorError("cursor JSON is invalid", error);
+  } catch {
+    return cursorError("cursor JSON is invalid");
   }
-  return { parsed, text };
+  if (canonicalJson(parsed) !== text) {
+    return cursorError("cursor JSON is not canonical");
+  }
+  const envelope = snapshotPlainObject(parsed, "cursor envelope");
+  exactKeys(envelope, ["mac", "payload"], "cursor envelope");
+  if (typeof envelope.mac !== "string") {
+    return cursorError("cursor authentication code is invalid");
+  }
+  authenticate(canonicalJson(envelope.payload), envelope.mac, key);
+  return snapshotPlainObject(envelope.payload, "cursor payload");
 }
 
-function parseRepositoryPayload(cursor: string): RepositoryCursorPayload {
-  const decoded = parseCursorJson(cursor);
-  const value = record(decoded.parsed, "repository cursor");
-  if (value.kind !== "repositories") {
-    return cursorError("cursor resource kind does not match repositories");
-  }
+function decodeRepositoryPayload(
+  cursor: string,
+  context: NormalizedRepositoryContext,
+  key: Buffer,
+): ValidatedRepositoryCursorPayload {
+  const payload = decodedEnvelope(cursor, key);
   exactKeys(
-    value,
+    payload,
     [
       "v",
       "kind",
@@ -272,251 +623,165 @@ function parseRepositoryPayload(cursor: string): RepositoryCursorPayload {
       "nulls",
       "repositoryId",
     ],
-    "repository cursor",
+    "repository cursor payload",
   );
-  if (value.v !== 1) {
+  if (payload.v !== 1) {
     return cursorError("repository cursor version is unsupported");
   }
-  let snapshotId: SnapshotId;
-  let repositoryId: RepositoryId;
-  try {
-    if (typeof value.snapshotId !== "string") {
-      return cursorError("repository cursor snapshot is invalid");
-    }
-    if (typeof value.repositoryId !== "string") {
-      return cursorError("repository cursor repository ID is invalid");
-    }
-    snapshotId = asSnapshotId(value.snapshotId);
-    repositoryId = asRepositoryId(value.repositoryId);
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    return cursorError(
-      "repository cursor contains an invalid stable ID",
-      error,
-    );
+  if (payload.kind !== "repositories") {
+    return cursorError("cursor resource kind does not match repositories");
   }
+  const snapshotId = stableSnapshotId(
+    payload.snapshotId,
+    "repository cursor snapshot",
+  );
   const filterHash = validHash(
-    value.filterHash,
+    payload.filterHash,
     "repository cursor filter hash",
   );
-  const sortHash = validHash(value.sortHash, "repository cursor sort hash");
-  const values = cursorValues(value.values, "repository cursor values");
-  const nulls = booleanMarkers(value.nulls);
-  if (
-    values.length !== nulls.length ||
-    values.some((entry, index) => (entry === null) !== nulls[index])
-  ) {
-    return cursorError(
-      "repository cursor null markers do not match its values",
-    );
+  const sortHash = validHash(payload.sortHash, "repository cursor sort hash");
+  const values = cursorValues(payload.values, "repository cursor values");
+  const nulls = booleanMarkers(payload.nulls);
+  const repositoryId = stableRepositoryId(payload.repositoryId);
+
+  if (snapshotId !== context.snapshotId) {
+    return cursorError("repository cursor snapshot does not match");
   }
-  const payload: RepositoryCursorPayload = {
+  if (filterHash !== context.filterHash) {
+    return cursorError("repository cursor filter does not match");
+  }
+  if (sortHash !== context.sortHash) {
+    return cursorError("repository cursor sort does not match");
+  }
+  validateRepositoryValues(context.sort, values, nulls);
+
+  const result = Object.freeze({
     v: 1,
     kind: "repositories",
     snapshotId,
     filterHash,
     sortHash,
-    values,
-    nulls,
+    values: Object.freeze([...values]),
+    nulls: Object.freeze([...nulls]),
     repositoryId,
-  };
-  if (canonicalJson(payload) !== decoded.text) {
-    return cursorError("repository cursor JSON is not canonical");
-  }
-  return payload;
+  }) as ValidatedRepositoryCursorPayload;
+  validatedRepositoryPayloads.add(result);
+  return result;
 }
 
-function parseListPayload(cursor: string): ListCursorPayload {
-  const decoded = parseCursorJson(cursor);
-  const value = record(decoded.parsed, "list cursor");
-  if (value.kind !== "lists") {
-    return cursorError("cursor resource kind does not match lists");
-  }
+function decodeListPayload(
+  cursor: string,
+  context: NormalizedListContext,
+  key: Buffer,
+): ListCursorPayload {
+  const payload = decodedEnvelope(cursor, key);
   exactKeys(
-    value,
+    payload,
     ["v", "kind", "snapshotId", "selectionHash", "values", "listId"],
-    "list cursor",
+    "list cursor payload",
   );
-  if (value.v !== 1) {
+  if (payload.v !== 1) {
     return cursorError("list cursor version is unsupported");
   }
-  let snapshotId: SnapshotId;
-  let listId: UserListId;
-  try {
-    if (typeof value.snapshotId !== "string") {
-      return cursorError("list cursor snapshot is invalid");
-    }
-    if (typeof value.listId !== "string") {
-      return cursorError("list cursor list ID is invalid");
-    }
-    snapshotId = asSnapshotId(value.snapshotId);
-    listId = asUserListId(value.listId);
-  } catch (error) {
-    if (error instanceof AppError) throw error;
-    return cursorError("list cursor contains an invalid stable ID", error);
+  if (payload.kind !== "lists") {
+    return cursorError("cursor resource kind does not match lists");
   }
+  const snapshotId = stableSnapshotId(
+    payload.snapshotId,
+    "list cursor snapshot",
+  );
   const selectionHash = validHash(
-    value.selectionHash,
+    payload.selectionHash,
     "list cursor selection hash",
   );
-  const values = cursorValues(value.values, "list cursor values");
-  const payload: ListCursorPayload = {
+  const values = cursorValues(payload.values, "list cursor values");
+  const listId = stableListId(payload.listId);
+  if (snapshotId !== context.snapshotId) {
+    return cursorError("list cursor snapshot does not match");
+  }
+  if (selectionHash !== context.selectionHash) {
+    return cursorError("list cursor selection does not match");
+  }
+  return Object.freeze({
     v: 1,
     kind: "lists",
     snapshotId,
     selectionHash,
-    values,
+    values: Object.freeze([...values]),
     listId,
-  };
-  if (canonicalJson(payload) !== decoded.text) {
-    return cursorError("list cursor JSON is not canonical");
-  }
-  return payload;
+  });
 }
 
-function encodePayload(payload: unknown): string {
-  const text = canonicalJson(payload);
-  const cursor = Buffer.from(text, "utf8").toString("base64url");
+export function assertValidatedRepositoryCursorPayload(
+  value: unknown,
+): asserts value is ValidatedRepositoryCursorPayload {
   if (
-    Buffer.byteLength(text, "utf8") > MAX_CURSOR_BYTES ||
-    Buffer.byteLength(cursor, "utf8") > MAX_CURSOR_BYTES
+    typeof value !== "object" ||
+    value === null ||
+    !validatedRepositoryPayloads.has(value)
   ) {
-    return cursorError("cursor must not exceed 4 KiB");
-  }
-  return cursor;
-}
-
-export function encodeRepositoryCursor(input: RepositoryCursorInput): string {
-  const inputRecord = record(input, "repository cursor input");
-  const inputKeys = [
-    "kind",
-    "snapshotId",
-    "filterHash",
-    "sortHash",
-    "values",
-    "nulls",
-    "repositoryId",
-    ...(Object.hasOwn(inputRecord, "v") ? ["v"] : []),
-  ];
-  exactKeys(inputRecord, inputKeys, "repository cursor input");
-  if (inputRecord.kind !== "repositories") {
-    return cursorError("cursor resource kind does not match repositories");
-  }
-  if (Object.hasOwn(inputRecord, "v") && inputRecord.v !== 1) {
-    return cursorError("repository cursor version is unsupported");
-  }
-  const values = cursorValues(input.values, "repository cursor values");
-  const nulls = booleanMarkers(input.nulls);
-  if (
-    values.length !== nulls.length ||
-    values.some((entry, index) => (entry === null) !== nulls[index])
-  ) {
-    return cursorError(
-      "repository cursor null markers do not match its values",
+    cursorError(
+      "repository cursor payload must come from complete authenticated decoding",
     );
   }
-  let snapshotId: SnapshotId;
-  let repositoryId: RepositoryId;
-  try {
-    snapshotId = asSnapshotId(input.snapshotId);
-    repositoryId = asRepositoryId(input.repositoryId);
-  } catch (error) {
-    return cursorError(
-      "repository cursor contains an invalid stable ID",
-      error,
-    );
-  }
-  return encodePayload({
-    v: 1,
-    kind: "repositories",
-    snapshotId,
-    filterHash: validHash(input.filterHash, "repository cursor filter hash"),
-    sortHash: validHash(input.sortHash, "repository cursor sort hash"),
-    values,
-    nulls,
-    repositoryId,
-  } satisfies RepositoryCursorPayload);
 }
 
-export function decodeRepositoryCursor(
-  cursor: string,
-  expected: ExpectedRepositoryCursor,
-): RepositoryCursorPayload {
-  if (expected.kind !== "repositories") {
-    return cursorError("cursor resource kind does not match repositories");
-  }
-  const payload = parseRepositoryPayload(cursor);
-  if (payload.snapshotId !== expected.snapshotId) {
-    return cursorError("repository cursor snapshot does not match");
-  }
-  if (payload.filterHash !== expected.filterHash) {
-    return cursorError("repository cursor filter does not match");
-  }
-  if (payload.sortHash !== expected.sortHash) {
-    return cursorError("repository cursor sort does not match");
-  }
-  return payload;
-}
-
-export function decodeRepositoryCursorForSort(
-  cursor: string,
-  expectedSortHash: string,
-): RepositoryCursorPayload {
-  const payload = parseRepositoryPayload(cursor);
-  if (payload.sortHash !== expectedSortHash) {
-    return cursorError("repository cursor sort does not match");
-  }
-  return payload;
-}
-
-export function encodeListCursor(input: ListCursorInput): string {
-  const inputRecord = record(input, "list cursor input");
-  const inputKeys = [
-    "kind",
-    "snapshotId",
-    "selectionHash",
-    "values",
-    "listId",
-    ...(Object.hasOwn(inputRecord, "v") ? ["v"] : []),
-  ];
-  exactKeys(inputRecord, inputKeys, "list cursor input");
-  if (inputRecord.kind !== "lists") {
-    return cursorError("cursor resource kind does not match lists");
-  }
-  if (Object.hasOwn(inputRecord, "v") && inputRecord.v !== 1) {
-    return cursorError("list cursor version is unsupported");
-  }
-  let snapshotId: SnapshotId;
-  let listId: UserListId;
-  try {
-    snapshotId = asSnapshotId(input.snapshotId);
-    listId = asUserListId(input.listId);
-  } catch (error) {
-    return cursorError("list cursor contains an invalid stable ID", error);
-  }
-  return encodePayload({
-    v: 1,
-    kind: "lists",
-    snapshotId,
-    selectionHash: validHash(input.selectionHash, "list cursor selection hash"),
-    values: cursorValues(input.values, "list cursor values"),
-    listId,
-  } satisfies ListCursorPayload);
-}
-
-export function decodeListCursor(
-  cursor: string,
-  expected: ExpectedListCursor,
-): ListCursorPayload {
-  if (expected.kind !== "lists") {
-    return cursorError("cursor resource kind does not match lists");
-  }
-  const payload = parseListPayload(cursor);
-  if (payload.snapshotId !== expected.snapshotId) {
-    return cursorError("list cursor snapshot does not match");
-  }
-  if (payload.selectionHash !== expected.selectionHash) {
-    return cursorError("list cursor selection does not match");
-  }
-  return payload;
+export function createCursorCodec(signingKey: Uint8Array): CursorCodec {
+  const key = signingKeyCopy(signingKey);
+  return Object.freeze({
+    encodeRepository(
+      contextInput: RepositoryCursorContext,
+      positionInput: RepositoryCursorPositionInput,
+    ): string {
+      const context = normalizeRepositoryContext(contextInput);
+      const position = repositoryPosition(positionInput, context.sort);
+      return encodedEnvelope(
+        {
+          v: 1,
+          kind: "repositories",
+          snapshotId: context.snapshotId,
+          filterHash: context.filterHash,
+          sortHash: context.sortHash,
+          values: position.values,
+          nulls: position.nulls,
+          repositoryId: position.repositoryId,
+        } satisfies RepositoryCursorPayload,
+        key,
+      );
+    },
+    decodeRepository(
+      cursor: string,
+      contextInput: RepositoryCursorContext,
+    ): ValidatedRepositoryCursorPayload {
+      return decodeRepositoryPayload(
+        cursor,
+        normalizeRepositoryContext(contextInput),
+        key,
+      );
+    },
+    encodeList(
+      contextInput: ListCursorContext,
+      positionInput: ListCursorPositionInput,
+    ): string {
+      const context = normalizeListContext(contextInput);
+      const position = listPosition(positionInput);
+      return encodedEnvelope(
+        {
+          v: 1,
+          kind: "lists",
+          snapshotId: context.snapshotId,
+          selectionHash: context.selectionHash,
+          values: position.values,
+          listId: position.listId,
+        } satisfies ListCursorPayload,
+        key,
+      );
+    },
+    decodeList(
+      cursor: string,
+      contextInput: ListCursorContext,
+    ): ListCursorPayload {
+      return decodeListPayload(cursor, normalizeListContext(contextInput), key);
+    },
+  });
 }

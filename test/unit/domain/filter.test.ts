@@ -1,16 +1,14 @@
 import { Buffer } from "node:buffer";
+import { createHmac } from "node:crypto";
 import Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import {
-  decodeListCursor,
-  decodeRepositoryCursor,
-  encodeListCursor,
-  encodeRepositoryCursor,
+  createCursorCodec,
   hashFilter,
   hashListSelection,
   hashRepositorySort,
 } from "../../../src/domain/cursor.js";
-import { AppError } from "../../../src/domain/errors.js";
+import { AppError, serializeError } from "../../../src/domain/errors.js";
 import {
   asRepositoryId,
   asSnapshotId,
@@ -25,6 +23,7 @@ import {
   type RepositorySort,
 } from "../../../src/domain/filter.js";
 import type { RepositoryView } from "../../../src/domain/repository.js";
+import { canonicalUtcTimestamp } from "../../../src/domain/timestamp.js";
 import {
   compileCursor,
   compileFilter,
@@ -34,6 +33,7 @@ import { repositoryViewFixture } from "../../fixtures/domain.js";
 
 const SNAPSHOT_ID = asSnapshotId("snap_1");
 const DEFAULT_SORT = [{ field: "stargazer_count", direction: "desc" }] as const;
+const CURSOR_CODEC = createCursorCodec(new Uint8Array(32).fill(3));
 
 function expectValidationError(action: () => unknown, message?: RegExp): void {
   try {
@@ -513,13 +513,13 @@ describe("closed repository filter language", () => {
         { now: () => "2026-07-16T00:00:00.000Z" },
       ),
     ).toMatchObject({ value: "2026-07-02T00:00:00.000Z" });
-    expect(
+    expectValidationError(() =>
       parseFilter({
         field: "pushed_at",
         op: "eq",
         value: "2026-07-16T00:00:00.123456Z",
       }),
-    ).toMatchObject({ value: "2026-07-16T00:00:00.123Z" });
+    );
   });
 
   test.each([
@@ -600,7 +600,7 @@ describe("stable repository sorts and keyset cursors", () => {
           repositoryId: asRepositoryId("R_2"),
           fullName: "same/name",
           stargazerCount: 10,
-          pushedAt: "2026-07-16T00:00:00Z",
+          pushedAt: "2026-07-16T00:00:00.000Z",
         },
         "2",
       ),
@@ -627,7 +627,7 @@ describe("stable repository sorts and keyset cursors", () => {
           repositoryId: asRepositoryId("R_4"),
           fullName: "last/name",
           stargazerCount: 9,
-          pushedAt: "2026-07-17T00:00:00Z",
+          pushedAt: "2026-07-17T00:00:00.000Z",
         },
         "4",
       ),
@@ -669,7 +669,7 @@ describe("stable repository sorts and keyset cursors", () => {
           repositoryId: asRepositoryId("R_A"),
           fullName: "same/name",
           stargazerCount: 10,
-          pushedAt: "2026-07-16T00:00:00Z",
+          pushedAt: "2026-07-16T00:00:00.000Z",
         },
         "A",
       ),
@@ -678,7 +678,7 @@ describe("stable repository sorts and keyset cursors", () => {
           repositoryId: asRepositoryId("R_B"),
           fullName: "same/name",
           stargazerCount: 10,
-          pushedAt: "2026-07-16T00:00:00Z",
+          pushedAt: "2026-07-16T00:00:00.000Z",
         },
         "B",
       ),
@@ -705,25 +705,27 @@ describe("stable repository sorts and keyset cursors", () => {
           repositoryId: asRepositoryId("R_E"),
           fullName: "lower/name",
           stargazerCount: 9,
-          pushedAt: "2026-07-17T00:00:00Z",
+          pushedAt: "2026-07-17T00:00:00.000Z",
         },
         "E",
       ),
     ].sort((left, right) => compareRepositories(left, right, sort));
     const filterHash = hashFilter(null);
-    const sortHash = hashRepositorySort(sort);
+    const cursorContext = {
+      kind: "repositories",
+      snapshotId: SNAPSHOT_ID,
+      filterHash,
+      sort,
+    } as const;
     const database = createDatabase(views);
     try {
       for (const boundary of [1, 2, 3, 4]) {
         const position = repositoryCursorPosition(views[boundary]!, sort);
-        const cursor = encodeRepositoryCursor({
-          kind: "repositories",
-          snapshotId: SNAPSHOT_ID,
-          filterHash,
-          sortHash,
-          ...position,
-        });
-        const compiled = compileCursor(sort, cursor);
+        const cursor = CURSOR_CODEC.encodeRepository(cursorContext, position);
+        const compiled = compileCursor(
+          sort,
+          CURSOR_CODEC.decodeRepository(cursor, cursorContext),
+        );
         const actual = (
           database
             .prepare(
@@ -740,14 +742,14 @@ describe("stable repository sorts and keyset cursors", () => {
         );
       }
       const finalPosition = repositoryCursorPosition(views.at(-1)!, sort);
-      const finalCursor = encodeRepositoryCursor({
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-        ...finalPosition,
-      });
-      const finalCompiled = compileCursor(sort, finalCursor);
+      const finalCursor = CURSOR_CODEC.encodeRepository(
+        cursorContext,
+        finalPosition,
+      );
+      const finalCompiled = compileCursor(
+        sort,
+        CURSOR_CODEC.decodeRepository(finalCursor, cursorContext),
+      );
       expect(
         database
           .prepare(
@@ -765,19 +767,29 @@ describe("stable repository sorts and keyset cursors", () => {
   });
 });
 
-describe("versioned bound cursors", () => {
+describe("authenticated versioned cursors", () => {
   const filterHash = "f".repeat(64);
-  const sortHash = "s".repeat(64);
-  const selectionHash = "l".repeat(64);
+  const selectionHash = "b".repeat(64);
+  const sort = [
+    { field: "stargazer_count", direction: "desc" },
+    { field: "pushed_at", direction: "asc" },
+  ] as const;
+  const repositoryContext = {
+    kind: "repositories",
+    snapshotId: SNAPSHOT_ID,
+    filterHash,
+    sort,
+  } as const;
+  const listContext = {
+    kind: "lists",
+    snapshotId: SNAPSHOT_ID,
+    selectionHash,
+  } as const;
 
   function repositoryCursor(): string {
-    return encodeRepositoryCursor({
-      kind: "repositories",
-      snapshotId: SNAPSHOT_ID,
-      filterHash,
-      sortHash,
-      values: [12, null],
-      nulls: [false, true],
+    return CURSOR_CODEC.encodeRepository(repositoryContext, {
+      values: [12, null, "openai/sdk"],
+      nulls: [false, true, false],
       repositoryId: asRepositoryId("R_9"),
     });
   }
@@ -785,34 +797,20 @@ describe("versioned bound cursors", () => {
   test("round-trips canonical repository and list cursors", () => {
     const cursor = repositoryCursor();
     expect(
-      decodeRepositoryCursor(cursor, {
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-      }),
+      CURSOR_CODEC.decodeRepository(cursor, repositoryContext),
     ).toMatchObject({
       v: 1,
       kind: "repositories",
-      values: [12, null],
-      nulls: [false, true],
+      values: [12, null, "openai/sdk"],
+      nulls: [false, true, false],
       repositoryId: "R_9",
     });
 
-    const listCursor = encodeListCursor({
-      kind: "lists",
-      snapshotId: SNAPSHOT_ID,
-      selectionHash,
+    const listCursor = CURSOR_CODEC.encodeList(listContext, {
       values: ["agents", "2026-07-16T00:00:00.000Z"],
       listId: asUserListId("UL_1"),
     });
-    expect(
-      decodeListCursor(listCursor, {
-        kind: "lists",
-        snapshotId: SNAPSHOT_ID,
-        selectionHash,
-      }),
-    ).toMatchObject({
+    expect(CURSOR_CODEC.decodeList(listCursor, listContext)).toMatchObject({
       v: 1,
       kind: "lists",
       values: ["agents", "2026-07-16T00:00:00.000Z"],
@@ -823,38 +821,20 @@ describe("versioned bound cursors", () => {
   });
 
   test.each([
-    [
-      "snapshot",
-      {
-        kind: "repositories",
-        snapshotId: asSnapshotId("snap_2"),
-        filterHash,
-        sortHash,
-      },
-    ],
-    [
-      "filter",
-      {
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash: "x".repeat(64),
-        sortHash,
-      },
-    ],
+    ["snapshot", { ...repositoryContext, snapshotId: asSnapshotId("snap_2") }],
+    ["filter", { ...repositoryContext, filterHash: "a".repeat(64) }],
     [
       "sort",
       {
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash: "x".repeat(64),
+        ...repositoryContext,
+        sort: [{ field: "full_name", direction: "desc" }] as const,
       },
     ],
   ] as const)(
     "rejects repository cursor reuse across %s",
     (boundary, expected) => {
       expectValidationError(
-        () => decodeRepositoryCursor(repositoryCursor(), expected),
+        () => CURSOR_CODEC.decodeRepository(repositoryCursor(), expected),
         new RegExp(`cursor.*${boundary}`, "iu"),
       );
     },
@@ -864,59 +844,31 @@ describe("versioned bound cursors", () => {
     const cursor = repositoryCursor();
     const changed = `${cursor.slice(0, -1)}${cursor.endsWith("A") ? "B" : "A"}`;
     expectValidationError(() =>
-      decodeRepositoryCursor(changed, {
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-      }),
+      CURSOR_CODEC.decodeRepository(changed, repositoryContext),
     );
 
-    const listCursor = encodeListCursor({
-      kind: "lists",
-      snapshotId: SNAPSHOT_ID,
-      selectionHash,
+    const listCursor = CURSOR_CODEC.encodeList(listContext, {
       values: ["agents"],
       listId: asUserListId("UL_1"),
     });
     expectValidationError(() =>
-      decodeRepositoryCursor(listCursor, {
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-      }),
+      CURSOR_CODEC.decodeRepository(listCursor, repositoryContext),
     );
 
     const noncanonical = Buffer.from(
       JSON.stringify({
-        kind: "repositories",
-        v: 1,
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-        values: [12, null],
-        nulls: [false, true],
-        repositoryId: "R_9",
+        payload: { kind: "repositories", v: 1 },
+        mac: "0".repeat(64),
       }),
     ).toString("base64url");
     expectValidationError(() =>
-      decodeRepositoryCursor(noncanonical, {
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-      }),
+      CURSOR_CODEC.decodeRepository(noncanonical, repositoryContext),
     );
 
     expectValidationError(() =>
-      encodeRepositoryCursor({
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-        values: ["x".repeat(5_000)],
-        nulls: [false],
+      CURSOR_CODEC.encodeRepository(repositoryContext, {
+        values: [12, null, "x".repeat(5_000)],
+        nulls: [false, true, false],
         repositoryId: asRepositoryId("R_9"),
       }),
     );
@@ -924,62 +876,42 @@ describe("versioned bound cursors", () => {
 
   test("rejects malformed marker/value pairs and wrong list selections", () => {
     expectValidationError(() =>
-      encodeRepositoryCursor({
-        kind: "repositories",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-        values: [null],
-        nulls: [false],
+      CURSOR_CODEC.encodeRepository(repositoryContext, {
+        values: [12, null, "openai/sdk"],
+        nulls: [false, false, false],
         repositoryId: asRepositoryId("R_9"),
       }),
     );
-    const listCursor = encodeListCursor({
-      kind: "lists",
-      snapshotId: SNAPSHOT_ID,
-      selectionHash,
+    const listCursor = CURSOR_CODEC.encodeList(listContext, {
       values: ["agents"],
       listId: asUserListId("UL_1"),
     });
     expectValidationError(
       () =>
-        decodeListCursor(listCursor, {
-          kind: "lists",
-          snapshotId: SNAPSHOT_ID,
-          selectionHash: "x".repeat(64),
+        CURSOR_CODEC.decodeList(listCursor, {
+          ...listContext,
+          selectionHash: "a".repeat(64),
         }),
       /cursor.*selection/iu,
     );
   });
 
-  test("rejects non-v1, cross-resource, and extended encode inputs", () => {
-    const validInput = {
-      kind: "repositories",
-      snapshotId: SNAPSHOT_ID,
-      filterHash,
-      sortHash,
-      values: [12],
-      nulls: [false],
-      repositoryId: asRepositoryId("R_9"),
-    } as const;
-    for (const input of [
-      { ...validInput, v: 2 },
-      { ...validInput, kind: "lists" },
-      { ...validInput, rawSql: "1=1" },
-    ]) {
-      expectValidationError(() =>
-        encodeRepositoryCursor(
-          input as unknown as Parameters<typeof encodeRepositoryCursor>[0],
-        ),
-      );
-    }
+  test("rejects cross-resource and extended encode inputs", () => {
     expectValidationError(() =>
-      decodeRepositoryCursor(repositoryCursor(), {
+      CURSOR_CODEC.encodeRepository(
+        { ...repositoryContext, rawSql: "1=1" } as typeof repositoryContext,
+        {
+          values: [12, null, "openai/sdk"],
+          nulls: [false, true, false],
+          repositoryId: asRepositoryId("R_9"),
+        },
+      ),
+    );
+    expectValidationError(() =>
+      CURSOR_CODEC.decodeRepository(repositoryCursor(), {
+        ...repositoryContext,
         kind: "lists",
-        snapshotId: SNAPSHOT_ID,
-        filterHash,
-        sortHash,
-      } as unknown as Parameters<typeof decodeRepositoryCursor>[1]),
+      } as unknown as typeof repositoryContext),
     );
   });
 
@@ -1009,20 +941,354 @@ describe("versioned bound cursors", () => {
       hashListSelection({ a: 1, b: 2 }),
     );
   });
+});
 
-  test("rejects a cursor compiled against a different normalized sort", () => {
-    const sort = [{ field: "full_name", direction: "asc" }] as const;
-    const position = repositoryCursorPosition(repositoryViewFixture, sort);
-    const cursor = encodeRepositoryCursor({
-      kind: "repositories",
-      snapshotId: SNAPSHOT_ID,
-      filterHash: hashFilter(null),
-      sortHash: hashRepositorySort(sort),
-      ...position,
-    });
+describe("review hardening regressions", () => {
+  const signingKey = new Uint8Array(32).fill(7);
+  const codec = createCursorCodec(signingKey);
+  const repositoryContext = {
+    kind: "repositories",
+    snapshotId: SNAPSHOT_ID,
+    filterHash: "f".repeat(64),
+    sort: [
+      { field: "stargazer_count", direction: "desc" },
+      { field: "pushed_at", direction: "asc" },
+    ],
+  } as const;
+  const repositoryPosition = {
+    values: [12, null, "openai/sdk"],
+    nulls: [false, true, false],
+    repositoryId: asRepositoryId("R_9"),
+  } as const;
+
+  function resignRepositoryCursor(
+    cursor: string,
+    mutate: (payload: {
+      values: (string | number | null)[];
+      nulls: boolean[];
+    }) => void,
+  ): string {
+    const envelope = JSON.parse(
+      Buffer.from(cursor, "base64url").toString("utf8"),
+    ) as {
+      mac: string;
+      payload: {
+        values: (string | number | null)[];
+        nulls: boolean[];
+      };
+    };
+    mutate(envelope.payload);
+    envelope.mac = createHmac("sha256", signingKey)
+      .update(JSON.stringify(envelope.payload))
+      .digest("hex");
+    return Buffer.from(JSON.stringify(envelope), "utf8").toString("base64url");
+  }
+
+  test("authenticates canonical cursors and rejects re-encoded payload mutations", () => {
+    const cursor = codec.encodeRepository(
+      repositoryContext,
+      repositoryPosition,
+    );
+    const decoded = codec.decodeRepository(cursor, repositoryContext);
+    expect(decoded).toMatchObject(repositoryPosition);
+    expect(Object.isFrozen(decoded)).toBe(true);
+    expect(Object.isFrozen(decoded.values)).toBe(true);
+
+    const envelope = JSON.parse(
+      Buffer.from(cursor, "base64url").toString("utf8"),
+    ) as {
+      mac: string;
+      payload: { repositoryId: string };
+    };
+    envelope.payload.repositoryId = "R_ATTACKER";
+    const changed = Buffer.from(JSON.stringify(envelope), "utf8").toString(
+      "base64url",
+    );
     expectValidationError(
-      () => compileCursor([{ field: "full_name", direction: "desc" }], cursor),
+      () => codec.decodeRepository(changed, repositoryContext),
+      /cursor.*authentic/iu,
+    );
+  });
+
+  test("requires complete decode context and a runtime-branded compiler payload", () => {
+    const cursor = codec.encodeRepository(
+      repositoryContext,
+      repositoryPosition,
+    );
+    for (const context of [
+      { ...repositoryContext, snapshotId: asSnapshotId("snap_2") },
+      { ...repositoryContext, filterHash: "a".repeat(64) },
+      {
+        ...repositoryContext,
+        sort: [{ field: "full_name", direction: "desc" }] as const,
+      },
+    ]) {
+      expectValidationError(() => codec.decodeRepository(cursor, context));
+    }
+
+    const decoded = codec.decodeRepository(cursor, repositoryContext);
+    expect(() => compileCursor(repositoryContext.sort, decoded)).not.toThrow();
+    expectValidationError(() =>
+      compileCursor(repositoryContext.sort, { ...decoded }),
+    );
+    expectValidationError(
+      () => compileCursor([{ field: "full_name", direction: "desc" }], decoded),
       /cursor.*sort/iu,
     );
+  });
+
+  test("never invokes accessors while normalizing sorts or encoding cursors", () => {
+    let directionGetterCalls = 0;
+    const sortTerm = Object.defineProperties(
+      {},
+      {
+        field: { enumerable: true, value: "full_name" },
+        direction: {
+          enumerable: true,
+          get() {
+            directionGetterCalls += 1;
+            return directionGetterCalls === 1
+              ? "asc"
+              : "ASC; DROP TABLE repository_versions; --";
+          },
+        },
+      },
+    );
+    expectValidationError(() =>
+      compileOrder([sortTerm] as unknown as readonly RepositorySort[]),
+    );
+    expect(directionGetterCalls).toBe(0);
+
+    let valueGetterCalls = 0;
+    const values = [12, null, "openai/sdk"];
+    Object.defineProperty(values, 0, {
+      enumerable: true,
+      get() {
+        valueGetterCalls += 1;
+        return 12;
+      },
+    });
+    expectValidationError(() =>
+      codec.encodeRepository(repositoryContext, {
+        ...repositoryPosition,
+        values,
+      }),
+    );
+    expect(valueGetterCalls).toBe(0);
+
+    let contextGetterCalls = 0;
+    const accessorContext = Object.defineProperties(
+      {},
+      {
+        kind: { enumerable: true, value: "repositories" },
+        snapshotId: { enumerable: true, value: SNAPSHOT_ID },
+        filterHash: {
+          enumerable: true,
+          get() {
+            contextGetterCalls += 1;
+            return "f".repeat(64);
+          },
+        },
+        sort: { enumerable: true, value: repositoryContext.sort },
+      },
+    );
+    expectValidationError(() =>
+      codec.encodeRepository(
+        accessorContext as typeof repositoryContext,
+        repositoryPosition,
+      ),
+    );
+    expect(contextGetterCalls).toBe(0);
+  });
+
+  test("rejects short and hostile signing keys without disclosing key material", () => {
+    const shortKey = new Uint8Array(31).fill(0xab);
+    let failure: unknown;
+    try {
+      createCursorCodec(shortKey);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(AppError);
+    const serialized = JSON.stringify(serializeError(failure));
+    expect(serialized).toContain("VALIDATION_ERROR");
+    expect(serialized).not.toContain(Buffer.from(shortKey).toString("hex"));
+    expect(serialized).not.toContain([...shortKey].join(","));
+
+    const hostile = Proxy.revocable(new Uint8Array(32).fill(0xcd), {});
+    hostile.revoke();
+    expectValidationError(() => createCursorCodec(hostile.proxy));
+
+    const mutableKey = new Uint8Array(32).fill(0x19);
+    const copiedKeyCodec = createCursorCodec(mutableKey);
+    mutableKey.fill(0x20);
+    const listContext = {
+      kind: "lists",
+      snapshotId: SNAPSHOT_ID,
+      selectionHash: "b".repeat(64),
+    } as const;
+    const cursor = copiedKeyCodec.encodeList(listContext, {
+      values: ["agents"],
+      listId: asUserListId("UL_KEY"),
+    });
+    expect(() =>
+      createCursorCodec(new Uint8Array(32).fill(0x19)).decodeList(
+        cursor,
+        listContext,
+      ),
+    ).not.toThrow();
+  });
+
+  test("rejects proxies, custom prototypes, cycles, and invalid canonical values", () => {
+    const { proxy, revoke } = Proxy.revocable(
+      [{ field: "full_name", direction: "asc" }],
+      {},
+    );
+    revoke();
+    expectValidationError(() =>
+      normalizeSort(proxy as readonly RepositorySort[]),
+    );
+    expectValidationError(() =>
+      normalizeSort([
+        Object.create(
+          { inherited: true },
+          {
+            field: { enumerable: true, value: "full_name" },
+            direction: { enumerable: true, value: "asc" },
+          },
+        ),
+      ] as readonly RepositorySort[]),
+    );
+
+    const cyclic: { self?: unknown } = {};
+    cyclic.self = cyclic;
+    expectValidationError(() => hashListSelection(cyclic as never));
+    expectValidationError(() =>
+      hashListSelection({ invalid: undefined } as never),
+    );
+    expectValidationError(() => hashListSelection({ invalid: Number.NaN }));
+
+    let deeplyNested: unknown = {};
+    for (let index = 0; index < 1_000; index += 1) {
+      deeplyNested = { child: deeplyNested };
+    }
+    expectValidationError(() => hashListSelection(deeplyNested as never));
+  });
+
+  test("uses strict millisecond UTC timestamps and bounded relative arithmetic", () => {
+    expect(canonicalUtcTimestamp("2026-07-16T00:00:00Z")).toBe(
+      "2026-07-16T00:00:00.000Z",
+    );
+    expect(canonicalUtcTimestamp("2026-07-16T00:00:00.1Z")).toBe(
+      "2026-07-16T00:00:00.100Z",
+    );
+    for (const timestamp of [
+      "2026-07-16T00:00:00.1234Z",
+      "2026-07-16T00:00:00.1235Z",
+      "2026-07-16T00:00:00.9999Z",
+      "2026-02-29T00:00:00Z",
+      "2026-07-16T08:00:00+08:00",
+      "-000001-01-01T00:00:00.000Z",
+      "+010000-01-01T00:00:00.000Z",
+    ]) {
+      expectValidationError(() => canonicalUtcTimestamp(timestamp));
+    }
+    expectValidationError(() =>
+      parseFilter(
+        {
+          field: "pushed_at",
+          op: "before",
+          value: { ago: { amount: 1, unit: "years" } },
+        },
+        { now: "0000-01-01T00:00:00.000Z" },
+      ),
+    );
+  });
+
+  test("requires canonical temporal positions and nonnegative safe stargazers", () => {
+    for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      expectValidationError(() =>
+        codec.encodeRepository(repositoryContext, {
+          ...repositoryPosition,
+          values: [invalid, null, "openai/sdk"],
+        }),
+      );
+    }
+    for (const invalid of [
+      "Thu, 01 Jan 1970 00:00:00 GMT",
+      "0",
+      "2026-07-16T00:00:00Z",
+      "2026-07-16T00:00:00.1234Z",
+    ]) {
+      expectValidationError(() =>
+        codec.encodeRepository(repositoryContext, {
+          ...repositoryPosition,
+          values: [12, invalid, "openai/sdk"],
+          nulls: [false, false, false],
+        }),
+      );
+    }
+
+    const validCursor = codec.encodeRepository(
+      repositoryContext,
+      repositoryPosition,
+    );
+    for (const invalid of [
+      "Thu, 01 Jan 1970 00:00:00 GMT",
+      "0",
+      "2026-07-16T00:00:00Z",
+      "2026-07-16T00:00:00.1234Z",
+    ]) {
+      const signedMalformed = resignRepositoryCursor(validCursor, (payload) => {
+        payload.values[1] = invalid;
+        payload.nulls[1] = false;
+      });
+      expectValidationError(() =>
+        codec.decodeRepository(signedMalformed, repositoryContext),
+      );
+    }
+    for (const invalid of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+      const signedMalformed = resignRepositoryCursor(validCursor, (payload) => {
+        payload.values[0] = invalid;
+      });
+      expectValidationError(() =>
+        codec.decodeRepository(signedMalformed, repositoryContext),
+      );
+    }
+  });
+
+  test("matches SQLite BINARY UTF-8 ordering for non-BMP text", () => {
+    const supplementary = withView(
+      { repositoryId: asRepositoryId("R_UTF8_A"), fullName: "\u{10000}" },
+      "UTF8_A",
+    );
+    const privateUse = withView(
+      { repositoryId: asRepositoryId("R_UTF8_B"), fullName: "\uE000" },
+      "UTF8_B",
+    );
+    const sort = [{ field: "full_name", direction: "asc" }] as const;
+    expect(
+      compareRepositories(supplementary, privateUse, sort),
+    ).toBeGreaterThan(0);
+
+    const database = createDatabase([supplementary, privateUse]);
+    try {
+      const sqlOrder = (
+        database
+          .prepare(
+            `SELECT ss.repository_id AS repositoryId
+             FROM repository_versions rv
+             JOIN snapshot_stars ss ON ss.repository_id = rv.repository_id
+             ORDER BY ${compileOrder(sort)}`,
+          )
+          .all() as { repositoryId: string }[]
+      ).map((row) => row.repositoryId);
+      const memoryOrder = [supplementary, privateUse]
+        .sort((left, right) => compareRepositories(left, right, sort))
+        .map((view) => view.repositoryId);
+      expect(memoryOrder).toEqual(sqlOrder);
+    } finally {
+      database.close();
+    }
   });
 });

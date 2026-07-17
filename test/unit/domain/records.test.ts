@@ -86,6 +86,13 @@ test("validates stable identities and normalizes topics", () => {
   expect(trimmedRepository.owner).toBe("OpenAI");
   expect(trimmedRepository.name).toBe("SDK");
   expect(trimmedRepository.fullName).toBe("OpenAI/SDK");
+  const normalizedTimestamps = repositorySchema.parse({
+    ...repositoryInputFixture,
+    pushedAt: "2026-07-16T00:00:00.1Z",
+    updatedAt: "2026-07-16T01:00:00Z",
+  });
+  expect(normalizedTimestamps.pushedAt).toBe("2026-07-16T00:00:00.100Z");
+  expect(normalizedTimestamps.updatedAt).toBe("2026-07-16T01:00:00.000Z");
 
   expect(() =>
     repositorySchema.parse({
@@ -123,6 +130,12 @@ test("validates stable identities and normalizes topics", () => {
       updatedAt: "2026-07-16T09:00:00+08:00",
     }).success,
   ).toBe(false);
+  expect(
+    repositorySchema.safeParse({
+      ...repositoryInputFixture,
+      updatedAt: "2026-07-16T01:00:00.1234Z",
+    }).success,
+  ).toBe(false);
 
   const binding: AccountBinding = {
     host: "github.com",
@@ -131,7 +144,7 @@ test("validates stable identities and normalizes topics", () => {
   };
   const star: StarRecord = {
     repositoryId: repository.repositoryId,
-    starredAt: "2026-07-16T00:00:00Z",
+    starredAt: "2026-07-16T00:00:00.000Z",
   };
   const list: UserList = {
     listId: asUserListId("UL_1"),
@@ -139,8 +152,8 @@ test("validates stable identities and normalizes topics", () => {
     slug: "agents",
     description: null,
     isPrivate: false,
-    createdAt: "2026-07-16T00:00:00Z",
-    updatedAt: "2026-07-16T01:00:00Z",
+    createdAt: "2026-07-16T00:00:00.000Z",
+    updatedAt: "2026-07-16T01:00:00.000Z",
     lastAddedAt: null,
   };
   const membership: ListMembership = {
@@ -154,13 +167,13 @@ test("validates stable identities and normalizes topics", () => {
   };
   const observed: ObservedRepositoryMetadata = {
     repository,
-    observedAt: "2026-07-16T02:00:00Z",
+    observedAt: "2026-07-16T02:00:00.000Z",
   };
   const draft: SnapshotDraft = {
     id: asSnapshotId("snap_external"),
     binding,
     mode: "full",
-    startedAt: "2026-07-16T00:00:00Z",
+    startedAt: "2026-07-16T00:00:00.000Z",
   };
   const counts: SnapshotCounts = {
     repositories: 1,
@@ -172,7 +185,7 @@ test("validates stable identities and normalizes topics", () => {
   const snapshot: Snapshot = {
     ...draft,
     status: "complete",
-    completedAt: "2026-07-16T02:00:00Z",
+    completedAt: "2026-07-16T02:00:00.000Z",
     failedAt: null,
     counts,
     warningCount: 0,
