@@ -244,7 +244,7 @@ const CURSOR_INTRINSICS = freezeCursorIntrinsics({
   reflectDefineProperty: Reflect.defineProperty,
   reflectGetPrototypeOf: Reflect.getPrototypeOf,
   reflectOwnKeys: Reflect.ownKeys,
-  regexpTest: RegExp.prototype.test,
+  regexpExec: RegExp.prototype.exec,
   stringFromValue: String,
   timingSafeEqual,
   typedArrayByteLength,
@@ -264,9 +264,11 @@ const validatedListMembershipPayloads =
   new CURSOR_INTRINSICS.weakSetConstructor<object>();
 
 function regexpMatches(pattern: RegExp, value: string): boolean {
-  return CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.regexpTest, pattern, [
-    value,
-  ]);
+  return (
+    CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.regexpExec, pattern, [
+      value,
+    ]) !== null
+  );
 }
 
 function weakSetAdd<T extends object>(target: WeakSet<T>, value: T): void {

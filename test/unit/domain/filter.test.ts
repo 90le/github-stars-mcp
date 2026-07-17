@@ -1498,6 +1498,7 @@ describe("review hardening regressions", () => {
     }
     const weakSetPrototypeForTest = WeakSet.prototype;
     const originals = {
+      regexpExec: RegExp.prototype.exec,
       regexpTest: RegExp.prototype.test,
       uint8ArrayConstructor: globalThis.Uint8Array,
       weakSetAdd: WeakSet.prototype.add,
@@ -1579,6 +1580,22 @@ describe("review hardening regressions", () => {
             hookCalls += 1;
           }
           return applyForTest(originals.regexpTest, this, [value]);
+        },
+      );
+      patch(
+        RegExp.prototype,
+        "exec",
+        function guardedRegExpExec(
+          this: RegExp,
+          value: string,
+        ): RegExpExecArray | null {
+          if (
+            this.source === "^[a-f0-9]{64}$" ||
+            this.source === "^[A-Za-z0-9_-]+$"
+          ) {
+            hookCalls += 1;
+          }
+          return applyForTest(originals.regexpExec, this, [value]);
         },
       );
 
