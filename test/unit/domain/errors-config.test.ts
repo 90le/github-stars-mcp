@@ -306,6 +306,174 @@ describe("domain errors and redaction", () => {
     expect(serialized.details).not.toHaveProperty("cause");
   });
 
+  test("uses descriptor-only traversal without invoking proxy, toJSON, coercion, iterator, getter, or inherited hooks", () => {
+    let getterCalls = 0;
+    let proxyTrapCalls = 0;
+    let toJsonCalls = 0;
+    let iteratorCalls = 0;
+    let coercionCalls = 0;
+    let inheritedAccessorCalls = 0;
+
+    const proxy = new Proxy(
+      { visible: "proxy value" },
+      {
+        getPrototypeOf: () => {
+          proxyTrapCalls += 1;
+          return Object.prototype;
+        },
+        ownKeys: () => {
+          proxyTrapCalls += 1;
+          return ["visible"];
+        },
+        getOwnPropertyDescriptor: (_target, property) => {
+          proxyTrapCalls += 1;
+          return property === "visible"
+            ? {
+                configurable: true,
+                enumerable: true,
+                value: "proxy value",
+                writable: true,
+              }
+            : undefined;
+        },
+      },
+    );
+    const hooks = {
+      toJSON: () => {
+        toJsonCalls += 1;
+        return "toJSON must not run";
+      },
+      [Symbol.iterator]: () => {
+        iteratorCalls += 1;
+        return [][Symbol.iterator]();
+      },
+      [Symbol.toPrimitive]: () => {
+        coercionCalls += 1;
+        return "coercion must not run";
+      },
+      toString: () => {
+        coercionCalls += 1;
+        return "toString must not run";
+      },
+      valueOf: () => {
+        coercionCalls += 1;
+        return 1;
+      },
+    };
+    const inheritedPrototype = Object.defineProperty(
+      {},
+      "inheritedCredential",
+      {
+        configurable: true,
+        enumerable: true,
+        get: () => {
+          inheritedAccessorCalls += 1;
+          return "inherited accessor must not run";
+        },
+      },
+    );
+    const inherited = Object.create(inheritedPrototype) as Record<
+      string,
+      unknown
+    >;
+    Object.defineProperty(inherited, "visible", {
+      configurable: true,
+      enumerable: true,
+      value: "own value",
+      writable: true,
+    });
+    const value = Object.defineProperties(
+      { proxy, hooks, inherited },
+      {
+        accessor: {
+          configurable: true,
+          enumerable: true,
+          get: () => {
+            getterCalls += 1;
+            return "getter must not run";
+          },
+        },
+      },
+    );
+
+    const redacted = redactSecrets(value);
+
+    expect(redacted).toMatchObject({
+      proxy: "[Unsupported object]",
+      hooks: {
+        toJSON: "[Function]",
+        toString: "[Function]",
+        valueOf: "[Function]",
+      },
+      inherited: "[Unsupported object]",
+    });
+    expect(getterCalls).toBe(0);
+    expect(proxyTrapCalls).toBe(0);
+    expect(toJsonCalls).toBe(0);
+    expect(iteratorCalls).toBe(0);
+    expect(coercionCalls).toBe(0);
+    expect(inheritedAccessorCalls).toBe(0);
+  });
+
+  test("does not consult Array or Set iterators while sanitizing", () => {
+    const arrayIteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    const setIteratorDescriptor = Object.getOwnPropertyDescriptor(
+      Set.prototype,
+      Symbol.iterator,
+    );
+    if (
+      arrayIteratorDescriptor === undefined ||
+      !("value" in arrayIteratorDescriptor) ||
+      setIteratorDescriptor === undefined ||
+      !("value" in setIteratorDescriptor)
+    ) {
+      throw new Error("iterator descriptors are required");
+    }
+    const arrayIterator = arrayIteratorDescriptor.value as unknown;
+    const setIterator = setIteratorDescriptor.value as unknown;
+    let iteratorCalls = 0;
+    let redacted: ReturnType<typeof redactSecrets> | undefined;
+
+    try {
+      Object.defineProperty(Array.prototype, Symbol.iterator, {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          iteratorCalls += 1;
+          return arrayIterator;
+        },
+      });
+      Object.defineProperty(Set.prototype, Symbol.iterator, {
+        configurable: true,
+        enumerable: false,
+        get: () => {
+          iteratorCalls += 1;
+          return setIterator;
+        },
+      });
+      redacted = redactSecrets({ message: "visible registered-secret" }, [
+        "registered-secret",
+      ]);
+    } finally {
+      Object.defineProperty(
+        Array.prototype,
+        Symbol.iterator,
+        arrayIteratorDescriptor,
+      );
+      Object.defineProperty(
+        Set.prototype,
+        Symbol.iterator,
+        setIteratorDescriptor,
+      );
+    }
+
+    expect(iteratorCalls).toBe(0);
+    expect(redacted).toEqual({ message: "visible [REDACTED]" });
+  });
+
   test("bounds recursive traversal, handles cycles, and stringifies unsupported values", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;

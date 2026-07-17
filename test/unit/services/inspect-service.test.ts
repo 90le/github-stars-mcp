@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { StoragePort } from "../../../src/app/ports/storage-port.js";
 import { InspectService } from "../../../src/app/services/inspect-service.js";
+import { canonicalJson } from "../../../src/domain/canonical-json.js";
 import { AppError } from "../../../src/domain/errors.js";
 import {
   asPlanId,
@@ -300,11 +301,19 @@ function storageFixture(input?: {
 }
 
 function cursor(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+  return Buffer.from(canonicalJson(value), "utf8").toString("base64url");
+}
+
+function cursorFromText(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
 }
 
 function cursorPayload(value: string): unknown {
   return JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+}
+
+function cursorText(value: string): string {
+  return Buffer.from(value, "base64url").toString("utf8");
 }
 
 describe("InspectService", () => {
@@ -413,6 +422,34 @@ describe("InspectService", () => {
     });
     expect(first).not.toHaveProperty("attempts");
     expect(first).not.toHaveProperty("reconciliations");
+  });
+
+  it("encodes inspect cursors as canonical JSON", async () => {
+    const run = runFixture("run_canonical_cursor");
+    const operations = Object.freeze([
+      runOperationFixture("run_canonical_cursor", 0),
+      runOperationFixture("run_canonical_cursor", 1),
+    ]);
+    const { storage } = storageFixture({
+      runs: [run],
+      runOperations: { run_canonical_cursor: operations },
+    });
+
+    const result = await new InspectService(storage).inspect({
+      kind: "run",
+      id: "run_canonical_cursor",
+      limit: 1,
+    });
+
+    expect(result.nextCursor).not.toBeNull();
+    expect(cursorText(result.nextCursor!)).toBe(
+      canonicalJson({
+        version: 1,
+        kind: "run",
+        targetId: "run_canonical_cursor",
+        afterSequence: 0,
+      }),
+    );
   });
 
   it("pages attempts with a run-and-operation-bound cursor", async () => {
@@ -648,6 +685,46 @@ describe("InspectService", () => {
       afterSequence: 2,
       pageSize: 50,
     });
+  });
+
+  it("rejects every non-canonical cursor JSON encoding before storage", async () => {
+    const run = runFixture("run_noncanonical_cursor");
+    const base = storageFixture({ runs: [run] });
+    const getRun = vi.fn(base.storage.getRun);
+    const service = new InspectService({
+      ...base.storage,
+      getRun,
+    });
+    const canonical = canonicalJson({
+      version: 1,
+      kind: "run",
+      targetId: "run_noncanonical_cursor",
+      afterSequence: 0,
+    });
+    const nonCanonical = [
+      ` ${canonical}`,
+      `${canonical} `,
+      '{"version":1,"kind":"run","targetId":"run_noncanonical_cursor","afterSequence":0}',
+      '{"afterSequence":0,"afterSequence":0,"kind":"run","targetId":"run_noncanonical_cursor","version":1}',
+      '{"afterSequence":-0,"kind":"run","targetId":"run_noncanonical_cursor","version":1}',
+      '{"afterSequence":0e0,"kind":"run","targetId":"run_noncanonical_cursor","version":1}',
+      '{"afterSequence":0,"kind":"\\u0072un","targetId":"run_noncanonical_cursor","version":1}',
+    ];
+
+    for (const text of nonCanonical) {
+      await expect(
+        service.inspect({
+          kind: "run",
+          id: "run_noncanonical_cursor",
+          cursor: cursorFromText(text),
+        }),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        message: "Inspection cursor is invalid",
+      });
+    }
+    expect(getRun).not.toHaveBeenCalled();
+    expect(base.listRunOperationsPage).not.toHaveBeenCalled();
   });
 
   it("binds history cursors to the exact kind, run, and operation before storage", async () => {
@@ -932,6 +1009,72 @@ describe("InspectService", () => {
     });
     expect(Object.isFrozen(result)).toBe(true);
     expect(Object.isFrozen(result.operations)).toBe(true);
+  });
+
+  it("removes GitHub tokens and Bearer credentials from every audit presentation string and key", async () => {
+    const githubToken = `ghp_${"A".repeat(36)}`;
+    const bearerCredential = "opaque-bearer-credential-value";
+    const runId = "run_credential_redaction";
+    const operationId = "op_credential_redaction";
+    const details = (marker: string) =>
+      Object.freeze({
+        queryUrl: `https://github.com/octocat/tool?access_token=${githubToken}&marker=${marker}`,
+        userinfoUrl: `https://octocat:${githubToken}@github.com/octocat/tool`,
+        message: `GitHub rejected ${githubToken}`,
+        description: `remote response used Bearer ${bearerCredential}`,
+        [`field-${githubToken}`]: "credential-bearing object key",
+        nested: Object.freeze({
+          arbitrary: githubToken,
+          bearer: `Bearer ${bearerCredential}`,
+        }),
+        headers: Object.freeze({
+          authorization: `Bearer ${githubToken}`,
+        }),
+      });
+    const run = Object.freeze({
+      ...runFixture(runId),
+      warnings: Object.freeze([`run message ${githubToken}`]),
+    }) as ChangeRun;
+    const operation = runOperationFixture(runId, 0, details("run"));
+    const attempt = attemptFixture(runId, operationId, 1, details("attempt"));
+    const reconciliation = reconciliationFixture(
+      runId,
+      operationId,
+      1,
+      details("reconciliation"),
+    );
+    const { storage } = storageFixture({
+      runs: [run],
+      runOperations: { [runId]: Object.freeze([operation]) },
+      attempts: {
+        [`${runId}\u0000${operationId}`]: Object.freeze([attempt]),
+      },
+      reconciliations: {
+        [`${runId}\u0000${operationId}`]: Object.freeze([reconciliation]),
+      },
+    });
+    const service = new InspectService(storage);
+
+    const results = [
+      await service.inspect({ kind: "run", id: runId }),
+      await service.inspect({
+        kind: "attempts",
+        id: asRunId(runId),
+        operationId,
+      }),
+      await service.inspect({
+        kind: "reconciliations",
+        id: asRunId(runId),
+        operationId,
+      }),
+    ];
+
+    for (const result of results) {
+      const serialized = JSON.stringify(result);
+      expect(serialized).toContain("[REDACTED]");
+      expect(serialized).not.toContain(githubToken);
+      expect(serialized).not.toContain(bearerCredential);
+    }
   });
 
   it("redacts, detaches, and deeply freezes history presentations", async () => {

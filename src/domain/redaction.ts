@@ -1,3 +1,4 @@
+import { types as utilTypes } from "node:util";
 import type { JsonValue } from "./json.js";
 
 const REDACTED = "[REDACTED]";
@@ -5,13 +6,33 @@ const TRUNCATED = "[Truncated]";
 const CIRCULAR = "[Circular]";
 const UNSUPPORTED_ARRAY_ITEM = "[Unsupported array item]";
 const MAX_DEPTH = 20;
-const SENSITIVE_KEYS = new Set([
-  "authorization",
-  "token",
-  "access_token",
-  "password",
-  "cookie",
-]);
+const GITHUB_TOKEN =
+  /\b(?:github_pat_[A-Za-z0-9_]{8,255}|gh[pousr]_[A-Za-z0-9_]{8,255})\b/gu;
+const BEARER_CREDENTIAL = /\bBearer[ \t]+[A-Za-z0-9._~+/\-=]{1,4096}/giu;
+
+const FREEZE = Object.freeze;
+/* eslint-disable @typescript-eslint/unbound-method -- Redaction captures mutable realm methods once and invokes them only with explicit receivers. */
+const INTRINSICS = FREEZE({
+  arrayIsArray: Array.isArray,
+  arraySort: Array.prototype.sort,
+  getOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
+  objectDefineProperty: Object.defineProperty,
+  objectFreeze: FREEZE,
+  objectPrototype: Object.prototype,
+  reflectApply: Reflect.apply,
+  reflectGetPrototypeOf: Reflect.getPrototypeOf,
+  reflectOwnKeys: Reflect.ownKeys,
+  regexpReplace: RegExp.prototype[Symbol.replace],
+  stringFromValue: String,
+  stringReplaceAll: String.prototype.replaceAll,
+  stringToLowerCase: String.prototype.toLowerCase,
+  utilIsProxy: utilTypes.isProxy,
+  weakSetAdd: WeakSet.prototype.add,
+  weakSetConstructor: WeakSet,
+  weakSetDelete: WeakSet.prototype.delete,
+  weakSetHas: WeakSet.prototype.has,
+});
+/* eslint-enable @typescript-eslint/unbound-method */
 
 const INVALID_SECRET_REGISTRY: readonly string[] = (() => {
   const sentinel: string[] = [];
@@ -26,8 +47,8 @@ function inspectSecretRegistry(
 
   let descriptors: Record<string, PropertyDescriptor>;
   try {
-    if (!Array.isArray(secrets)) return undefined;
-    descriptors = Object.getOwnPropertyDescriptors(secrets);
+    if (!INTRINSICS.arrayIsArray(secrets)) return undefined;
+    descriptors = INTRINSICS.getOwnPropertyDescriptors(secrets);
   } catch {
     return undefined;
   }
@@ -44,7 +65,9 @@ function inspectSecretRegistry(
   }
 
   const length = lengthDescriptor.value;
-  for (const key of Reflect.ownKeys(descriptors)) {
+  const keys = INTRINSICS.reflectOwnKeys(descriptors);
+  for (let keyIndex = 0; keyIndex < keys.length; keyIndex += 1) {
+    const key = keys[keyIndex];
     if (typeof key !== "string") return undefined;
     if (key === "length") continue;
     if (!/^(?:0|[1-9]\d*)$/u.test(key)) return undefined;
@@ -65,7 +88,7 @@ function inspectSecretRegistry(
     }
     return undefined;
   }
-  return Object.freeze(snapshot);
+  return INTRINSICS.objectFreeze(snapshot);
 }
 
 export function snapshotSecretRegistry(
@@ -80,32 +103,62 @@ function registeredSecrets(
   const snapshot = snapshotSecretRegistry(secrets);
   if (snapshot === INVALID_SECRET_REGISTRY) return undefined;
 
-  const unique = new Set<string>();
+  const unique: string[] = [];
   for (let index = 0; index < snapshot.length; index += 1) {
     const secret = snapshot[index];
-    if (secret !== undefined && secret.length > 0) unique.add(secret);
+    if (secret === undefined || secret.length === 0) continue;
+    let seen = false;
+    for (
+      let existingIndex = 0;
+      existingIndex < unique.length;
+      existingIndex += 1
+    ) {
+      if (unique[existingIndex] === secret) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) unique.push(secret);
   }
-  return [...unique].sort((left, right) => right.length - left.length);
+  INTRINSICS.reflectApply(INTRINSICS.arraySort, unique, [
+    (left: string, right: string) => right.length - left.length,
+  ]);
+  return INTRINSICS.objectFreeze(unique);
 }
 
 function redactString(value: string, secrets: readonly string[]): string {
   let redacted = value;
-  for (const secret of secrets) {
-    redacted = redacted.replaceAll(secret, REDACTED);
+  for (let index = 0; index < secrets.length; index += 1) {
+    const secret = secrets[index];
+    if (secret !== undefined) {
+      redacted = INTRINSICS.reflectApply(
+        INTRINSICS.stringReplaceAll,
+        redacted,
+        [secret, REDACTED],
+      ) as string;
+    }
   }
-  return redacted;
+  redacted = INTRINSICS.reflectApply(INTRINSICS.regexpReplace, GITHUB_TOKEN, [
+    redacted,
+    REDACTED,
+  ]) as string;
+  return INTRINSICS.reflectApply(INTRINSICS.regexpReplace, BEARER_CREDENTIAL, [
+    redacted,
+    REDACTED,
+  ]) as string;
 }
 
 function unsupportedPrimitive(
   value: bigint | symbol | undefined,
   secrets: readonly string[],
 ): string {
-  return redactString(String(value), secrets);
+  return redactString(INTRINSICS.stringFromValue(value), secrets);
 }
 
 function dataDescriptors(value: object): PropertyDescriptorMap | undefined {
   try {
-    return Object.getOwnPropertyDescriptors(value);
+    if (INTRINSICS.utilIsProxy(value)) return undefined;
+    return INTRINSICS.getOwnPropertyDescriptors(value);
   } catch {
     return undefined;
   }
@@ -131,7 +184,7 @@ function redactArray(
   }
 
   const result: JsonValue[] = [];
-  ancestors.add(value);
+  INTRINSICS.reflectApply(INTRINSICS.weakSetAdd, ancestors, [value]);
   try {
     for (let index = 0; index < lengthDescriptor.value; index += 1) {
       const descriptor = descriptors[String(index)];
@@ -146,15 +199,16 @@ function redactArray(
       result.push(redactValue(descriptor.value, secrets, depth + 1, ancestors));
     }
   } finally {
-    ancestors.delete(value);
+    INTRINSICS.reflectApply(INTRINSICS.weakSetDelete, ancestors, [value]);
   }
   return result;
 }
 
 function isPlainObject(value: object): boolean {
   try {
-    const prototype = Object.getPrototypeOf(value) as object | null;
-    return prototype === Object.prototype || prototype === null;
+    if (INTRINSICS.utilIsProxy(value)) return false;
+    const prototype = INTRINSICS.reflectGetPrototypeOf(value);
+    return prototype === INTRINSICS.objectPrototype || prototype === null;
   } catch {
     return false;
   }
@@ -165,7 +219,7 @@ function defineDataProperty(
   key: string,
   value: JsonValue,
 ): void {
-  Object.defineProperty(target, key, {
+  INTRINSICS.objectDefineProperty(target, key, {
     configurable: true,
     enumerable: true,
     value,
@@ -185,21 +239,36 @@ function redactObject(
   if (descriptors === undefined) return "[Unsupported object]";
 
   const result: Record<string, JsonValue> = {};
-  ancestors.add(value);
+  INTRINSICS.reflectApply(INTRINSICS.weakSetAdd, ancestors, [value]);
   try {
-    for (const [key, descriptor] of Object.entries(descriptors)) {
+    const keys = INTRINSICS.reflectOwnKeys(descriptors);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index];
+      if (typeof key !== "string") continue;
+      const descriptor = descriptors[key];
+      if (descriptor === undefined) continue;
       if (descriptor.enumerable !== true || !("value" in descriptor)) {
         continue;
       }
 
       const outputKey = redactString(key, secrets);
-      const outputValue = SENSITIVE_KEYS.has(key.toLowerCase())
-        ? REDACTED
-        : redactValue(descriptor.value, secrets, depth + 1, ancestors);
+      const lowerKey = INTRINSICS.reflectApply(
+        INTRINSICS.stringToLowerCase,
+        key,
+        [],
+      );
+      const outputValue =
+        lowerKey === "authorization" ||
+        lowerKey === "token" ||
+        lowerKey === "access_token" ||
+        lowerKey === "password" ||
+        lowerKey === "cookie"
+          ? REDACTED
+          : redactValue(descriptor.value, secrets, depth + 1, ancestors);
       defineDataProperty(result, outputKey, outputValue);
     }
   } finally {
-    ancestors.delete(value);
+    INTRINSICS.reflectApply(INTRINSICS.weakSetDelete, ancestors, [value]);
   }
   return result;
 }
@@ -226,11 +295,16 @@ function redactValue(
   }
   if (typeof value === "function") return "[Function]";
   if (depth >= MAX_DEPTH) return TRUNCATED;
-  if (ancestors.has(value)) return CIRCULAR;
+  if (
+    INTRINSICS.reflectApply(INTRINSICS.weakSetHas, ancestors, [value]) === true
+  ) {
+    return CIRCULAR;
+  }
 
   let array = false;
   try {
-    array = Array.isArray(value);
+    if (INTRINSICS.utilIsProxy(value)) return "[Unsupported object]";
+    array = INTRINSICS.arrayIsArray(value);
   } catch {
     return "[Unsupported object]";
   }
@@ -246,5 +320,10 @@ export function redactSecrets(
   const inspectedSecrets = registeredSecrets(secrets);
   return inspectedSecrets === undefined
     ? REDACTED
-    : redactValue(value, inspectedSecrets, 0, new WeakSet());
+    : redactValue(
+        value,
+        inspectedSecrets,
+        0,
+        new INTRINSICS.weakSetConstructor<object>(),
+      );
 }

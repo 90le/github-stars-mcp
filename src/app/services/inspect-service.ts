@@ -1,6 +1,7 @@
 import { types as utilTypes } from "node:util";
 import type { StoragePort } from "../ports/storage-port.js";
 import {
+  canonicalJson,
   canonicalJsonClone,
   freezeJsonValue,
 } from "../../domain/canonical-json.js";
@@ -346,6 +347,9 @@ function decodeCursor(value: string): CursorPayload {
 
   let cloned: JsonValue;
   try {
+    if (canonicalJson(parsed) !== decoded) {
+      return validation("Inspection cursor is invalid");
+    }
     cloned = canonicalJsonClone(parsed);
   } catch {
     return validation("Inspection cursor is invalid");
@@ -495,7 +499,7 @@ function parseInput(input: InspectInput): ParsedInput {
 }
 
 function encodeCursor(payload: CursorPayload): string {
-  return Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  return Buffer.from(canonicalJson(payload), "utf8").toString("base64url");
 }
 
 function sequenceCursor(

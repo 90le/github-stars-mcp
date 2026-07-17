@@ -1,4 +1,7 @@
-import type { GitHubPort, RateLimitState } from "../app/ports/github-port.js";
+import type {
+  GitHubMutationPort,
+  RateLimitState,
+} from "../app/ports/github-port.js";
 import {
   CREATE_USER_LIST,
   DELETE_USER_LIST,
@@ -150,14 +153,27 @@ export const GRAPHQL_MUTATION_DOCUMENTS = Object.freeze({
   Record<keyof typeof GRAPHQL_MUTATION_OPERATIONS, string>
 >);
 
-export const GITHUB_MUTATION_METHOD_NAMES = Object.freeze([
+type ExactMutationMethodNames<
+  Names extends readonly (keyof GitHubMutationPort)[],
+> =
+  Exclude<keyof GitHubMutationPort, Names[number]> extends never
+    ? Names
+    : never;
+
+function exactMutationMethodNames<
+  const Names extends readonly (keyof GitHubMutationPort)[],
+>(names: ExactMutationMethodNames<Names>): Readonly<Names> {
+  return Object.freeze(names);
+}
+
+export const GITHUB_MUTATION_METHOD_NAMES = exactMutationMethodNames([
   "star",
   "unstar",
   "createUserList",
   "updateUserList",
   "deleteUserList",
   "setRepositoryListIds",
-] as const satisfies readonly (keyof GitHubPort)[]);
+] as const);
 
 export type RestReadOperation = keyof typeof REST_READ_OPERATIONS;
 export type GraphqlReadOperation = keyof typeof GRAPHQL_READ_OPERATIONS;
