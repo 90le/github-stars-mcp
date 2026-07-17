@@ -1,0 +1,933 @@
+import { Buffer } from "node:buffer";
+import { describe, expect, it } from "vitest";
+import type {
+  CreateUserListInput,
+  GitHubLiveReadPort,
+  GitHubMutationPort,
+  MutationReceipt,
+  RepositoryIdentity,
+  UpdateUserListInput,
+  UserListMutationResult,
+} from "../../../src/app/ports/github-port.js";
+import {
+  MutationExecutor,
+  type ExecutionContext,
+  type PreparedMutation,
+} from "../../../src/app/services/mutation-executor.js";
+import { AppError } from "../../../src/domain/errors.js";
+import {
+  asRepositoryDatabaseId,
+  asRepositoryId,
+  asUserListId,
+  type RepositoryId,
+  type UserListId,
+} from "../../../src/domain/ids.js";
+import type { ResolvedOperation } from "../../../src/domain/plan.js";
+import type {
+  RepositoryCoordinates,
+  UserList,
+} from "../../../src/domain/repository.js";
+import { userListFixture } from "../../support/change-service-fixtures.js";
+
+const coordinates = Object.freeze({ owner: "acme", name: "widget" });
+const repositoryId = asRepositoryId("R_1");
+const repositoryDatabaseId = asRepositoryDatabaseId("101");
+const listId = asUserListId("UL_1");
+const createdListId = asUserListId("UL_created");
+
+type MutationCall = Readonly<{
+  kind:
+    | "star"
+    | "unstar"
+    | "createUserList"
+    | "updateUserList"
+    | "deleteUserList"
+    | "setRepositoryListIds";
+  operationId: string;
+  value: unknown;
+}>;
+
+class StatefulGitHub implements GitHubLiveReadPort, GitHubMutationPort {
+  identity: RepositoryIdentity | null = Object.freeze({
+    repositoryId,
+    repositoryDatabaseId,
+    coordinates,
+  });
+  starred = false;
+  applyMutations = true;
+  createdList = userListFixture({
+    listId: createdListId,
+    name: "Created",
+    slug: "created",
+    description: null,
+    isPrivate: false,
+  });
+  readonly lists = new Map<UserListId, UserList>();
+  readonly memberships = new Map<RepositoryId, readonly UserListId[]>();
+  readonly reads: string[] = [];
+  readonly mutations: MutationCall[] = [];
+  onRead: ((name: string) => void) | null = null;
+  afterMutation: ((kind: MutationCall["kind"]) => void) | null = null;
+
+  constructor() {
+    this.lists.set(
+      listId,
+      userListFixture({
+        listId,
+        name: "Original",
+        slug: "original",
+        description: "Before",
+        isPrivate: false,
+      }),
+    );
+    this.memberships.set(repositoryId, Object.freeze([listId]));
+  }
+
+  #read(name: string): void {
+    this.reads.push(name);
+    this.onRead?.(name);
+  }
+
+  #record(
+    kind: MutationCall["kind"],
+    operationId: string,
+    value: unknown,
+  ): void {
+    this.mutations.push(Object.freeze({ kind, operationId, value }));
+  }
+
+  #receipt(kind: MutationCall["kind"], operationId: string): MutationReceipt {
+    return Object.freeze({
+      requestId: `REQ-${String(this.mutations.length)}`,
+      clientMutationId:
+        kind === "star" || kind === "unstar" ? null : operationId,
+    });
+  }
+
+  getRepositoryIdentity(): Promise<RepositoryIdentity | null> {
+    this.#read("getRepositoryIdentity");
+    return Promise.resolve(this.identity);
+  }
+
+  getUserList(id: UserListId): Promise<UserList | null> {
+    this.#read(`getUserList:${id}`);
+    return Promise.resolve(this.lists.get(id) ?? null);
+  }
+
+  checkStar(): Promise<boolean> {
+    this.#read("checkStar");
+    return Promise.resolve(this.starred);
+  }
+
+  getRepositoryListIds(id: RepositoryId): Promise<readonly UserListId[]> {
+    this.#read(`getRepositoryListIds:${id}`);
+    return Promise.resolve(
+      Object.freeze([...(this.memberships.get(id) ?? [])]),
+    );
+  }
+
+  star(
+    repository: RepositoryCoordinates,
+    operationId: string,
+  ): Promise<MutationReceipt> {
+    this.#record("star", operationId, repository);
+    if (this.applyMutations) this.starred = true;
+    this.afterMutation?.("star");
+    return Promise.resolve(this.#receipt("star", operationId));
+  }
+
+  unstar(
+    repository: RepositoryCoordinates,
+    operationId: string,
+  ): Promise<MutationReceipt> {
+    this.#record("unstar", operationId, repository);
+    if (this.applyMutations) this.starred = false;
+    this.afterMutation?.("unstar");
+    return Promise.resolve(this.#receipt("unstar", operationId));
+  }
+
+  createUserList(
+    input: CreateUserListInput,
+    operationId: string,
+  ): Promise<UserListMutationResult> {
+    this.#record("createUserList", operationId, input);
+    const list = Object.freeze({
+      ...this.createdList,
+      name: input.name,
+      description: input.description,
+      isPrivate: input.isPrivate,
+    });
+    if (this.applyMutations) this.lists.set(list.listId, list);
+    this.afterMutation?.("createUserList");
+    return Promise.resolve(
+      Object.freeze({
+        list,
+        receipt: this.#receipt("createUserList", operationId),
+      }),
+    );
+  }
+
+  updateUserList(
+    id: UserListId,
+    input: UpdateUserListInput,
+    operationId: string,
+  ): Promise<UserListMutationResult> {
+    this.#record("updateUserList", operationId, Object.freeze({ id, input }));
+    const current = this.lists.get(id);
+    if (current === undefined) {
+      return Promise.reject(
+        new AppError("NOT_FOUND", "List is missing", { retryable: false }),
+      );
+    }
+    const list = Object.freeze({
+      ...current,
+      ...(input.name === undefined ? {} : { name: input.name }),
+      ...(input.description === undefined
+        ? {}
+        : { description: input.description }),
+      ...(input.isPrivate === undefined ? {} : { isPrivate: input.isPrivate }),
+    });
+    if (this.applyMutations) this.lists.set(id, list);
+    this.afterMutation?.("updateUserList");
+    return Promise.resolve(
+      Object.freeze({
+        list,
+        receipt: this.#receipt("updateUserList", operationId),
+      }),
+    );
+  }
+
+  deleteUserList(
+    id: UserListId,
+    operationId: string,
+  ): Promise<MutationReceipt> {
+    this.#record("deleteUserList", operationId, id);
+    if (this.applyMutations) this.lists.delete(id);
+    this.afterMutation?.("deleteUserList");
+    return Promise.resolve(this.#receipt("deleteUserList", operationId));
+  }
+
+  setRepositoryListIds(
+    id: RepositoryId,
+    ids: readonly UserListId[],
+    operationId: string,
+  ): Promise<MutationReceipt> {
+    this.#record(
+      "setRepositoryListIds",
+      operationId,
+      Object.freeze({ id, ids: Object.freeze([...ids]) }),
+    );
+    if (this.applyMutations) {
+      this.memberships.set(id, Object.freeze([...ids]));
+    }
+    this.afterMutation?.("setRepositoryListIds");
+    return Promise.resolve(this.#receipt("setRepositoryListIds", operationId));
+  }
+}
+
+function emptyExecutionContext(): ExecutionContext {
+  return {
+    createdListIdsByOperationId: new Map<string, UserListId>(),
+  };
+}
+
+function common(operationId: string) {
+  return {
+    operationId,
+    dependsOn: Object.freeze([] as string[]),
+    preconditions: Object.freeze([]),
+    inverse: Object.freeze({}),
+    risk: "normal" as const,
+  };
+}
+
+function starOperation(kind: "star" | "unstar" = "star"): ResolvedOperation {
+  return Object.freeze({
+    ...common(`op_${kind}`),
+    kind,
+    repositoryId,
+    repositoryDatabaseId,
+    coordinates,
+    before:
+      kind === "star"
+        ? Object.freeze({ starred: false })
+        : Object.freeze({ starred: true }),
+    after:
+      kind === "star"
+        ? Object.freeze({ starred: true })
+        : Object.freeze({ starred: false }),
+  });
+}
+
+function createOperation(): ResolvedOperation {
+  return Object.freeze({
+    ...common("op_create"),
+    kind: "list_create",
+    clientRef: "created",
+    before: Object.freeze({ listIds: Object.freeze([listId]) }),
+    after: Object.freeze({
+      name: "Created",
+      description: null,
+      isPrivate: false,
+    }),
+  });
+}
+
+function updateOperation(): ResolvedOperation {
+  return Object.freeze({
+    ...common("op_update"),
+    kind: "list_update",
+    listId,
+    before: Object.freeze({
+      name: "Original",
+      description: "Before",
+      isPrivate: false,
+    }),
+    after: Object.freeze({
+      name: "Renamed",
+      description: null,
+      isPrivate: true,
+    }),
+  });
+}
+
+function completeList(list: UserList) {
+  return Object.freeze({
+    listId: list.listId,
+    name: list.name,
+    slug: list.slug,
+    description: list.description,
+    isPrivate: list.isPrivate,
+    createdAt: list.createdAt,
+    updatedAt: list.updatedAt,
+    lastAddedAt: list.lastAddedAt,
+  });
+}
+
+function deleteOperation(list: UserList): ResolvedOperation {
+  return Object.freeze({
+    ...common("op_delete"),
+    kind: "list_delete",
+    listId: list.listId,
+    before: Object.freeze({
+      list: completeList(list),
+      repositoryIds: Object.freeze([repositoryId]),
+    }),
+    after: Object.freeze({ exists: false }),
+    risk: "destructive",
+  });
+}
+
+function membershipOperation(
+  targetLists: Extract<
+    ResolvedOperation,
+    { kind: "list_membership_set" }
+  >["targetLists"] = Object.freeze([
+    Object.freeze({ kind: "existing" as const, listId }),
+  ]),
+): ResolvedOperation {
+  return Object.freeze({
+    ...common("op_membership"),
+    kind: "list_membership_set",
+    repositoryId,
+    repositoryDatabaseId,
+    coordinates,
+    expectedListIds: Object.freeze([listId]),
+    targetLists,
+    before: Object.freeze({ listIds: Object.freeze([listId]) }),
+    after: Object.freeze({
+      listIds: Object.freeze(
+        targetLists.map((target) =>
+          target.kind === "existing"
+            ? target.listId
+            : Object.freeze({
+                createOperationId: target.createOperationId,
+              }),
+        ),
+      ),
+    }),
+  });
+}
+
+function executor(github: StatefulGitHub): MutationExecutor {
+  return new MutationExecutor(github, github);
+}
+
+async function prepared(
+  service: MutationExecutor,
+  operation: ResolvedOperation,
+  context: ExecutionContext,
+  signal?: AbortSignal,
+): Promise<PreparedMutation> {
+  const result = await service.prepare(operation, context, signal);
+  expect(result.kind).toBe("dispatch");
+  if (result.kind !== "dispatch") {
+    throw new Error("Expected a prepared mutation");
+  }
+  return result.prepared;
+}
+
+describe("MutationExecutor live preconditions", () => {
+  it("rejects a malformed resolved operation before any live read", async () => {
+    const github = new StatefulGitHub();
+    const malformed = Object.freeze({
+      ...common("op_malformed"),
+      kind: "star",
+      repositoryId,
+      repositoryDatabaseId,
+      before: Object.freeze({ starred: false }),
+      after: Object.freeze({ starred: true }),
+    }) as unknown as ResolvedOperation;
+
+    await expect(
+      executor(github).prepare(malformed, emptyExecutionContext()),
+    ).rejects.toMatchObject({
+      code: "VALIDATION_ERROR",
+      retryable: false,
+    });
+    expect(github.reads).toEqual([]);
+    expect(github.mutations).toEqual([]);
+  });
+
+  it.each([
+    ["node ID", asRepositoryId("R_other"), repositoryDatabaseId],
+    ["database ID", repositoryId, asRepositoryDatabaseId("999")],
+  ])(
+    "rejects a changed repository %s before star and unstar",
+    async (_label, actualRepositoryId, actualDatabaseId) => {
+      for (const kind of ["star", "unstar"] as const) {
+        const github = new StatefulGitHub();
+        github.starred = kind === "unstar";
+        github.identity = Object.freeze({
+          repositoryId: actualRepositoryId,
+          repositoryDatabaseId: actualDatabaseId,
+          coordinates,
+        });
+
+        await expect(
+          executor(github).prepare(
+            starOperation(kind),
+            emptyExecutionContext(),
+          ),
+        ).rejects.toMatchObject({
+          code: "PRECONDITION_FAILED",
+          retryable: false,
+        });
+        expect(github.reads).toEqual(["getRepositoryIdentity"]);
+        expect(github.mutations).toEqual([]);
+      }
+    },
+  );
+
+  it.each(["list_update", "list_delete"] as const)(
+    "rejects changed complete List metadata before %s",
+    async (kind) => {
+      const github = new StatefulGitHub();
+      const original = github.lists.get(listId)!;
+      github.lists.set(
+        listId,
+        Object.freeze(
+          kind === "list_update"
+            ? { ...original, name: "Changed elsewhere" }
+            : {
+                ...original,
+                updatedAt: "2026-07-16T00:03:00.000Z",
+              },
+        ),
+      );
+      const operation =
+        kind === "list_update" ? updateOperation() : deleteOperation(original);
+
+      await expect(
+        executor(github).prepare(operation, emptyExecutionContext()),
+      ).rejects.toMatchObject({
+        code: "PRECONDITION_FAILED",
+        retryable: false,
+      });
+      expect(github.mutations).toEqual([]);
+    },
+  );
+
+  it("rejects a changed complete membership set before mutation", async () => {
+    const github = new StatefulGitHub();
+    github.memberships.set(
+      repositoryId,
+      Object.freeze([listId, asUserListId("UL_extra")]),
+    );
+
+    await expect(
+      executor(github).prepare(membershipOperation(), emptyExecutionContext()),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      retryable: false,
+    });
+    expect(github.reads).toEqual([
+      "getRepositoryIdentity",
+      `getRepositoryListIds:${repositoryId}`,
+    ]);
+    expect(github.mutations).toEqual([]);
+  });
+
+  it("checks cancellation before and after live reads", async () => {
+    const alreadyAborted = new AbortController();
+    alreadyAborted.abort();
+    const githubBefore = new StatefulGitHub();
+    await expect(
+      executor(githubBefore).prepare(
+        starOperation(),
+        emptyExecutionContext(),
+        alreadyAborted.signal,
+      ),
+    ).rejects.toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      details: { reason: "cancelled" },
+    });
+    expect(githubBefore.reads).toEqual([]);
+
+    const afterRead = new AbortController();
+    const githubAfter = new StatefulGitHub();
+    githubAfter.onRead = (name) => {
+      if (name === "getRepositoryIdentity") afterRead.abort();
+    };
+    await expect(
+      executor(githubAfter).prepare(
+        starOperation(),
+        emptyExecutionContext(),
+        afterRead.signal,
+      ),
+    ).rejects.toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      details: { reason: "cancelled" },
+    });
+    expect(githubAfter.reads).toEqual(["getRepositoryIdentity"]);
+    expect(githubAfter.mutations).toEqual([]);
+  });
+});
+
+describe("MutationExecutor desired-state skips", () => {
+  it("skips an already-starred repository with zero mutation calls", async () => {
+    const github = new StatefulGitHub();
+    github.starred = true;
+
+    await expect(
+      executor(github).prepare(starOperation(), emptyExecutionContext()),
+    ).resolves.toMatchObject({
+      kind: "skipped",
+      outcome: {
+        kind: "skipped",
+        before: { starred: true },
+        after: { starred: true },
+        receipt: null,
+      },
+    });
+    expect(github.mutations).toEqual([]);
+  });
+
+  it("skips an already-updated List and an already-deleted List", async () => {
+    const updatedGitHub = new StatefulGitHub();
+    const current = updatedGitHub.lists.get(listId)!;
+    updatedGitHub.lists.set(
+      listId,
+      Object.freeze({
+        ...current,
+        name: "Renamed",
+        description: null,
+        isPrivate: true,
+      }),
+    );
+    await expect(
+      executor(updatedGitHub).prepare(
+        updateOperation(),
+        emptyExecutionContext(),
+      ),
+    ).resolves.toMatchObject({
+      kind: "skipped",
+      outcome: { kind: "skipped", receipt: null },
+    });
+    expect(updatedGitHub.mutations).toEqual([]);
+
+    const deletedGitHub = new StatefulGitHub();
+    const deleted = deletedGitHub.lists.get(listId)!;
+    deletedGitHub.lists.delete(listId);
+    await expect(
+      executor(deletedGitHub).prepare(
+        deleteOperation(deleted),
+        emptyExecutionContext(),
+      ),
+    ).resolves.toMatchObject({
+      kind: "skipped",
+      outcome: {
+        kind: "skipped",
+        after: { exists: false },
+        receipt: null,
+      },
+    });
+    expect(deletedGitHub.mutations).toEqual([]);
+  });
+
+  it("skips an already-complete desired membership set", async () => {
+    const targetId = asUserListId("UL_target");
+    const github = new StatefulGitHub();
+    github.memberships.set(repositoryId, Object.freeze([targetId]));
+    const operation = membershipOperation(
+      Object.freeze([Object.freeze({ kind: "existing", listId: targetId })]),
+    );
+
+    await expect(
+      executor(github).prepare(operation, emptyExecutionContext()),
+    ).resolves.toMatchObject({
+      kind: "skipped",
+      outcome: {
+        kind: "skipped",
+        after: { listIds: [targetId] },
+        receipt: null,
+      },
+    });
+    expect(github.mutations).toEqual([]);
+  });
+
+  it("uses a prior create context to skip an already-created List", async () => {
+    const github = new StatefulGitHub();
+    github.lists.set(createdListId, github.createdList);
+    const context = emptyExecutionContext();
+    context.createdListIdsByOperationId.set("op_create", createdListId);
+
+    await expect(
+      executor(github).prepare(createOperation(), context),
+    ).resolves.toMatchObject({
+      kind: "skipped",
+      outcome: {
+        kind: "skipped",
+        after: { listId: createdListId, name: "Created" },
+        receipt: null,
+      },
+    });
+    expect(github.mutations).toEqual([]);
+  });
+});
+
+describe("MutationExecutor prepared dispatch", () => {
+  it("prepares without dispatch, freezes the value, and records star synchronously", async () => {
+    const github = new StatefulGitHub();
+    const service = executor(github);
+    const context = emptyExecutionContext();
+    const value = await prepared(service, starOperation(), context);
+
+    expect(github.mutations).toEqual([]);
+    expect(Object.isFrozen(value)).toBe(true);
+    expect(Object.isFrozen(value.mutation)).toBe(true);
+    const promise = service.dispatchPrepared(value, context);
+    expect(github.mutations.map((call) => call.kind)).toEqual(["star"]);
+
+    await expect(promise).resolves.toEqual({
+      kind: "succeeded",
+      before: { starred: false },
+      after: { starred: true },
+      receipt: {
+        requestId: "REQ-1",
+        clientMutationId: null,
+      },
+    });
+  });
+
+  it("checks cancellation immediately before the unique dispatch", async () => {
+    const github = new StatefulGitHub();
+    const service = executor(github);
+    const context = emptyExecutionContext();
+    const value = await prepared(service, starOperation(), context);
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(
+      service.dispatchPrepared(value, context, controller.signal),
+    ).rejects.toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      details: { reason: "cancelled" },
+    });
+    expect(github.mutations).toEqual([]);
+  });
+
+  it("rejects forged, context-mismatched, and reused prepared values", async () => {
+    const github = new StatefulGitHub();
+    const service = executor(github);
+    const context = emptyExecutionContext();
+    const value = await prepared(service, starOperation(), context);
+    const forged = Object.freeze({
+      operation: starOperation(),
+      before: Object.freeze({ starred: false }),
+      mutation: Object.freeze({ kind: "star", coordinates }),
+    }) as PreparedMutation;
+
+    await expect(
+      service.dispatchPrepared(forged, context),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    await expect(
+      service.dispatchPrepared(value, emptyExecutionContext()),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    await service.dispatchPrepared(value, context);
+    await expect(
+      service.dispatchPrepared(value, context),
+    ).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(github.mutations.map((call) => call.kind)).toEqual(["star"]);
+  });
+
+  it("throws reconciliation required when successful dispatch has no exact after state", async () => {
+    const github = new StatefulGitHub();
+    github.applyMutations = false;
+    const service = executor(github);
+    const context = emptyExecutionContext();
+    const value = await prepared(service, starOperation(), context);
+
+    await expect(
+      service.dispatchPrepared(value, context),
+    ).rejects.toMatchObject({
+      code: "RECONCILIATION_REQUIRED",
+      retryable: false,
+      details: { operationId: "op_star", mutationName: "star" },
+    });
+    expect(github.mutations.map((call) => call.kind)).toEqual(["star"]);
+  });
+
+  it("treats a changed repository identity during readback as reconciliation required", async () => {
+    const github = new StatefulGitHub();
+    github.afterMutation = () => {
+      github.identity = Object.freeze({
+        repositoryId: asRepositoryId("R_replaced"),
+        repositoryDatabaseId,
+        coordinates,
+      });
+    };
+    const service = executor(github);
+    const context = emptyExecutionContext();
+
+    await expect(
+      service.dispatchPrepared(
+        await prepared(service, starOperation(), context),
+        context,
+      ),
+    ).rejects.toMatchObject({
+      code: "RECONCILIATION_REQUIRED",
+      retryable: false,
+    });
+    expect(github.mutations).toHaveLength(1);
+  });
+
+  it("copies and freezes a successful mutation receipt", async () => {
+    const github = new StatefulGitHub();
+    const receipt: {
+      requestId: string | null;
+      clientMutationId: string | null;
+    } = {
+      requestId: "REQ-mutable",
+      clientMutationId: null,
+    };
+    github.star = (repository: RepositoryCoordinates, operationId: string) => {
+      github.mutations.push(
+        Object.freeze({
+          kind: "star",
+          operationId,
+          value: repository,
+        }),
+      );
+      github.starred = true;
+      return Promise.resolve(receipt);
+    };
+    const service = executor(github);
+    const context = emptyExecutionContext();
+
+    const result = await service.dispatchPrepared(
+      await prepared(service, starOperation(), context),
+      context,
+    );
+
+    expect(Object.isFrozen(result.receipt)).toBe(true);
+    receipt.requestId = "REQ-changed";
+    expect(result.receipt?.requestId).toBe("REQ-mutable");
+  });
+});
+
+describe("MutationExecutor allowlisted operations", () => {
+  it("dispatches all six named mutations exactly once with exact readback", async () => {
+    const observedKinds: MutationCall["kind"][] = [];
+
+    {
+      const github = new StatefulGitHub();
+      const service = executor(github);
+      const context = emptyExecutionContext();
+      await service.dispatchPrepared(
+        await prepared(service, starOperation(), context),
+        context,
+      );
+      observedKinds.push(...github.mutations.map((call) => call.kind));
+    }
+    {
+      const github = new StatefulGitHub();
+      github.starred = true;
+      const service = executor(github);
+      const context = emptyExecutionContext();
+      await service.dispatchPrepared(
+        await prepared(service, starOperation("unstar"), context),
+        context,
+      );
+      observedKinds.push(...github.mutations.map((call) => call.kind));
+    }
+    {
+      const github = new StatefulGitHub();
+      const service = executor(github);
+      const context = emptyExecutionContext();
+      await service.dispatchPrepared(
+        await prepared(service, createOperation(), context),
+        context,
+      );
+      observedKinds.push(...github.mutations.map((call) => call.kind));
+      expect(context.createdListIdsByOperationId.get("op_create")).toBe(
+        createdListId,
+      );
+    }
+    {
+      const github = new StatefulGitHub();
+      const service = executor(github);
+      const context = emptyExecutionContext();
+      await service.dispatchPrepared(
+        await prepared(service, updateOperation(), context),
+        context,
+      );
+      observedKinds.push(...github.mutations.map((call) => call.kind));
+    }
+    {
+      const github = new StatefulGitHub();
+      const current = github.lists.get(listId)!;
+      const service = executor(github);
+      const context = emptyExecutionContext();
+      await service.dispatchPrepared(
+        await prepared(service, deleteOperation(current), context),
+        context,
+      );
+      observedKinds.push(...github.mutations.map((call) => call.kind));
+    }
+    {
+      const github = new StatefulGitHub();
+      const targetId = asUserListId("UL_target");
+      const operation = membershipOperation(
+        Object.freeze([Object.freeze({ kind: "existing", listId: targetId })]),
+      );
+      const service = executor(github);
+      const context = emptyExecutionContext();
+      await service.dispatchPrepared(
+        await prepared(service, operation, context),
+        context,
+      );
+      observedKinds.push(...github.mutations.map((call) => call.kind));
+    }
+
+    expect(observedKinds).toEqual([
+      "star",
+      "unstar",
+      "createUserList",
+      "updateUserList",
+      "deleteUserList",
+      "setRepositoryListIds",
+    ]);
+  });
+
+  it("stores the created List ID and returns it in the succeeded after state", async () => {
+    const github = new StatefulGitHub();
+    const service = executor(github);
+    const context = emptyExecutionContext();
+    const result = await service.dispatchPrepared(
+      await prepared(service, createOperation(), context),
+      context,
+    );
+
+    expect(context.createdListIdsByOperationId).toEqual(
+      new Map([["op_create", createdListId]]),
+    );
+    expect(result).toMatchObject({
+      kind: "succeeded",
+      after: {
+        listId: createdListId,
+        name: "Created",
+        description: null,
+        isPrivate: false,
+      },
+      receipt: {
+        requestId: "REQ-1",
+        clientMutationId: "op_create",
+      },
+    });
+  });
+
+  it("resolves created targets and UTF-8 sorts unique membership IDs without changing context", async () => {
+    const utf16First = asUserListId("UL_𐀀");
+    const utf8First = asUserListId("UL_\uE000");
+    expect([utf16First, utf8First].sort()).toEqual([utf16First, utf8First]);
+    expect(
+      [utf16First, utf8First].sort((left, right) =>
+        Buffer.compare(Buffer.from(left), Buffer.from(right)),
+      ),
+    ).toEqual([utf8First, utf16First]);
+
+    const github = new StatefulGitHub();
+    github.memberships.set(repositoryId, Object.freeze([listId]));
+    const context = emptyExecutionContext();
+    context.createdListIdsByOperationId.set("op_created_a", utf16First);
+    const service = executor(github);
+    const operation = membershipOperation(
+      Object.freeze([
+        Object.freeze({ kind: "existing", listId: utf8First }),
+        Object.freeze({
+          kind: "created",
+          createOperationId: "op_created_a",
+        }),
+        Object.freeze({ kind: "existing", listId: utf8First }),
+      ]),
+    );
+
+    await service.dispatchPrepared(
+      await prepared(service, operation, context),
+      context,
+    );
+
+    expect(github.mutations).toHaveLength(1);
+    expect(github.mutations[0]).toMatchObject({
+      kind: "setRepositoryListIds",
+      value: {
+        id: repositoryId,
+        ids: [utf8First, utf16First],
+      },
+    });
+    expect(context.createdListIdsByOperationId).toEqual(
+      new Map([["op_created_a", utf16First]]),
+    );
+  });
+
+  it("fails before mutation when a created membership target is unresolved", async () => {
+    const github = new StatefulGitHub();
+    const operation = membershipOperation(
+      Object.freeze([
+        Object.freeze({
+          kind: "created",
+          createOperationId: "op_missing_create",
+        }),
+      ]),
+    );
+
+    await expect(
+      executor(github).prepare(operation, emptyExecutionContext()),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      retryable: false,
+    });
+    expect(github.mutations).toEqual([]);
+  });
+
+  it("exposes no generic dispatch method or route/document mutation", () => {
+    const github = new StatefulGitHub();
+    const service = executor(github) as unknown as Record<string, unknown>;
+
+    expect(service.request).toBeUndefined();
+    expect(service.dispatch).toBeUndefined();
+    expect(service.execute).toBeUndefined();
+    expect(Object.keys(service)).toEqual([]);
+  });
+});
