@@ -34,13 +34,23 @@ const EXPECTED_ENV = Object.freeze([
   "GITHUB_STARS_MCP_PLAN_TTL_MINUTES",
 ]);
 const PRESENTATION_EXTENSIONS = new Set([".json", ".md", ".yaml", ".yml"]);
-const ASSET_EXTENSIONS = new Set([".gif", ".jpeg", ".jpg", ".png", ".webp"]);
+const ASSET_EXTENSIONS = new Set([".png"]);
 const ALLOWED_PLUGIN_EXTENSIONS = new Set([
   ...PRESENTATION_EXTENSIONS,
   ...ASSET_EXTENSIONS,
 ]);
+const REQUIRED_PLUGIN_FILES = new Set([
+  ".codex-plugin/plugin.json",
+  ".mcp.json",
+  "skills/manage-github-stars/SKILL.md",
+]);
+const EXPECTED_PACKAGE_FILES = Object.freeze([
+  "dist",
+  "plugins/github-stars-mcp",
+  "README.md",
+  "LICENSE",
+]);
 const MANIFEST_KEYS = new Set([
-  "apps",
   "author",
   "description",
   "homepage",
@@ -219,13 +229,27 @@ async function assertPluginReference(reference, expectedKind, code) {
   );
 }
 
+async function assertManifestAssetReference(reference, code) {
+  assert(
+    typeof reference === "string" &&
+      reference.startsWith("./assets/") &&
+      reference.toLowerCase().endsWith(".png"),
+    `${code}_FORMAT`,
+  );
+  const target = resolve(PLUGIN_ROOT, reference);
+  const relativePath = relative(PLUGIN_ROOT, target).replaceAll("\\", "/");
+  assert(reference === `./${relativePath}`, `${code}_FORMAT`);
+  await assertPluginReference(reference, "file", code);
+  return relativePath;
+}
+
 async function assertPluginFile(path, code) {
   const metadata = await assertPluginPath(path, code);
   assert(metadata.isFile(), `${code}_KIND`);
   assert(metadata.size <= 1_048_576, `${code}_SIZE`);
 }
 
-async function collectPluginFiles(directory = PLUGIN_ROOT) {
+async function collectPluginTree(directory = PLUGIN_ROOT) {
   let entries;
   try {
     entries = await readdir(directory, { withFileTypes: true });
@@ -233,20 +257,24 @@ async function collectPluginFiles(directory = PLUGIN_ROOT) {
     fail("PLUGIN_TREE_MISSING");
   }
   const files = [];
+  const directories = [];
   for (const entry of entries.sort((left, right) =>
     left.name.localeCompare(right.name, "en"),
   )) {
     const path = resolve(directory, entry.name);
     const metadata = await assertPluginPath(path, "PLUGIN_TREE");
     if (metadata.isDirectory()) {
-      files.push(...(await collectPluginFiles(path)));
+      directories.push(path);
+      const nested = await collectPluginTree(path);
+      files.push(...nested.files);
+      directories.push(...nested.directories);
     } else {
       assert(metadata.isFile(), "PLUGIN_TREE_ENTRY_KIND");
       assert(metadata.size <= 1_048_576, "PLUGIN_FILE_TOO_LARGE");
       files.push(path);
     }
   }
-  return files;
+  return { directories, files };
 }
 
 function parseSkillFrontmatter(source) {
@@ -269,6 +297,7 @@ async function validateManifest() {
   const manifestPath = resolve(PLUGIN_ROOT, ".codex-plugin/plugin.json");
   await assertPluginFile(manifestPath, "MANIFEST_PATH");
   const manifest = await readJson(manifestPath, "MANIFEST");
+  assert(manifest.apps === undefined, "MANIFEST_APPS");
   assertAllowedKeys(manifest, MANIFEST_KEYS, "MANIFEST_KEYS");
   assert(manifest.name === "github-stars-mcp", "MANIFEST_NAME");
   assert(manifest.version === "1.0.0", "MANIFEST_VERSION");
@@ -293,9 +322,6 @@ async function validateManifest() {
   assert(author.url === "https://github.com/90le", "MANIFEST_AUTHOR_URL");
   await assertPluginReference(manifest.skills, "directory", "MANIFEST_SKILLS");
   await assertPluginReference(manifest.mcpServers, "file", "MANIFEST_MCP");
-  if (manifest.apps !== undefined) {
-    await assertPluginReference(manifest.apps, "file", "MANIFEST_APPS");
-  }
 
   const interfaceMetadata = assertPlainObject(
     manifest.interface,
@@ -306,12 +332,14 @@ async function validateManifest() {
     INTERFACE_KEYS,
     "MANIFEST_INTERFACE_KEYS",
   );
+  const assets = new Set();
   for (const key of ["composerIcon", "logo", "logoDark"]) {
     if (interfaceMetadata[key] !== undefined) {
-      await assertPluginReference(
-        interfaceMetadata[key],
-        "file",
-        `MANIFEST_ASSET_${key.toUpperCase()}`,
+      assets.add(
+        await assertManifestAssetReference(
+          interfaceMetadata[key],
+          `MANIFEST_ASSET_${key.toUpperCase()}`,
+        ),
       );
     }
   }
@@ -322,19 +350,15 @@ async function validateManifest() {
       "MANIFEST_ASSET_SCREENSHOTS",
     );
     for (const screenshot of interfaceMetadata.screenshots) {
-      assert(
-        typeof screenshot === "string" &&
-          screenshot.startsWith("./assets/") &&
-          screenshot.toLowerCase().endsWith(".png"),
-        "MANIFEST_ASSET_SCREENSHOTS",
-      );
-      await assertPluginReference(
-        screenshot,
-        "file",
-        "MANIFEST_ASSET_SCREENSHOT",
+      assets.add(
+        await assertManifestAssetReference(
+          screenshot,
+          "MANIFEST_ASSET_SCREENSHOT",
+        ),
       );
     }
   }
+  return assets;
 }
 
 async function validateMcpConfiguration() {
@@ -450,34 +474,92 @@ function hasBytes(contents, offset, expected) {
   return expected.every((value, index) => contents[offset + index] === value);
 }
 
-function validAsset(contents, extension) {
-  if (extension === ".png") {
-    return hasBytes(
-      contents,
-      0,
-      [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a],
-    );
+function pngCrc32(contents, start, end) {
+  let crc = 0xffffffff;
+  for (let offset = start; offset < end; offset += 1) {
+    crc ^= contents[offset];
+    for (let bit = 0; bit < 8; bit += 1) {
+      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+    }
   }
-  if (extension === ".jpg" || extension === ".jpeg") {
-    return hasBytes(contents, 0, [0xff, 0xd8, 0xff]);
-  }
-  if (extension === ".gif") {
-    return (
-      contents.subarray(0, 6).toString("ascii") === "GIF87a" ||
-      contents.subarray(0, 6).toString("ascii") === "GIF89a"
-    );
-  }
-  if (extension === ".webp") {
-    return (
-      contents.subarray(0, 4).toString("ascii") === "RIFF" &&
-      contents.subarray(8, 12).toString("ascii") === "WEBP"
-    );
-  }
-  return false;
+  return (crc ^ 0xffffffff) >>> 0;
 }
 
-async function validatePluginTree() {
-  const files = await collectPluginFiles();
+function validPng(contents) {
+  if (
+    !hasBytes(contents, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  ) {
+    return false;
+  }
+
+  let offset = 8;
+  let chunkIndex = 0;
+  let seenIhdr = false;
+  let seenIdat = false;
+  let seenIend = false;
+  while (offset < contents.length) {
+    if (seenIend || contents.length - offset < 12) return false;
+    const length = contents.readUInt32BE(offset);
+    if (length > contents.length - offset - 12) return false;
+
+    const typeStart = offset + 4;
+    const dataStart = offset + 8;
+    const crcStart = dataStart + length;
+    const nextOffset = crcStart + 4;
+    const type = contents.subarray(typeStart, dataStart).toString("ascii");
+    if (
+      !/^[A-Za-z]{4}$/u.test(type) ||
+      pngCrc32(contents, typeStart, crcStart) !==
+        contents.readUInt32BE(crcStart)
+    ) {
+      return false;
+    }
+
+    if (type === "IHDR") {
+      if (chunkIndex !== 0 || seenIhdr || length !== 13) return false;
+      seenIhdr = true;
+    } else if (chunkIndex === 0) {
+      return false;
+    }
+
+    if (type === "IDAT") seenIdat = true;
+    if (type === "IEND") {
+      if (seenIend || length !== 0 || nextOffset !== contents.length) {
+        return false;
+      }
+      seenIend = true;
+    }
+
+    offset = nextOffset;
+    chunkIndex += 1;
+  }
+  return seenIhdr && seenIdat && seenIend;
+}
+
+function validAsset(contents, extension) {
+  return extension === ".png" && validPng(contents);
+}
+
+function pluginRelativePath(path) {
+  return relative(PLUGIN_ROOT, path).replaceAll("\\", "/");
+}
+
+function parentDirectories(paths) {
+  const directories = new Set();
+  for (const path of paths) {
+    const segments = path.split("/");
+    segments.pop();
+    let current = "";
+    for (const segment of segments) {
+      current = current === "" ? segment : `${current}/${segment}`;
+      directories.add(current);
+    }
+  }
+  return directories;
+}
+
+async function validatePluginTree(assets) {
+  const { directories, files } = await collectPluginTree();
   assert(files.length > 0, "PLUGIN_EMPTY");
   for (const path of files) {
     const extension = extname(path).toLowerCase();
@@ -516,6 +598,26 @@ async function validatePluginTree() {
       assert(!/\b(?:TODO|TBD)\b/u.test(source), "PLUGIN_PLACEHOLDER");
     }
   }
+
+  const expectedFiles = new Set([...REQUIRED_PLUGIN_FILES, ...assets]);
+  const actualFiles = files.map(pluginRelativePath);
+  assert(
+    actualFiles.length === expectedFiles.size &&
+      actualFiles.every((path) => expectedFiles.has(path)),
+    "PLUGIN_TREE_CONTENTS",
+  );
+
+  const requiredDirectories = parentDirectories(expectedFiles);
+  const allowedDirectories = new Set(requiredDirectories);
+  allowedDirectories.add("assets");
+  const actualDirectories = directories.map(pluginRelativePath);
+  assert(
+    actualDirectories.every((path) => allowedDirectories.has(path)) &&
+      [...requiredDirectories].every((path) =>
+        actualDirectories.includes(path),
+      ),
+    "PLUGIN_TREE_DIRECTORIES",
+  );
 }
 
 function validateArguments() {
@@ -569,10 +671,9 @@ async function validateRepositoryBoundary() {
 async function validatePackageMetadata() {
   const packageMetadata = await readJson(PACKAGE_PATH, "PACKAGE");
   assert(packageMetadata.name === "github-stars-mcp", "PACKAGE_NAME");
-  assert(Array.isArray(packageMetadata.files), "PACKAGE_FILES");
-  assert(
-    packageMetadata.files.includes("plugins/github-stars-mcp") &&
-      !packageMetadata.files.includes("plugins"),
+  assertExactArray(
+    packageMetadata.files,
+    EXPECTED_PACKAGE_FILES,
     "PACKAGE_FILES",
   );
 }
@@ -623,6 +724,30 @@ async function validatePackageDryRun(staticOnly) {
     assert(typeof record.path === "string", "PACKAGE_DRY_RUN_FILE_PATH");
     return record.path;
   });
+  assert(
+    new Set(paths).size === paths.length &&
+      paths.every((path) => {
+        const segments = path.split("/");
+        if (
+          path.includes("\\") ||
+          path.includes("\0") ||
+          segments.some(
+            (segment) =>
+              segment.length === 0 || segment === "." || segment === "..",
+          )
+        ) {
+          return false;
+        }
+        return (
+          path === "package.json" ||
+          path === "README.md" ||
+          path === "LICENSE" ||
+          path.startsWith("dist/") ||
+          path.startsWith("plugins/github-stars-mcp/")
+        );
+      }),
+    "PACKAGE_DRY_RUN_CONTENTS",
+  );
   for (const expected of [
     "plugins/github-stars-mcp/.codex-plugin/plugin.json",
     "plugins/github-stars-mcp/.mcp.json",
@@ -677,7 +802,17 @@ async function findCodexCommand() {
 }
 
 function isolatedEnvironment(home) {
-  const environment = { ...process.env, CODEX_HOME: home };
+  const environment = {
+    ...process.env,
+    CODEX_HOME: home,
+    HOME: home,
+    USERPROFILE: home,
+    XDG_CACHE_HOME: join(home, "xdg-cache"),
+    XDG_CONFIG_HOME: join(home, "xdg-config"),
+    XDG_DATA_HOME: join(home, "xdg-data"),
+    XDG_RUNTIME_DIR: join(home, "xdg-runtime"),
+    XDG_STATE_HOME: join(home, "xdg-state"),
+  };
   for (const key of [
     "GITHUB_STARS_TOKEN",
     "GITHUB_TOKEN",
@@ -702,6 +837,63 @@ function runCodex(command, arguments_, root, home, code) {
     ),
     `${code}_JSON`,
   );
+}
+
+async function assertSameCanonicalPath(actual, expected, code) {
+  assert(typeof actual === "string" && actual.length > 0, code);
+  let actualCanonical;
+  let expectedCanonical;
+  try {
+    [actualCanonical, expectedCanonical] = await Promise.all([
+      realpath(actual),
+      realpath(expected),
+    ]);
+  } catch {
+    fail(code);
+  }
+  assert(actualCanonical === expectedCanonical, code);
+}
+
+async function validateCodexPluginList(value, expectedSource) {
+  const code = "CODEX_PLUGIN_LIST_CONTENTS";
+  const result = assertPlainObject(value, code);
+  assertExactKeys(result, ["available", "installed"], code);
+  assert(
+    Array.isArray(result.installed) &&
+      result.installed.length === 1 &&
+      Array.isArray(result.available) &&
+      result.available.length === 0,
+    code,
+  );
+  const plugin = assertPlainObject(result.installed[0], code);
+  assert(
+    plugin.pluginId === "github-stars-mcp@personal" &&
+      plugin.name === "github-stars-mcp" &&
+      plugin.marketplaceName === "personal" &&
+      plugin.version === "1.0.0" &&
+      plugin.installed === true &&
+      plugin.enabled === true,
+    code,
+  );
+  const source = assertPlainObject(plugin.source, code);
+  assertExactKeys(source, ["path", "source"], code);
+  assert(source.source === "local", code);
+  await assertSameCanonicalPath(source.path, expectedSource, code);
+}
+
+function validateCodexMcp(value) {
+  const code = "CODEX_MCP_CONTENTS";
+  const server = assertPlainObject(value, code);
+  assert(server.name === "github-stars-mcp" && server.enabled === true, code);
+  const transport = assertPlainObject(server.transport, code);
+  assert(transport.type === "stdio" && transport.command === "npx", code);
+  assertExactArray(
+    transport.args,
+    ["-y", "github-stars-mcp@1.0.0", "--stdio"],
+    code,
+  );
+  assertExactArray(transport.env_vars, EXPECTED_ENV, code);
+  assert(server.tool_timeout_sec === 900, code);
 }
 
 async function validateWithCodex(staticOnly) {
@@ -747,9 +939,9 @@ async function validateWithCodex(staticOnly) {
       home,
       "CODEX_PLUGIN_LIST",
     );
-    assert(
-      JSON.stringify(plugins).includes("github-stars-mcp"),
-      "CODEX_PLUGIN_LIST_CONTENTS",
+    await validateCodexPluginList(
+      plugins,
+      join(marketplaceRoot, "plugins/github-stars-mcp"),
     );
     const server = runCodex(
       command,
@@ -758,17 +950,7 @@ async function validateWithCodex(staticOnly) {
       home,
       "CODEX_MCP_GET",
     );
-    const serialized = JSON.stringify(server);
-    for (const expected of [
-      "github-stars-mcp",
-      "npx",
-      "github-stars-mcp@1.0.0",
-      "--stdio",
-      "GITHUB_STARS_TOKEN",
-      "GITHUB_STARS_MCP_PLAN_TTL_MINUTES",
-    ]) {
-      assert(serialized.includes(expected), "CODEX_MCP_CONTENTS");
-    }
+    validateCodexMcp(server);
   } finally {
     await rm(fixture, { recursive: true, force: true });
   }
@@ -777,12 +959,12 @@ async function validateWithCodex(staticOnly) {
 async function main() {
   const staticOnly = validateArguments();
   await validateRepositoryBoundary();
-  await validateManifest();
+  const assets = await validateManifest();
   await validateMcpConfiguration();
   await validateMarketplace();
   await validatePackageMetadata();
   await validateSkill();
-  await validatePluginTree();
+  await validatePluginTree(assets);
   await validatePackageDryRun(staticOnly);
   await validateWithCodex(staticOnly);
   process.stdout.write("Validated Codex plugin github-stars-mcp\n");
