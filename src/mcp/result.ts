@@ -1,10 +1,7 @@
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { types as utilTypes } from "node:util";
 import type { RateLimitState } from "../app/ports/github-port.js";
-import {
-  canonicalJsonClone,
-  freezeJsonValue,
-} from "../domain/canonical-json.js";
+import { canonicalJsonClone } from "../domain/canonical-json.js";
 import {
   AppError,
   serializeError,
@@ -125,6 +122,34 @@ function hasSetValue<T>(target: ReadonlySet<T>, value: T): boolean {
 
 function addSetValue<T>(target: Set<T>, value: T): void {
   INTRINSICS.reflectApply(INTRINSICS.setAdd, target, [value]);
+}
+
+function freezeOutputGraph<T>(value: T): T {
+  if (value === null || typeof value !== "object") return value;
+
+  const descriptors = INTRINSICS.objectGetOwnPropertyDescriptors(value);
+  if (!INTRINSICS.objectHasOwn(descriptors, "toJSON")) {
+    INTRINSICS.objectDefineProperty(value, "toJSON", {
+      configurable: false,
+      enumerable: false,
+      value: undefined,
+      writable: false,
+    });
+  }
+
+  const keys = INTRINSICS.objectKeys(descriptors);
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (key === undefined) return invalidInput();
+    const descriptor = descriptors[key];
+    if (
+      descriptor !== undefined &&
+      INTRINSICS.objectHasOwn(descriptor, "value")
+    ) {
+      freezeOutputGraph(descriptor.value);
+    }
+  }
+  return INTRINSICS.objectFreeze(value);
 }
 
 function charCodeAt(value: string, index: number): number {
@@ -551,14 +576,11 @@ function sanitizeSuccessText(
 }
 
 function createTextContent(text: string) {
-  const item = INTRINSICS.objectFreeze({ type: "text" as const, text });
-  const content = [item];
-  INTRINSICS.objectFreeze(content);
-  return content;
+  return freezeOutputGraph([{ type: "text" as const, text }]);
 }
 
 function frozenJson(value: JsonValue): JsonValue {
-  return freezeJsonValue(value);
+  return freezeOutputGraph(value);
 }
 
 function sanitizedFailureDetails(value: JsonValue): JsonValue {
@@ -568,7 +590,7 @@ function sanitizedFailureDetails(value: JsonValue): JsonValue {
     const sanitized = sanitizeJsonValue(redacted, FAILURE_OMITTED_KEYS);
     return frozenJson(canonicalJsonClone(sanitized));
   } catch {
-    return INTRINSICS.objectFreeze({});
+    return freezeOutputGraph({});
   }
 }
 
@@ -786,13 +808,13 @@ function createFailureResult(
   details: JsonValue,
   requestId: string,
 ): CallToolResult {
-  const error = INTRINSICS.objectFreeze({
+  const error = freezeOutputGraph({
     code,
     message,
     retryable,
     details,
   });
-  const structuredContent = INTRINSICS.objectFreeze({
+  const structuredContent = freezeOutputGraph({
     schema_version: "1",
     ok: false,
     request_id: requestId,
@@ -804,14 +826,14 @@ function createFailureResult(
     content: createTextContent(text),
     structuredContent,
   };
-  return INTRINSICS.objectFreeze(result);
+  return freezeOutputGraph(result);
 }
 
 const TOTAL_FAILURE_RESULT = createFailureResult(
   "INTERNAL_ERROR",
   "An unexpected internal error occurred",
   false,
-  INTRINSICS.objectFreeze({}),
+  freezeOutputGraph({}),
   INVALID_REQUEST_ID,
 );
 
@@ -852,11 +874,11 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
       ),
     );
   }
-  INTRINSICS.objectFreeze(sanitizedWarnings);
+  freezeOutputGraph(sanitizedWarnings);
   const sanitizedRateLimit =
     rateLimit === null
       ? null
-      : INTRINSICS.objectFreeze({
+      : freezeOutputGraph({
           remaining: rateLimit.remaining,
           resetAt: rateLimit.resetAt,
         });
@@ -870,7 +892,7 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
     MAX_SUMMARY_LENGTH,
   );
 
-  const structuredContent = INTRINSICS.objectFreeze({
+  const structuredContent = freezeOutputGraph({
     schema_version: "1",
     ok: true,
     request_id: requestId,
@@ -883,7 +905,7 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
     content: createTextContent(sanitizedSummary),
     structuredContent,
   };
-  return INTRINSICS.objectFreeze(result);
+  return freezeOutputGraph(result);
 }
 
 export function toolFailure(error: unknown, requestId: string): CallToolResult {

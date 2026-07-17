@@ -1,3 +1,4 @@
+import { types as utilTypes } from "node:util";
 import type { JsonValue } from "./json.js";
 import { redactSecrets, snapshotSecretRegistry } from "./redaction.js";
 
@@ -36,6 +37,7 @@ const INTRINSICS = freezeIntrinsic({
   objectGetOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
   objectHasOwn: Object.hasOwn,
   reflectApply: Reflect.apply,
+  utilIsProxy: utilTypes.isProxy,
 });
 
 interface AppErrorOptions {
@@ -151,6 +153,7 @@ function isAppError(error: unknown): error is AppError {
 
 export function serializeError(error: unknown): SerializedDomainError {
   try {
+    if (INTRINSICS.utilIsProxy(error)) return internalError();
     return isAppError(error) ? serializeAppError(error) : internalError();
   } catch {
     return internalError();

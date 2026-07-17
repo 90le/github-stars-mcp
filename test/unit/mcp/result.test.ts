@@ -905,6 +905,85 @@ describe("captured result intrinsics", () => {
     }
   });
 
+  it("keeps result JSON stable after inherited toJSON hooks are installed", () => {
+    const results = [
+      toolSuccess(
+        { nested: { items: [{ value: "success" }] } },
+        {
+          requestId: "req_to_json_success",
+          summary: "success",
+          warnings: ["warning"],
+          rateLimit: {
+            remaining: 1,
+            resetAt: "2026-07-16T08:00:00.000Z",
+          },
+        },
+      ),
+      toolFailure(
+        new AppError("NOT_FOUND", "missing", {
+          details: { nested: { items: [{ value: "failure" }] } },
+        }),
+        "req_to_json_failure",
+      ),
+    ] as const;
+    const expected = results.map((result) => JSON.stringify(result));
+    const objectToJsonDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      "toJSON",
+    );
+    const arrayToJsonDescriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      "toJSON",
+    );
+    let objectHookCalls = 0;
+    let arrayHookCalls = 0;
+    let objectSerialized: readonly (string | undefined)[] = [];
+    let arraySerialized: readonly (string | undefined)[] = [];
+
+    try {
+      Object.defineProperty(Object.prototype, "toJSON", {
+        configurable: true,
+        value() {
+          objectHookCalls += 1;
+          return { attacker: "object-prototype-rewrite" };
+        },
+      });
+      objectSerialized = results.map((result) => JSON.stringify(result));
+    } finally {
+      if (objectToJsonDescriptor === undefined) {
+        Reflect.deleteProperty(Object.prototype, "toJSON");
+      } else {
+        Object.defineProperty(
+          Object.prototype,
+          "toJSON",
+          objectToJsonDescriptor,
+        );
+      }
+    }
+
+    try {
+      Object.defineProperty(Array.prototype, "toJSON", {
+        configurable: true,
+        value() {
+          arrayHookCalls += 1;
+          return ["array-prototype-rewrite"];
+        },
+      });
+      arraySerialized = results.map((result) => JSON.stringify(result));
+    } finally {
+      if (arrayToJsonDescriptor === undefined) {
+        Reflect.deleteProperty(Array.prototype, "toJSON");
+      } else {
+        Object.defineProperty(Array.prototype, "toJSON", arrayToJsonDescriptor);
+      }
+    }
+
+    expect(objectHookCalls).toBe(0);
+    expect(arrayHookCalls).toBe(0);
+    expect(objectSerialized).toEqual(expected);
+    expect(arraySerialized).toEqual(expected);
+  });
+
   it("does not invoke inherited array index setters while building results", () => {
     const indexDescriptor = Object.getOwnPropertyDescriptor(
       Array.prototype,

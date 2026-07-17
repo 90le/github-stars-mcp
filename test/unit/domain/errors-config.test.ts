@@ -1080,6 +1080,34 @@ describe("domain errors and redaction", () => {
     expect(serialized.details).toEqual({});
     expect(JSON.stringify(serialized)).not.toContain(arbitrarySecret);
   });
+
+  test("serializes a top-level Proxy fail-closed without invoking its prototype trap", () => {
+    const arbitrarySecret = "proxied-error-prototype-secret";
+    let prototypeTrapCalls = 0;
+    const proxied = new Proxy(
+      new AppError("AUTH_REQUIRED", arbitrarySecret, {
+        details: { echo: arbitrarySecret },
+        secrets: [arbitrarySecret],
+      }),
+      {
+        getPrototypeOf: () => {
+          prototypeTrapCalls += 1;
+          throw new Error(arbitrarySecret);
+        },
+      },
+    );
+
+    const serialized = serializeError(proxied);
+
+    expect(prototypeTrapCalls).toBe(0);
+    expect(serialized).toEqual({
+      code: "INTERNAL_ERROR",
+      message: "An unexpected internal error occurred",
+      retryable: false,
+      details: {},
+    });
+    expect(JSON.stringify(serialized)).not.toContain(arbitrarySecret);
+  });
 });
 
 describe("configuration", () => {
