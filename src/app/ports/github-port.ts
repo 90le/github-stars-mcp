@@ -75,13 +75,19 @@ export type GitHubSearchPage = Readonly<{
   rateLimit: RateLimitState | null;
 }>;
 
-export interface GitHubPort {
+export interface GitHubStatusReadPort {
   getViewer(signal?: AbortSignal): Promise<AccountBinding>;
   probeCapabilities(signal?: AbortSignal): Promise<GitHubCapabilities>;
+}
+
+export interface GitHubStarReadPort extends GitHubStatusReadPort {
   listStarredRepositories(
     cursor: string | null,
     signal?: AbortSignal,
   ): Promise<Page<GitHubStar>>;
+}
+
+export interface GitHubListReadPort {
   listUserLists(
     cursor: string | null,
     signal?: AbortSignal,
@@ -91,12 +97,24 @@ export interface GitHubPort {
     cursor: string | null,
     signal?: AbortSignal,
   ): Promise<Page<GitHubListItem>>;
+}
+
+export interface GitHubSyncReadPort
+  extends GitHubStarReadPort, GitHubListReadPort {}
+
+export interface GitHubEvidenceReadPort {
   getReadme(
     repository: RepositoryCoordinates,
     signal?: AbortSignal,
   ): Promise<GitHubReadme | null>;
+}
+
+export interface GitHubDiscoveryReadPort {
   searchRepositories(
     input: GitHubSearchInput,
     signal?: AbortSignal,
   ): Promise<GitHubSearchPage>;
 }
+
+export interface GitHubPort
+  extends GitHubSyncReadPort, GitHubEvidenceReadPort, GitHubDiscoveryReadPort {}

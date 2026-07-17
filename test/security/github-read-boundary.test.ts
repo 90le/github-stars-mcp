@@ -9,10 +9,14 @@ const ALLOWLIST_SOURCE = new URL(
   "../../src/github/allowed-operations.ts",
   import.meta.url,
 );
+const ADAPTER_SOURCE = new URL(
+  "../../src/github/octokit-github-adapter.ts",
+  import.meta.url,
+);
 
 function interfaceMethodNames(source: string, interfaceName: string): string[] {
   const interfaceBody = new RegExp(
-    `export interface ${interfaceName}\\s*\\{(?<body>[\\s\\S]*?)\\n\\}`,
+    `export interface ${interfaceName}(?:\\s+extends[^\\{]+)?\\s*\\{(?<body>[\\s\\S]*?)\\n\\}`,
     "u",
   ).exec(source)?.groups?.body;
 
@@ -30,17 +34,22 @@ describe("GitHub read capability boundary", () => {
   it("exposes only approved named application operations", async () => {
     const source = await readFile(PORT_SOURCE, "utf8");
 
-    expect(interfaceMethodNames(source, "GitHubPort")).toEqual(
-      [
-        "getReadme",
-        "getViewer",
-        "listStarredRepositories",
-        "listUserListItems",
-        "listUserLists",
-        "probeCapabilities",
-        "searchRepositories",
-      ].sort(),
-    );
+    const methods = [
+      ...interfaceMethodNames(source, "GitHubStatusReadPort"),
+      ...interfaceMethodNames(source, "GitHubStarReadPort"),
+      ...interfaceMethodNames(source, "GitHubListReadPort"),
+      ...interfaceMethodNames(source, "GitHubEvidenceReadPort"),
+      ...interfaceMethodNames(source, "GitHubDiscoveryReadPort"),
+    ];
+    expect([...new Set(methods)].sort()).toEqual([
+      "getReadme",
+      "getViewer",
+      "listStarredRepositories",
+      "listUserListItems",
+      "listUserLists",
+      "probeCapabilities",
+      "searchRepositories",
+    ]);
     expect(source).not.toMatch(
       /\b(?:request|graphql|rawRequest|deleteRepository|archiveRepository|transferRepository|updateRepository|updateFile|createOrUpdateFile|deleteFile|createCommit)\s*\(/u,
     );
@@ -54,6 +63,21 @@ describe("GitHub read capability boundary", () => {
     expect(source).not.toMatch(/https?:\/\//u);
     expect(source).not.toMatch(
       /\b(?:deleteRepository|archiveRepository|transferRepository|updateRepository|updateFile|createOrUpdateFile|deleteFile|createCommit)\b/u,
+    );
+  });
+
+  it("keeps caller URL, document, header, media, and host overrides out of the adapter", async () => {
+    const source = await readFile(ADAPTER_SOURCE, "utf8");
+
+    expect(source).not.toMatch(
+      /\b(?:baseUrl|authorization|userAgent|apiVersion|documentOverride|mediaType)\b/u,
+    );
+    expect(source).not.toMatch(
+      /Object\.freeze\(\{\s*(?:headers?|accept|url|document)\s*:/u,
+    );
+    expect(source).not.toMatch(/constructor\s*\(\s*transport\s*:[^,)]*,/u);
+    expect(source).not.toMatch(
+      /\b(?:getReadme|searchRepositories|deleteRepository|archiveRepository|transferRepository)\s*\(/u,
     );
   });
 });
