@@ -1091,6 +1091,270 @@ describe("closed GitHub live read and mutation boundary", () => {
     ).toThrow("colliding header names");
   });
 
+  it("rejects an operation ID containing the credential before REST dispatch or error details", async () => {
+    const credential = "github_pat_contract-secret";
+    const harness = transportHarness([
+      () => {
+        throw new Error("must not dispatch a credential operation ID");
+      },
+    ]);
+
+    const error = await caught(
+      harness.transport.restMutation("star", restRepository, credential),
+    );
+
+    expect(error).toMatchObject({
+      code: "VALIDATION_ERROR",
+      retryable: false,
+    });
+    expect(harness.requests).toEqual([]);
+    expect(JSON.stringify(serializeError(error))).not.toContain(credential);
+    expect(JSON.stringify(error)).not.toContain(credential);
+  });
+
+  it("never returns a credential-valued request ID receipt", async () => {
+    const credential = "github_pat_contract-secret";
+    const harness = transportHarness([
+      () =>
+        jsonResponse(204, null, {
+          "x-github-request-id": credential,
+        }),
+    ]);
+    const adapter = new OctokitGitHubAdapter(harness.transport);
+
+    const error = await caught(adapter.star(repository, "op_secret_header"));
+
+    expect(error).toMatchObject({
+      code: "RECONCILIATION_REQUIRED",
+      retryable: false,
+    });
+    expect(harness.requests).toHaveLength(1);
+    expect(JSON.stringify(serializeError(error))).not.toContain(credential);
+    expect(JSON.stringify(error)).not.toContain(credential);
+  });
+
+  it("fails closed when native Headers merge duplicate request IDs", async () => {
+    const headers = new Headers();
+    headers.append("X-GitHub-Request-ID", "ONE");
+    headers.append("x-github-request-id", "TWO");
+    expect(headers.get("x-github-request-id")).toBe("ONE, TWO");
+    const harness = transportHarness([
+      () =>
+        new Response(null, {
+          status: 204,
+          headers,
+        }),
+    ]);
+    const adapter = new OctokitGitHubAdapter(harness.transport);
+
+    const error = await caught(adapter.star(repository, "op_colliding_header"));
+
+    expect(error).toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      retryable: false,
+    });
+    expect(harness.requests).toHaveLength(1);
+    expect(JSON.stringify(error)).not.toMatch(/ONE|TWO/u);
+  });
+
+  it.each([
+    [
+      "REST owner",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.restMutation(
+          "star",
+          { owner: "octo\u0085cat", repo: "tool" },
+          "op_c1_owner",
+        ),
+    ],
+    [
+      "REST repository name",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.restMutation(
+          "star",
+          { owner: "octocat", repo: "to\u0085ol" },
+          "op_c1_repo",
+        ),
+    ],
+    [
+      "operation ID",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.restMutation("star", restRepository, "op_c1\u0085"),
+    ],
+    [
+      "List name",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.graphqlMutation(
+          "createUserList",
+          {
+            name: "New\u0085List",
+            description: null,
+            isPrivate: false,
+            clientMutationId: "op_c1_name",
+          },
+          "op_c1_name",
+        ),
+    ],
+    [
+      "List description",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.graphqlMutation(
+          "createUserList",
+          {
+            name: "New",
+            description: "unsafe\u009fdescription",
+            isPrivate: false,
+            clientMutationId: "op_c1_description",
+          },
+          "op_c1_description",
+        ),
+    ],
+    [
+      "stable List ID",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.graphqlMutation(
+          "deleteUserList",
+          {
+            listId: "UL_\u0085",
+            clientMutationId: "op_c1_list_id",
+          },
+          "op_c1_list_id",
+        ),
+    ],
+    [
+      "membership ID",
+      (harness: ReturnType<typeof transportHarness>) =>
+        harness.transport.graphqlMutation(
+          "setRepositoryListIds",
+          {
+            itemId: "R_1",
+            listIds: ["UL_safe", "UL_\u0085"],
+            clientMutationId: "op_c1_membership",
+          },
+          "op_c1_membership",
+        ),
+    ],
+  ] as const)(
+    "rejects C1 controls in %s before physical dispatch",
+    async (_label, invoke) => {
+      const harness = transportHarness([
+        () => {
+          throw new Error("must not dispatch C1 text");
+        },
+      ]);
+
+      const error = await caught(invoke(harness));
+
+      expect(error).toMatchObject({
+        code: "VALIDATION_ERROR",
+        retryable: false,
+      });
+      expect(harness.requests).toEqual([]);
+      expect(JSON.stringify(error)).not.toContain("\u0085");
+      expect(JSON.stringify(error)).not.toContain("\u009f");
+    },
+  );
+
+  it.each([
+    [
+      "repository owner",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.star(
+          Object.freeze({ owner: "octo\u0085cat", name: "tool" }),
+          "op_adapter_owner",
+        ),
+    ],
+    [
+      "repository name",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.star(
+          Object.freeze({ owner: "octocat", name: "to\u0085ol" }),
+          "op_adapter_name",
+        ),
+    ],
+    [
+      "operation ID",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.star(repository, "op_adapter\u0085"),
+    ],
+    [
+      "List name",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.createUserList(
+          Object.freeze({
+            name: "unsafe\u0085name",
+            description: null,
+            isPrivate: false,
+          }),
+          "op_adapter_list_name",
+        ),
+    ],
+    [
+      "List description",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.createUserList(
+          Object.freeze({
+            name: "safe",
+            description: "unsafe\u009fdescription",
+            isPrivate: false,
+          }),
+          "op_adapter_list_description",
+        ),
+    ],
+    [
+      "stable ID",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.deleteUserList(asUserListId("UL_\u0085"), "op_adapter_list_id"),
+    ],
+    [
+      "membership ID",
+      (adapter: OctokitGitHubAdapter) =>
+        adapter.setRepositoryListIds(
+          asRepositoryId("R_1"),
+          [asUserListId("UL_\u0085")],
+          "op_adapter_membership_id",
+        ),
+    ],
+  ] as const)(
+    "rejects C1 controls in adapter %s with zero scripted requests",
+    async (_label, invoke) => {
+      const scripted = createScriptedGitHubAdapter([]);
+      const error = await caught(invoke(scripted.adapter));
+
+      expect(error).toMatchObject({
+        code: "VALIDATION_ERROR",
+        retryable: false,
+      });
+      expect(scripted.requests).toEqual([]);
+      expect(JSON.stringify(error)).not.toContain("\u0085");
+      expect(JSON.stringify(error)).not.toContain("\u009f");
+    },
+  );
+
+  it("rejects a C1 request ID without returning it", async () => {
+    const scripted = createScriptedGitHubAdapter([
+      {
+        kind: "rest",
+        operation: "star",
+        method: "PUT",
+        path: "/user/starred/{owner}/{repo}",
+        status: 204,
+        headers: { "x-github-request-id": "REQ\u0085SECRET" },
+      },
+    ]);
+
+    const error = await caught(
+      scripted.adapter.star(repository, "op_c1_request_id"),
+    );
+
+    expect(error).toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      retryable: false,
+    });
+    expect(scripted.requests).toHaveLength(1);
+    expect(JSON.stringify(error)).not.toContain("REQ\u0085SECRET");
+  });
+
   it("serializes ambiguous errors without transport causes or credentials", () => {
     const raw = new Error(
       "github_pat_raw-cause-secret authorization: bearer raw",

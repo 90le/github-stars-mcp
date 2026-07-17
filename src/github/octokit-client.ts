@@ -180,7 +180,9 @@ function originRejected(operation: string): AppError {
 function controlFree(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
-    if (codeUnit <= 0x1f || codeUnit === 0x7f) return false;
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) {
+      return false;
+    }
   }
   return true;
 }
@@ -1997,7 +1999,10 @@ export function createOctokitTransport(
             : invalidInput("invalid_parameters", operation),
         );
       }
-      if (containsSecret(copiedParameters, token)) {
+      if (
+        containsSecret(copiedOperationId, token) ||
+        containsSecret(copiedParameters, token)
+      ) {
         return Promise.reject(invalidInput("invalid_parameters", operation));
       }
       const expected = expectedRestMutationRequest(operation, copiedParameters);
@@ -2043,7 +2048,11 @@ export function createOctokitTransport(
               },
             },
           )) as OctokitResponse<unknown>;
-          return normalizedRestResponse<T>(response, rateGate);
+          const normalized = normalizedRestResponse<T>(response, rateGate);
+          if (containsSecret(normalized.headers, token)) {
+            throw new BoundaryFailure("malformed_envelope");
+          }
+          return normalized;
         },
       );
     },
@@ -2073,7 +2082,10 @@ export function createOctokitTransport(
             : invalidInput("invalid_parameters", operation),
         );
       }
-      if (containsSecret(copiedVariables, token)) {
+      if (
+        containsSecret(copiedOperationId, token) ||
+        containsSecret(copiedVariables, token)
+      ) {
         return Promise.reject(invalidInput("invalid_parameters", operation));
       }
       const expected: ExpectedRequest = {
@@ -2122,7 +2134,11 @@ export function createOctokitTransport(
               ...(signal === undefined ? {} : { signal }),
             },
           })) as OctokitResponse<unknown>;
-          return normalizedGraphqlResponse<T>(response, rateGate);
+          const normalized = normalizedGraphqlResponse<T>(response, rateGate);
+          if (containsSecret(normalized.headers, token)) {
+            throw new BoundaryFailure("malformed_envelope");
+          }
+          return normalized;
         },
       );
     },

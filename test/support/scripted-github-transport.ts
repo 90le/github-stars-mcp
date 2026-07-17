@@ -151,16 +151,27 @@ function cloneFixtureValue(
       throw new InvalidFixtureValue();
     }
     const descriptors = Object.getOwnPropertyDescriptors(value as object);
+    const lengthDescriptor = descriptors.length;
+    if (
+      lengthDescriptor === undefined ||
+      !Object.hasOwn(lengthDescriptor, "value") ||
+      typeof lengthDescriptor.value !== "number" ||
+      !Number.isSafeInteger(lengthDescriptor.value) ||
+      lengthDescriptor.value < 0
+    ) {
+      throw new InvalidFixtureValue();
+    }
+    const length = lengthDescriptor.value;
     const keys = Reflect.ownKeys(descriptors);
     if (
       keys.some((key) => typeof key !== "string") ||
-      keys.length !== value.length + 1
+      keys.length !== length + 1
     ) {
       throw new InvalidFixtureValue();
     }
     const copy: unknown[] = [];
     copies.set(value, copy);
-    for (let index = 0; index < value.length; index += 1) {
+    for (let index = 0; index < length; index += 1) {
       const key = String(index);
       const descriptor = descriptors[key];
       if (
@@ -177,7 +188,7 @@ function cloneFixtureValue(
         writable: true,
       });
     }
-    copy.length = value.length;
+    copy.length = length;
     active.delete(value);
     return Object.freeze(copy);
   }
@@ -333,7 +344,9 @@ function scriptedStableText(
   }
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
-    if (codeUnit <= 0x1f || codeUnit === 0x7f) return null;
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) {
+      return null;
+    }
     if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
       if (!(next >= 0xdc00 && next <= 0xdfff)) return null;
@@ -350,7 +363,9 @@ function scriptedDescription(value: unknown): string | null | undefined {
   if (typeof value !== "string" || value.length > 1_024) return undefined;
   for (let index = 0; index < value.length; index += 1) {
     const codeUnit = value.charCodeAt(index);
-    if (codeUnit <= 0x1f || codeUnit === 0x7f) return undefined;
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) {
+      return undefined;
+    }
     if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
       const next = value.charCodeAt(index + 1);
       if (!(next >= 0xdc00 && next <= 0xdfff)) return undefined;
@@ -832,19 +847,72 @@ function requestLabel(
   return `${kind}:${operation}`;
 }
 
+function validatedTranscriptLength(transcript: unknown): number {
+  if (
+    transcript === null ||
+    typeof transcript !== "object" ||
+    utilTypes.isProxy(transcript) ||
+    !Array.isArray(transcript)
+  ) {
+    throw new Error(FIXTURE_VALUE_ERROR);
+  }
+
+  let descriptors: { [key: string]: PropertyDescriptor };
+  try {
+    if (Reflect.getPrototypeOf(transcript) !== Array.prototype) {
+      throw new InvalidFixtureValue();
+    }
+    descriptors = Object.getOwnPropertyDescriptors(transcript);
+  } catch {
+    throw new Error(FIXTURE_VALUE_ERROR);
+  }
+
+  const lengthDescriptor = descriptors.length;
+  if (
+    lengthDescriptor === undefined ||
+    !Object.hasOwn(lengthDescriptor, "value") ||
+    typeof lengthDescriptor.value !== "number" ||
+    !Number.isSafeInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0
+  ) {
+    throw new Error(FIXTURE_VALUE_ERROR);
+  }
+  const length = lengthDescriptor.value;
+  const keys = Reflect.ownKeys(descriptors);
+  if (keys.some((key) => typeof key !== "string")) {
+    throw new Error(FIXTURE_VALUE_ERROR);
+  }
+
+  const elementKeys = keys.filter((key) => key !== "length");
+  if (elementKeys.length < length) {
+    throw new Error("Scripted GitHub transcript must be a dense array");
+  }
+  if (elementKeys.length !== length) {
+    throw new Error(FIXTURE_VALUE_ERROR);
+  }
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    const descriptor = descriptors[key];
+    if (descriptor === undefined) {
+      throw new Error("Scripted GitHub transcript must be a dense array");
+    }
+    if (
+      elementKeys[index] !== key ||
+      !Object.hasOwn(descriptor, "value") ||
+      descriptor.enumerable !== true
+    ) {
+      throw new Error(FIXTURE_VALUE_ERROR);
+    }
+  }
+  return length;
+}
+
 export function createScriptedGitHubTransport(
   transcript: readonly ScriptedGitHubStep[],
 ): ScriptedGitHubTransportHarness {
-  if (utilTypes.isProxy(transcript)) {
-    throw new Error(FIXTURE_VALUE_ERROR);
-  }
-  for (let index = 0; index < transcript.length; index += 1) {
-    if (!Object.hasOwn(transcript, index)) {
-      throw new Error("Scripted GitHub transcript must be a dense array");
-    }
-  }
+  const transcriptLength = validatedTranscriptLength(transcript);
   const copiedTranscript = copyAndFreeze(transcript);
-  for (let index = 0; index < copiedTranscript.length; index += 1) {
+  for (let index = 0; index < transcriptLength; index += 1) {
     validateTranscriptStep(copiedTranscript[index]!, index);
   }
   const queue = [...copiedTranscript];

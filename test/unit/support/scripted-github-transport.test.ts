@@ -253,6 +253,33 @@ describe("scripted GitHub transport", () => {
     expect(traps.ownKeys).not.toHaveBeenCalled();
   });
 
+  it("rejects a hostile transcript length accessor without invoking it or leaking its error", () => {
+    const lengthHook = vi.fn(() => {
+      throw new Error("raw-length-accessor-secret");
+    });
+    const hostile = Object.create(null) as Record<string, unknown>;
+    Object.defineProperty(hostile, "length", {
+      configurable: true,
+      enumerable: false,
+      get: lengthHook,
+    });
+
+    let error: unknown;
+    try {
+      createScriptedGitHubTransport(
+        hostile as unknown as readonly ScriptedGitHubStep[],
+      );
+    } catch (reason) {
+      error = reason;
+    }
+
+    expect(String(error)).toBe(
+      "Error: Scripted GitHub transport accepts data properties on plain fixture values only",
+    );
+    expect(String(error)).not.toContain("raw-length-accessor-secret");
+    expect(lengthHook).not.toHaveBeenCalled();
+  });
+
   it("rejects sparse transcripts instead of treating a hole as exhaustion", () => {
     const sparse = new Array<ScriptedGitHubStep>(2);
     sparse[1] = {
@@ -268,6 +295,120 @@ describe("scripted GitHub transport", () => {
       "Scripted GitHub transcript must be a dense array",
     );
   });
+
+  it.each([
+    [
+      "REST owner",
+      () => {
+        const scripted = createScriptedGitHubTransport([
+          {
+            kind: "rest",
+            operation: "star",
+            method: "PUT",
+            path: "/user/starred/{owner}/{repo}",
+            status: 204,
+          },
+        ]);
+        return {
+          scripted,
+          result: scripted.transport.restMutation(
+            "star",
+            { owner: "octo\u0085cat", repo: "tool" },
+            "op_scripted_owner",
+          ),
+        };
+      },
+    ],
+    [
+      "operation ID",
+      () => {
+        const scripted = createScriptedGitHubTransport([
+          {
+            kind: "rest",
+            operation: "star",
+            method: "PUT",
+            path: "/user/starred/{owner}/{repo}",
+            status: 204,
+          },
+        ]);
+        return {
+          scripted,
+          result: scripted.transport.restMutation(
+            "star",
+            { owner: "octocat", repo: "tool" },
+            "op_scripted\u0085",
+          ),
+        };
+      },
+    ],
+    [
+      "List description",
+      () => {
+        const scripted = createScriptedGitHubTransport([
+          {
+            kind: "graphql",
+            operation: "createUserList",
+            graphqlOperation: "CreateUserList",
+            status: 200,
+            data: null,
+          },
+        ]);
+        return {
+          scripted,
+          result: scripted.transport.graphqlMutation(
+            "createUserList",
+            {
+              name: "safe",
+              description: "unsafe\u009fdescription",
+              isPrivate: false,
+              clientMutationId: "op_scripted_description",
+            },
+            "op_scripted_description",
+          ),
+        };
+      },
+    ],
+    [
+      "stable List ID",
+      () => {
+        const scripted = createScriptedGitHubTransport([
+          {
+            kind: "graphql",
+            operation: "deleteUserList",
+            graphqlOperation: "DeleteUserList",
+            status: 200,
+            data: null,
+          },
+        ]);
+        return {
+          scripted,
+          result: scripted.transport.graphqlMutation(
+            "deleteUserList",
+            {
+              listId: "UL_\u0085",
+              clientMutationId: "op_scripted_list_id",
+            },
+            "op_scripted_list_id",
+          ),
+        };
+      },
+    ],
+  ] as const)(
+    "rejects C1 controls in scripted %s with no request or transcript consumption",
+    async (_label, arrange) => {
+      const { scripted, result } = arrange();
+      const error = await result.catch((reason: unknown) => reason);
+
+      expect(error).toMatchObject({
+        code: "VALIDATION_ERROR",
+        retryable: false,
+      });
+      expect(scripted.requests).toEqual([]);
+      expect(() => scripted.assertExhausted()).toThrow(/1 unused step/u);
+      expect(JSON.stringify(error)).not.toContain("\u0085");
+      expect(JSON.stringify(error)).not.toContain("\u009f");
+    },
+  );
 
   it("preserves the complete GraphQL envelope and records fixed documents and occurrences", async () => {
     const firstVariables = { cursor: null as string | null };
