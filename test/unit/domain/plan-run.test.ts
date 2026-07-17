@@ -30,6 +30,8 @@ import {
 import {
   parseChangeRun,
   parseRunOperation,
+  parseRunOperationAttempt,
+  parseRunOperationReconciliation,
   recoverRunState,
   transitionRunState,
   type RunState,
@@ -1010,6 +1012,76 @@ test("RunOperation rejects unsafe counts, extras, bad errors, and timestamp stat
   ];
   for (const input of invalid) {
     expectAppError(() => parseRunOperation(input), "VALIDATION_ERROR");
+  }
+});
+
+test("attempt and reconciliation parsers enforce their closed lifecycle matrices", () => {
+  const runningAttempt = {
+    runId: "run_1",
+    operationId: "op_1",
+    attempt: 1,
+    before: { starred: true },
+    startedAt: "2026-07-16T00:00:00.000Z",
+    status: "running",
+    reconciliation: "pending",
+    after: null,
+    externalRequestId: null,
+    error: null,
+    finishedAt: null,
+  };
+  expect(parseRunOperationAttempt(runningAttempt).status).toBe("running");
+  expect(Object.isFrozen(parseRunOperationAttempt(runningAttempt))).toBe(true);
+  for (const invalid of [
+    { ...runningAttempt, attempt: 0 },
+    { ...runningAttempt, status: "skipped", reconciliation: "not_required" },
+    { ...runningAttempt, after: { starred: false } },
+    {
+      ...runningAttempt,
+      status: "unresolved",
+      reconciliation: "unknown",
+      error: {
+        code: "RECONCILIATION_REQUIRED",
+        message: "unknown",
+        retryable: true,
+        details: {},
+      },
+      finishedAt: "2026-07-16T00:01:00.000Z",
+    },
+  ]) {
+    expectAppError(() => parseRunOperationAttempt(invalid), "VALIDATION_ERROR");
+  }
+
+  const confirmed = {
+    runId: "run_1",
+    operationId: "op_1",
+    attempt: 1,
+    eventSequence: 0,
+    after: { starred: true },
+    observedAt: "2026-07-16T00:02:00.000Z",
+    status: "failed",
+    reconciliation: "confirmed_not_applied",
+    error: {
+      code: "GITHUB_UNAVAILABLE",
+      message: "not applied",
+      retryable: true,
+      details: {},
+    },
+  };
+  expect(parseRunOperationReconciliation(confirmed).status).toBe("failed");
+  for (const invalid of [
+    { ...confirmed, eventSequence: -1 },
+    { ...confirmed, error: { ...confirmed.error, retryable: false } },
+    {
+      ...confirmed,
+      status: "succeeded",
+      reconciliation: "confirmed_applied",
+    },
+    { ...confirmed, status: "skipped" },
+  ]) {
+    expectAppError(
+      () => parseRunOperationReconciliation(invalid),
+      "VALIDATION_ERROR",
+    );
   }
 });
 

@@ -62,15 +62,70 @@ export interface ListCursorPayload {
 }
 
 export interface ListCursorContext {
+  readonly v: 1;
   readonly kind: "lists";
   readonly snapshotId: SnapshotId | string;
-  readonly selectionHash: string;
 }
 
 export interface ListCursorPositionInput {
   readonly values: readonly CursorValue[];
   readonly listId: UserListId | string;
 }
+
+export type ListMembershipCursorContext =
+  | Readonly<{
+      v: 1;
+      kind: "list_memberships";
+      snapshotId: SnapshotId | string;
+      selector: { readonly kind: "list"; readonly listId: UserListId | string };
+    }>
+  | Readonly<{
+      v: 1;
+      kind: "list_memberships";
+      snapshotId: SnapshotId | string;
+      selector: {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId | string;
+      };
+    }>;
+
+export type ListMembershipCursorPosition =
+  | Readonly<{
+      selector: { readonly kind: "list"; readonly listId: UserListId | string };
+      boundaryRepositoryId: RepositoryId | string;
+    }>
+  | Readonly<{
+      selector: {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId | string;
+      };
+      boundaryListId: UserListId | string;
+    }>;
+
+declare const validatedListMembershipCursorBrand: unique symbol;
+
+export type ValidatedListMembershipCursorPayload =
+  | Readonly<{
+      v: 1;
+      kind: "list_memberships";
+      snapshotId: SnapshotId;
+      selectionHash: string;
+      selector: { readonly kind: "list"; readonly listId: UserListId };
+      boundaryRepositoryId: RepositoryId;
+      readonly [validatedListMembershipCursorBrand]: true;
+    }>
+  | Readonly<{
+      v: 1;
+      kind: "list_memberships";
+      snapshotId: SnapshotId;
+      selectionHash: string;
+      selector: {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId;
+      };
+      boundaryListId: UserListId;
+      readonly [validatedListMembershipCursorBrand]: true;
+    }>;
 
 export interface CursorCodec {
   encodeRepository(
@@ -86,6 +141,14 @@ export interface CursorCodec {
     position: ListCursorPositionInput,
   ): string;
   decodeList(cursor: string, context: ListCursorContext): ListCursorPayload;
+  encodeListMembership(
+    context: ListMembershipCursorContext,
+    position: ListMembershipCursorPosition,
+  ): string;
+  decodeListMembership(
+    cursor: string,
+    context: ListMembershipCursorContext,
+  ): ValidatedListMembershipCursorPayload;
 }
 
 interface NormalizedRepositoryContext {
@@ -96,15 +159,34 @@ interface NormalizedRepositoryContext {
 }
 
 interface NormalizedListContext {
+  readonly v: 1;
   readonly snapshotId: SnapshotId;
   readonly selectionHash: string;
 }
+
+type NormalizedListMembershipContext =
+  | Readonly<{
+      v: 1;
+      snapshotId: SnapshotId;
+      selectionHash: string;
+      selector: { readonly kind: "list"; readonly listId: UserListId };
+    }>
+  | Readonly<{
+      v: 1;
+      snapshotId: SnapshotId;
+      selectionHash: string;
+      selector: {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId;
+      };
+    }>;
 
 const MAX_CURSOR_BYTES = 4 * 1_024;
 const HASH = /^[a-f0-9]{64}$/u;
 const MAC = /^[a-f0-9]{64}$/u;
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
 const validatedRepositoryPayloads = new WeakSet<object>();
+const validatedListMembershipPayloads = new WeakSet<object>();
 const typedArrayPrototype = Object.getPrototypeOf(
   Uint8Array.prototype,
 ) as object;
@@ -396,21 +478,81 @@ function normalizeRepositoryContext(
 
 function normalizeListContext(context: unknown): NormalizedListContext {
   const record = snapshotPlainObject(context, "list cursor context");
-  exactKeys(
-    record,
-    ["kind", "snapshotId", "selectionHash"],
-    "list cursor context",
-  );
-  if (record.kind !== "lists") {
+  exactKeys(record, ["v", "kind", "snapshotId"], "list cursor context");
+  if (record.v !== 1 || record.kind !== "lists") {
     return cursorError("cursor resource kind does not match lists");
   }
+  const snapshotId = stableSnapshotId(
+    record.snapshotId,
+    "list cursor snapshot",
+  );
+  const publicContext = { v: 1, kind: "lists", snapshotId } as const;
   return {
-    snapshotId: stableSnapshotId(record.snapshotId, "list cursor snapshot"),
-    selectionHash: validHash(
-      record.selectionHash,
-      "list cursor selection hash",
-    ),
+    v: 1,
+    snapshotId,
+    selectionHash: hashCanonical(publicContext),
   };
+}
+
+function normalizeMembershipSelector(
+  input: unknown,
+  label: string,
+):
+  | { readonly kind: "list"; readonly listId: UserListId }
+  | {
+      readonly kind: "repository";
+      readonly repositoryId: RepositoryId;
+    } {
+  const record = snapshotPlainObject(input, label);
+  if (record.kind === "list") {
+    exactKeys(record, ["kind", "listId"], label);
+    return Object.freeze({
+      kind: "list",
+      listId: stableListId(record.listId),
+    });
+  }
+  if (record.kind === "repository") {
+    exactKeys(record, ["kind", "repositoryId"], label);
+    return Object.freeze({
+      kind: "repository",
+      repositoryId: stableRepositoryId(record.repositoryId),
+    });
+  }
+  return cursorError(`${label} kind is invalid`);
+}
+
+function normalizeListMembershipContext(
+  context: unknown,
+): NormalizedListMembershipContext {
+  const record = snapshotPlainObject(context, "List membership cursor context");
+  exactKeys(
+    record,
+    ["v", "kind", "snapshotId", "selector"],
+    "List membership cursor context",
+  );
+  if (record.v !== 1 || record.kind !== "list_memberships") {
+    return cursorError("cursor resource kind does not match List memberships");
+  }
+  const snapshotId = stableSnapshotId(
+    record.snapshotId,
+    "List membership cursor snapshot",
+  );
+  const selector = normalizeMembershipSelector(
+    record.selector,
+    "List membership cursor selector",
+  );
+  const publicContext = {
+    v: 1,
+    kind: "list_memberships",
+    snapshotId,
+    selector,
+  } as const;
+  return Object.freeze({
+    v: 1,
+    snapshotId,
+    selector,
+    selectionHash: hashCanonical(publicContext),
+  }) as NormalizedListMembershipContext;
 }
 
 function validateRepositoryValues(
@@ -508,6 +650,67 @@ function listPosition(input: unknown): {
     ]),
     listId: stableListId(record.listId),
   };
+}
+
+function sameMembershipSelector(
+  left: NormalizedListMembershipContext["selector"],
+  right:
+    | { readonly kind: "list"; readonly listId: UserListId }
+    | {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId;
+      },
+): boolean {
+  return left.kind === "list" && right.kind === "list"
+    ? left.listId === right.listId
+    : left.kind === "repository" && right.kind === "repository"
+      ? left.repositoryId === right.repositoryId
+      : false;
+}
+
+function listMembershipPosition(
+  input: unknown,
+  context: NormalizedListMembershipContext,
+):
+  | {
+      readonly selector: { readonly kind: "list"; readonly listId: UserListId };
+      readonly boundaryRepositoryId: RepositoryId;
+    }
+  | {
+      readonly selector: {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId;
+      };
+      readonly boundaryListId: UserListId;
+    } {
+  const record = snapshotPlainObject(input, "List membership cursor position");
+  const selector = normalizeMembershipSelector(
+    record.selector,
+    "List membership cursor position selector",
+  );
+  if (!sameMembershipSelector(context.selector, selector)) {
+    return cursorError("List membership cursor selectors do not match");
+  }
+  if (selector.kind === "list") {
+    exactKeys(
+      record,
+      ["selector", "boundaryRepositoryId"],
+      "List membership cursor position",
+    );
+    return Object.freeze({
+      selector,
+      boundaryRepositoryId: stableRepositoryId(record.boundaryRepositoryId),
+    });
+  }
+  exactKeys(
+    record,
+    ["selector", "boundaryListId"],
+    "List membership cursor position",
+  );
+  return Object.freeze({
+    selector,
+    boundaryListId: stableListId(record.boundaryListId),
+  });
 }
 
 function intrinsicByteLength(value: Uint8Array): number {
@@ -741,6 +944,68 @@ function decodeListPayload(
   });
 }
 
+function decodeListMembershipPayload(
+  cursor: string,
+  context: NormalizedListMembershipContext,
+  key: Uint8Array,
+): ValidatedListMembershipCursorPayload {
+  const payload = decodedEnvelope(cursor, key);
+  const selector = normalizeMembershipSelector(
+    payload.selector,
+    "List membership cursor selector",
+  );
+  const common = ["v", "kind", "snapshotId", "selectionHash", "selector"];
+  exactKeys(
+    payload,
+    selector.kind === "list"
+      ? [...common, "boundaryRepositoryId"]
+      : [...common, "boundaryListId"],
+    "List membership cursor payload",
+  );
+  if (payload.v !== 1 || payload.kind !== "list_memberships") {
+    return cursorError("cursor resource kind does not match List memberships");
+  }
+  const snapshotId = stableSnapshotId(
+    payload.snapshotId,
+    "List membership cursor snapshot",
+  );
+  const selectionHash = validHash(
+    payload.selectionHash,
+    "List membership cursor selection hash",
+  );
+  if (snapshotId !== context.snapshotId) {
+    return cursorError("List membership cursor snapshot does not match");
+  }
+  if (
+    selectionHash !== context.selectionHash ||
+    !sameMembershipSelector(context.selector, selector)
+  ) {
+    return cursorError("List membership cursor selection does not match");
+  }
+  const result =
+    selector.kind === "list"
+      ? Object.freeze({
+          v: 1,
+          kind: "list_memberships",
+          snapshotId,
+          selectionHash,
+          selector,
+          boundaryRepositoryId: stableRepositoryId(
+            payload.boundaryRepositoryId,
+          ),
+        })
+      : Object.freeze({
+          v: 1,
+          kind: "list_memberships",
+          snapshotId,
+          selectionHash,
+          selector,
+          boundaryListId: stableListId(payload.boundaryListId),
+        });
+  validatedListMembershipPayloads.add(result);
+  return result as ValidatedListMembershipCursorPayload;
+}
+
 export function assertValidatedRepositoryCursorPayload(
   value: unknown,
 ): asserts value is ValidatedRepositoryCursorPayload {
@@ -751,6 +1016,20 @@ export function assertValidatedRepositoryCursorPayload(
   ) {
     cursorError(
       "repository cursor payload must come from complete authenticated decoding",
+    );
+  }
+}
+
+export function assertValidatedListMembershipCursorPayload(
+  value: unknown,
+): asserts value is ValidatedListMembershipCursorPayload {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !validatedListMembershipPayloads.has(value)
+  ) {
+    cursorError(
+      "List membership cursor payload must come from authenticated decoding",
     );
   }
 }
@@ -811,6 +1090,43 @@ export function createCursorCodec(signingKey: Uint8Array): CursorCodec {
       contextInput: ListCursorContext,
     ): ListCursorPayload {
       return decodeListPayload(cursor, normalizeListContext(contextInput), key);
+    },
+    encodeListMembership(
+      contextInput: ListMembershipCursorContext,
+      positionInput: ListMembershipCursorPosition,
+    ): string {
+      const context = normalizeListMembershipContext(contextInput);
+      const position = listMembershipPosition(positionInput, context);
+      return encodedEnvelope(
+        "boundaryRepositoryId" in position
+          ? {
+              v: 1,
+              kind: "list_memberships",
+              snapshotId: context.snapshotId,
+              selectionHash: context.selectionHash,
+              selector: position.selector,
+              boundaryRepositoryId: position.boundaryRepositoryId,
+            }
+          : {
+              v: 1,
+              kind: "list_memberships",
+              snapshotId: context.snapshotId,
+              selectionHash: context.selectionHash,
+              selector: position.selector,
+              boundaryListId: position.boundaryListId,
+            },
+        key,
+      );
+    },
+    decodeListMembership(
+      cursor: string,
+      contextInput: ListMembershipCursorContext,
+    ): ValidatedListMembershipCursorPayload {
+      return decodeListMembershipPayload(
+        cursor,
+        normalizeListMembershipContext(contextInput),
+        key,
+      );
     },
   });
 }

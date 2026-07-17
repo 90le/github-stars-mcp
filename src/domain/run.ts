@@ -57,6 +57,94 @@ export interface RunOperation {
   readonly finishedAt: string | null;
 }
 
+export type RunOperationAttemptStatus =
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "unresolved";
+
+interface RunOperationAttemptBase {
+  readonly runId: RunId;
+  readonly operationId: string;
+  readonly attempt: number;
+  readonly before: JsonValue;
+  readonly startedAt: string;
+}
+
+export type RunOperationAttempt =
+  | Readonly<
+      RunOperationAttemptBase & {
+        status: "running";
+        reconciliation: "pending";
+        after: null;
+        externalRequestId: null;
+        error: null;
+        finishedAt: null;
+      }
+    >
+  | Readonly<
+      RunOperationAttemptBase & {
+        status: "succeeded";
+        reconciliation: "not_required";
+        after: JsonValue;
+        externalRequestId: string | null;
+        error: null;
+        finishedAt: string;
+      }
+    >
+  | Readonly<
+      RunOperationAttemptBase & {
+        status: "failed";
+        reconciliation: "confirmed_not_applied";
+        after: JsonValue;
+        externalRequestId: string | null;
+        error: SerializedDomainError;
+        finishedAt: string;
+      }
+    >
+  | Readonly<
+      RunOperationAttemptBase & {
+        status: "unresolved";
+        reconciliation: "unknown";
+        after: JsonValue;
+        externalRequestId: string | null;
+        error: SerializedDomainError & { readonly retryable: false };
+        finishedAt: string;
+      }
+    >;
+
+interface RunOperationReconciliationBase {
+  readonly runId: RunId;
+  readonly operationId: string;
+  readonly attempt: number;
+  readonly eventSequence: number;
+  readonly after: JsonValue;
+  readonly observedAt: string;
+}
+
+export type RunOperationReconciliation =
+  | Readonly<
+      RunOperationReconciliationBase & {
+        status: "succeeded";
+        reconciliation: "confirmed_applied";
+        error: null;
+      }
+    >
+  | Readonly<
+      RunOperationReconciliationBase & {
+        status: "failed";
+        reconciliation: "confirmed_not_applied";
+        error: SerializedDomainError & { readonly retryable: true };
+      }
+    >
+  | Readonly<
+      RunOperationReconciliationBase & {
+        status: "unresolved";
+        reconciliation: "unknown";
+        error: SerializedDomainError & { readonly retryable: false };
+      }
+    >;
+
 type SafeRecord = Record<string, JsonValue>;
 
 const RUN_STATES = new Set<RunState>([
@@ -306,6 +394,11 @@ export function parseRunOperation(input: unknown): RunOperation {
     "run operation",
   );
   const status = operationStatus(root.status as JsonValue);
+  const reconciliation = reconciliationStatus(root.reconciliation as JsonValue);
+  const attempts = nonnegativeInteger(
+    root.attempts as JsonValue,
+    "operation attempts",
+  );
   const startedAt = nullableTimestamp(
     root.startedAt as JsonValue,
     "operation startedAt",
@@ -314,17 +407,89 @@ export function parseRunOperation(input: unknown): RunOperation {
     root.finishedAt as JsonValue,
     "operation finishedAt",
   );
-  if (
-    (status === "pending" && (startedAt !== null || finishedAt !== null)) ||
-    (status === "running" && (startedAt === null || finishedAt !== null)) ||
-    (status !== "pending" && status !== "running" && finishedAt === null)
-  ) {
-    return validationError(
-      "run operation timestamps do not match its lifecycle status",
-    );
-  }
+  const externalRequestId =
+    root.externalRequestId === null
+      ? null
+      : text(
+          root.externalRequestId as JsonValue,
+          "external request ID",
+          MAX_STABLE_ID,
+        );
+  const error = serializedError(root.error as JsonValue);
+  const after = freezeJsonValue(root.after as JsonValue);
   if (startedAt !== null && finishedAt !== null && finishedAt < startedAt) {
     return validationError("run operation finishedAt cannot precede startedAt");
+  }
+
+  const pending =
+    status === "pending" &&
+    reconciliation === "not_required" &&
+    startedAt === null &&
+    finishedAt === null &&
+    externalRequestId === null &&
+    error === null &&
+    after === null;
+  const running =
+    status === "running" &&
+    reconciliation === "pending" &&
+    attempts >= 1 &&
+    startedAt !== null &&
+    finishedAt === null &&
+    externalRequestId === null &&
+    error === null &&
+    after === null;
+  const skipped =
+    status === "skipped" &&
+    reconciliation === "not_required" &&
+    attempts === 0 &&
+    startedAt === null &&
+    finishedAt !== null &&
+    externalRequestId === null &&
+    error === null &&
+    after === null;
+  const succeeded =
+    status === "succeeded" &&
+    (reconciliation === "not_required" ||
+      reconciliation === "confirmed_applied") &&
+    attempts >= 1 &&
+    startedAt !== null &&
+    finishedAt !== null &&
+    error === null;
+  const failedWithoutDispatch =
+    status === "failed" &&
+    reconciliation === "confirmed_not_applied" &&
+    startedAt === null &&
+    finishedAt !== null &&
+    externalRequestId === null &&
+    after === null &&
+    error !== null;
+  const failedAfterDispatch =
+    status === "failed" &&
+    reconciliation === "confirmed_not_applied" &&
+    attempts >= 1 &&
+    startedAt !== null &&
+    finishedAt !== null &&
+    error !== null;
+  const unresolved =
+    status === "unresolved" &&
+    reconciliation === "unknown" &&
+    attempts >= 1 &&
+    startedAt !== null &&
+    finishedAt !== null &&
+    error !== null &&
+    error.retryable === false;
+  if (
+    !pending &&
+    !running &&
+    !skipped &&
+    !succeeded &&
+    !failedWithoutDispatch &&
+    !failedAfterDispatch &&
+    !unresolved
+  ) {
+    return validationError(
+      "run operation fields do not match a legal lifecycle matrix row",
+    );
   }
 
   return Object.freeze({
@@ -339,25 +504,168 @@ export function parseRunOperation(input: unknown): RunOperation {
       "operation sequence",
     ),
     status,
-    reconciliation: reconciliationStatus(root.reconciliation as JsonValue),
-    attempts: nonnegativeInteger(
-      root.attempts as JsonValue,
-      "operation attempts",
-    ),
+    reconciliation,
+    attempts,
     before: freezeJsonValue(root.before as JsonValue),
-    after: freezeJsonValue(root.after as JsonValue),
-    externalRequestId:
-      root.externalRequestId === null
-        ? null
-        : text(
-            root.externalRequestId as JsonValue,
-            "external request ID",
-            MAX_STABLE_ID,
-          ),
-    error: serializedError(root.error as JsonValue),
+    after,
+    externalRequestId,
+    error,
     startedAt,
     finishedAt,
   });
+}
+
+function positiveInteger(value: JsonValue, label: string): number {
+  const parsed = nonnegativeInteger(value, label);
+  if (parsed < 1) return validationError(`${label} must be positive`);
+  return parsed;
+}
+
+export function parseRunOperationAttempt(input: unknown): RunOperationAttempt {
+  const root = record(canonicalJsonClone(input), "run operation attempt");
+  exactKeys(
+    root,
+    [
+      "runId",
+      "operationId",
+      "attempt",
+      "before",
+      "startedAt",
+      "status",
+      "reconciliation",
+      "after",
+      "externalRequestId",
+      "error",
+      "finishedAt",
+    ],
+    "run operation attempt",
+  );
+  const status = operationStatus(root.status as JsonValue);
+  if (status === "pending" || status === "skipped") {
+    return validationError("attempt status is invalid");
+  }
+  const reconciliation = reconciliationStatus(root.reconciliation as JsonValue);
+  const startedAt = canonicalUtcTimestamp(root.startedAt, "attempt startedAt");
+  const finishedAt = nullableTimestamp(
+    root.finishedAt as JsonValue,
+    "attempt finishedAt",
+  );
+  if (finishedAt !== null && finishedAt < startedAt) {
+    return validationError("attempt finishedAt cannot precede startedAt");
+  }
+  const externalRequestId =
+    root.externalRequestId === null
+      ? null
+      : text(
+          root.externalRequestId as JsonValue,
+          "external request ID",
+          MAX_STABLE_ID,
+        );
+  const error = serializedError(root.error as JsonValue);
+  const after = freezeJsonValue(root.after as JsonValue);
+  const valid =
+    (status === "running" &&
+      reconciliation === "pending" &&
+      after === null &&
+      externalRequestId === null &&
+      error === null &&
+      finishedAt === null) ||
+    (status === "succeeded" &&
+      reconciliation === "not_required" &&
+      error === null &&
+      finishedAt !== null) ||
+    (status === "failed" &&
+      reconciliation === "confirmed_not_applied" &&
+      error !== null &&
+      finishedAt !== null) ||
+    (status === "unresolved" &&
+      reconciliation === "unknown" &&
+      error !== null &&
+      error.retryable === false &&
+      finishedAt !== null);
+  if (!valid) {
+    return validationError("attempt fields do not match a legal matrix row");
+  }
+  return Object.freeze({
+    runId: stableId(root.runId as JsonValue, "run ID", asRunId),
+    operationId: text(
+      root.operationId as JsonValue,
+      "operation ID",
+      MAX_STABLE_ID,
+    ),
+    attempt: positiveInteger(root.attempt as JsonValue, "attempt number"),
+    before: freezeJsonValue(root.before as JsonValue),
+    startedAt,
+    status,
+    reconciliation,
+    after,
+    externalRequestId,
+    error,
+    finishedAt,
+  }) as RunOperationAttempt;
+}
+
+export function parseRunOperationReconciliation(
+  input: unknown,
+): RunOperationReconciliation {
+  const root = record(
+    canonicalJsonClone(input),
+    "run operation reconciliation",
+  );
+  exactKeys(
+    root,
+    [
+      "runId",
+      "operationId",
+      "attempt",
+      "eventSequence",
+      "after",
+      "observedAt",
+      "status",
+      "reconciliation",
+      "error",
+    ],
+    "run operation reconciliation",
+  );
+  const status = operationStatus(root.status as JsonValue);
+  const reconciliation = reconciliationStatus(root.reconciliation as JsonValue);
+  const error = serializedError(root.error as JsonValue);
+  const valid =
+    (status === "succeeded" &&
+      reconciliation === "confirmed_applied" &&
+      error === null) ||
+    (status === "failed" &&
+      reconciliation === "confirmed_not_applied" &&
+      error?.retryable === true) ||
+    (status === "unresolved" &&
+      reconciliation === "unknown" &&
+      error?.retryable === false);
+  if (!valid) {
+    return validationError(
+      "reconciliation fields do not match a legal matrix row",
+    );
+  }
+  return Object.freeze({
+    runId: stableId(root.runId as JsonValue, "run ID", asRunId),
+    operationId: text(
+      root.operationId as JsonValue,
+      "operation ID",
+      MAX_STABLE_ID,
+    ),
+    attempt: positiveInteger(root.attempt as JsonValue, "attempt number"),
+    eventSequence: nonnegativeInteger(
+      root.eventSequence as JsonValue,
+      "reconciliation event sequence",
+    ),
+    after: freezeJsonValue(root.after as JsonValue),
+    observedAt: canonicalUtcTimestamp(
+      root.observedAt,
+      "reconciliation observedAt",
+    ),
+    status,
+    reconciliation,
+    error,
+  }) as RunOperationReconciliation;
 }
 
 const RUN_TRANSITIONS = new Map<RunState, ReadonlySet<RunState>>([

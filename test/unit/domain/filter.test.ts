@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import Database from "better-sqlite3";
 import { describe, expect, test, vi } from "vitest";
 import {
+  assertValidatedListMembershipCursorPayload,
   createCursorCodec,
   hashFilter,
   hashListSelection,
@@ -864,7 +865,6 @@ describe("stable repository sorts and keyset cursors", () => {
 
 describe("authenticated versioned cursors", () => {
   const filterHash = "f".repeat(64);
-  const selectionHash = "b".repeat(64);
   const sort = [
     { field: "stargazer_count", direction: "desc" },
     { field: "pushed_at", direction: "asc" },
@@ -876,9 +876,9 @@ describe("authenticated versioned cursors", () => {
     sort,
   } as const;
   const listContext = {
+    v: 1,
     kind: "lists",
     snapshotId: SNAPSHOT_ID,
-    selectionHash,
   } as const;
 
   function repositoryCursor(): string {
@@ -981,13 +981,11 @@ describe("authenticated versioned cursors", () => {
       values: ["agents"],
       listId: asUserListId("UL_1"),
     });
-    expectValidationError(
-      () =>
-        CURSOR_CODEC.decodeList(listCursor, {
-          ...listContext,
-          selectionHash: "a".repeat(64),
-        }),
-      /cursor.*selection/iu,
+    expectValidationError(() =>
+      CURSOR_CODEC.decodeList(listCursor, {
+        ...listContext,
+        snapshotId: asSnapshotId("snap_other"),
+      }),
     );
   });
 
@@ -1034,6 +1032,75 @@ describe("authenticated versioned cursors", () => {
     ).toBe(hashRepositorySort(DEFAULT_SORT));
     expect(hashListSelection({ b: 2, a: 1 })).toBe(
       hashListSelection({ a: 1, b: 2 }),
+    );
+  });
+
+  test("locks derived List selection hashes and runtime-brands membership cursors", () => {
+    const listCursor = CURSOR_CODEC.encodeList(
+      { v: 1, kind: "lists", snapshotId: SNAPSHOT_ID },
+      { values: ["AI"], listId: asUserListId("L_1") },
+    );
+    const listEnvelope = JSON.parse(
+      Buffer.from(listCursor, "base64url").toString("utf8"),
+    ) as { payload: { selectionHash: string } };
+    expect(listEnvelope.payload.selectionHash).toBe(
+      "ebacad18c114f59f8b4a83de0dd9a0d62b4b336beccaaa64a36fbe7f5ea17230",
+    );
+
+    const listMembershipContext = {
+      v: 1,
+      kind: "list_memberships",
+      snapshotId: SNAPSHOT_ID,
+      selector: { kind: "list", listId: asUserListId("L_1") },
+    } as const;
+    const listMembershipCursor = CURSOR_CODEC.encodeListMembership(
+      listMembershipContext,
+      {
+        selector: listMembershipContext.selector,
+        boundaryRepositoryId: asRepositoryId("R_1"),
+      },
+    );
+    const listMembership = CURSOR_CODEC.decodeListMembership(
+      listMembershipCursor,
+      listMembershipContext,
+    );
+    expect(listMembership.selectionHash).toBe(
+      "0ca224c01b214e4f2b666ebad73a4031237f8623aa9a5da850d9c13394ee76b9",
+    );
+    expect(() =>
+      assertValidatedListMembershipCursorPayload(listMembership),
+    ).not.toThrow();
+    expectValidationError(() =>
+      assertValidatedListMembershipCursorPayload({ ...listMembership }),
+    );
+
+    const repositoryMembershipContext = {
+      v: 1,
+      kind: "list_memberships",
+      snapshotId: SNAPSHOT_ID,
+      selector: {
+        kind: "repository",
+        repositoryId: asRepositoryId("R_1"),
+      },
+    } as const;
+    const repositoryMembershipCursor = CURSOR_CODEC.encodeListMembership(
+      repositoryMembershipContext,
+      {
+        selector: repositoryMembershipContext.selector,
+        boundaryListId: asUserListId("L_1"),
+      },
+    );
+    expect(
+      CURSOR_CODEC.decodeListMembership(
+        repositoryMembershipCursor,
+        repositoryMembershipContext,
+      ).selectionHash,
+    ).toBe("44f61d13268a2be2b6b420fe28536027f1ce9f6f05c62e9753cd4ad64bf992f9");
+    expectValidationError(() =>
+      CURSOR_CODEC.decodeListMembership(
+        listMembershipCursor,
+        repositoryMembershipContext,
+      ),
     );
   });
 });
@@ -1222,9 +1289,9 @@ describe("review hardening regressions", () => {
     const copiedKeyCodec = createCursorCodec(mutableKey);
     mutableKey.fill(0x20);
     const listContext = {
+      v: 1,
       kind: "lists",
       snapshotId: SNAPSHOT_ID,
-      selectionHash: "b".repeat(64),
     } as const;
     const cursor = copiedKeyCodec.encodeList(listContext, {
       values: ["agents"],
@@ -1276,9 +1343,9 @@ describe("review hardening regressions", () => {
 
     pooledKey.fill(0);
     const listContext = {
+      v: 1,
       kind: "lists",
       snapshotId: SNAPSHOT_ID,
-      selectionHash: "c".repeat(64),
     } as const;
     const cursor = isolatedCodec.encodeList(listContext, {
       values: ["isolated"],

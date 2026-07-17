@@ -1,9 +1,23 @@
 import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import type { Clock } from "../app/ports/runtime-port.js";
+import { canonicalJsonClone, freezeJsonValue } from "./canonical-json.js";
 import { AppError } from "./errors.js";
-import type { RepositoryId, SnapshotId } from "./ids.js";
-import type { RepositoryView, UserList } from "./repository.js";
+import {
+  asRepositoryId,
+  asSnapshotId,
+  asUserListId,
+  type RepositoryId,
+  type SnapshotId,
+  type UserListId,
+} from "./ids.js";
+import type { JsonValue } from "./json.js";
+import {
+  repositoryViewSchema,
+  userListSchema,
+  type RepositoryView,
+  type UserList,
+} from "./repository.js";
 import { canonicalUtcTimestamp } from "./timestamp.js";
 
 type StringFilterField =
@@ -87,15 +101,20 @@ export interface RepositoryQueryPage {
   readonly items: readonly RepositoryView[];
   readonly total: number;
   readonly aggregates: {
-    readonly byLanguage: Readonly<Record<string, number>>;
+    readonly languages: readonly LanguageAggregate[];
     readonly archived: number;
     readonly forks: number;
   };
   readonly nextCursor: string | null;
 }
 
-export interface ListView extends UserList {
-  readonly repositoryIds: readonly RepositoryId[];
+export interface LanguageAggregate {
+  readonly language: string | null;
+  readonly count: number;
+}
+
+export interface ListSummary extends UserList {
+  readonly repositoryCount: number;
 }
 
 export interface ListQuery {
@@ -105,10 +124,44 @@ export interface ListQuery {
 }
 
 export interface ListQueryPage {
-  readonly items: readonly ListView[];
+  readonly coverage: "complete";
+  readonly items: readonly ListSummary[];
   readonly total: number;
   readonly nextCursor: string | null;
 }
+
+export type ListMembershipSelector =
+  | { readonly kind: "list"; readonly listId: UserListId }
+  | { readonly kind: "repository"; readonly repositoryId: RepositoryId };
+
+export interface ListMembershipQuery {
+  readonly snapshotId: SnapshotId;
+  readonly selector: ListMembershipSelector;
+  readonly pageSize: number;
+  readonly cursor: string | null;
+}
+
+export type ListMembershipQueryPage =
+  | {
+      readonly coverage: "complete";
+      readonly selector: {
+        readonly kind: "list";
+        readonly listId: UserListId;
+      };
+      readonly repositoryIds: readonly RepositoryId[];
+      readonly total: number;
+      readonly nextCursor: string | null;
+    }
+  | {
+      readonly coverage: "complete";
+      readonly selector: {
+        readonly kind: "repository";
+        readonly repositoryId: RepositoryId;
+      };
+      readonly listIds: readonly UserListId[];
+      readonly total: number;
+      readonly nextCursor: string | null;
+    };
 
 export type FilterParseContext = { readonly now: string } | Pick<Clock, "now">;
 
@@ -934,4 +987,300 @@ export function repositoryCursorPosition(
     nulls: values.map((value) => value === null),
     repositoryId: view.repositoryId,
   };
+}
+
+export function filterRequiresListCoverage(
+  filter: FilterExpression | null,
+): boolean {
+  if (filter === null) return false;
+  if ("all" in filter) {
+    return filter.all.some(filterRequiresListCoverage);
+  }
+  if ("any" in filter) {
+    return filter.any.some(filterRequiresListCoverage);
+  }
+  if ("not" in filter) return filterRequiresListCoverage(filter.not);
+  return filter.field === "list_ids" || filter.field === "is_unclassified";
+}
+
+function parsePageSize(value: unknown): number {
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value > 100
+  ) {
+    return validationError("pageSize must be an integer from 1 to 100");
+  }
+  return value;
+}
+
+function parseCursorText(value: unknown): string | null {
+  if (
+    value !== null &&
+    (typeof value !== "string" ||
+      value.length === 0 ||
+      Buffer.byteLength(value, "utf8") > 4 * 1_024)
+  ) {
+    return validationError("cursor must be null or bounded text");
+  }
+  return value;
+}
+
+function parsedSnapshotId(value: unknown): SnapshotId {
+  if (typeof value !== "string") {
+    return validationError("snapshotId must be a stable ID");
+  }
+  try {
+    return asSnapshotId(value);
+  } catch {
+    return validationError("snapshotId must be a stable ID");
+  }
+}
+
+export function parseRepositoryQuery(input: unknown): RepositoryQuery {
+  const root = asRecord(input, "repository query");
+  requireExactKeys(
+    root,
+    ["snapshotId", "filter", "sort", "pageSize", "cursor"],
+    "repository query",
+  );
+  const normalized = normalizeSort(root.sort as readonly RepositorySort[])
+    .filter(
+      (
+        term,
+      ): term is NormalizedRepositorySort & {
+        readonly field: RepositorySort["field"];
+      } => term.field !== "repository_id",
+    )
+    .map(({ field, direction }) => Object.freeze({ field, direction }));
+  return Object.freeze({
+    snapshotId: parsedSnapshotId(root.snapshotId),
+    filter: root.filter === null ? null : parseFilter(root.filter),
+    sort: Object.freeze(normalized),
+    pageSize: parsePageSize(root.pageSize),
+    cursor: parseCursorText(root.cursor),
+  });
+}
+
+export function parseListQuery(input: unknown): ListQuery {
+  const root = asRecord(input, "List query");
+  requireExactKeys(root, ["snapshotId", "pageSize", "cursor"], "List query");
+  return Object.freeze({
+    snapshotId: parsedSnapshotId(root.snapshotId),
+    pageSize: parsePageSize(root.pageSize),
+    cursor: parseCursorText(root.cursor),
+  });
+}
+
+function parseMembershipSelector(input: unknown): ListMembershipSelector {
+  const root = asRecord(input, "List membership selector");
+  if (root.kind === "list") {
+    requireExactKeys(root, ["kind", "listId"], "List membership selector");
+    if (typeof root.listId !== "string") {
+      return validationError("List selector ID must be a stable ID");
+    }
+    try {
+      return Object.freeze({ kind: "list", listId: asUserListId(root.listId) });
+    } catch {
+      return validationError("List selector ID must be a stable ID");
+    }
+  }
+  if (root.kind === "repository") {
+    requireExactKeys(
+      root,
+      ["kind", "repositoryId"],
+      "List membership selector",
+    );
+    if (typeof root.repositoryId !== "string") {
+      return validationError("repository selector ID must be a stable ID");
+    }
+    try {
+      return Object.freeze({
+        kind: "repository",
+        repositoryId: asRepositoryId(root.repositoryId),
+      });
+    } catch {
+      return validationError("repository selector ID must be a stable ID");
+    }
+  }
+  return validationError("List membership selector kind is invalid");
+}
+
+export function parseListMembershipQuery(input: unknown): ListMembershipQuery {
+  const root = asRecord(input, "List membership query");
+  requireExactKeys(
+    root,
+    ["snapshotId", "selector", "pageSize", "cursor"],
+    "List membership query",
+  );
+  return Object.freeze({
+    snapshotId: parsedSnapshotId(root.snapshotId),
+    selector: parseMembershipSelector(root.selector),
+    pageSize: parsePageSize(root.pageSize),
+    cursor: parseCursorText(root.cursor),
+  });
+}
+
+function nonnegativeInteger(value: JsonValue, label: string): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    return validationError(`${label} must be a nonnegative safe integer`);
+  }
+  return value;
+}
+
+function frozenClone<T>(value: T): T {
+  return freezeJsonValue(canonicalJsonClone(value)) as unknown as T;
+}
+
+export function parseRepositoryQueryPage(input: unknown): RepositoryQueryPage {
+  const root = asRecord(canonicalJsonClone(input), "repository query page");
+  requireExactKeys(
+    root,
+    ["items", "total", "aggregates", "nextCursor"],
+    "repository query page",
+  );
+  const items = denseArray(root.items, "repository query items").map((item) =>
+    repositoryViewSchema.parse(item),
+  );
+  if (items.length > 100) {
+    return validationError("repository query page cannot exceed 100 items");
+  }
+  const aggregates = asRecord(root.aggregates, "repository query aggregates");
+  requireExactKeys(
+    aggregates,
+    ["languages", "archived", "forks"],
+    "repository query aggregates",
+  );
+  const languageRows = denseArray(
+    aggregates.languages,
+    "language aggregates",
+  ).map((entry) => {
+    const row = asRecord(entry, "language aggregate");
+    requireExactKeys(row, ["language", "count"], "language aggregate");
+    if (row.language !== null && typeof row.language !== "string") {
+      return validationError("aggregate language must be text or null");
+    }
+    return {
+      language: row.language,
+      count: nonnegativeInteger(row.count as JsonValue, "language count"),
+    };
+  });
+  return frozenClone({
+    items,
+    total: nonnegativeInteger(root.total as JsonValue, "query total"),
+    aggregates: {
+      languages: languageRows,
+      archived: nonnegativeInteger(
+        aggregates.archived as JsonValue,
+        "archived aggregate",
+      ),
+      forks: nonnegativeInteger(
+        aggregates.forks as JsonValue,
+        "fork aggregate",
+      ),
+    },
+    nextCursor: parseCursorText(root.nextCursor),
+  });
+}
+
+export function parseListQueryPage(input: unknown): ListQueryPage {
+  const root = asRecord(canonicalJsonClone(input), "List query page");
+  requireExactKeys(
+    root,
+    ["coverage", "items", "total", "nextCursor"],
+    "List query page",
+  );
+  if (root.coverage !== "complete") {
+    return validationError("List query coverage must be complete");
+  }
+  const items = denseArray(root.items, "List query items").map((entry) => {
+    const row = asRecord(entry, "List summary");
+    const listKeys = [
+      "listId",
+      "name",
+      "slug",
+      "description",
+      "isPrivate",
+      "createdAt",
+      "updatedAt",
+      "lastAddedAt",
+    ] as const;
+    requireExactKeys(row, [...listKeys, "repositoryCount"], "List summary");
+    const listInput = Object.fromEntries(
+      listKeys.map((key) => [key, row[key]]),
+    );
+    return {
+      ...userListSchema.parse(listInput),
+      repositoryCount: nonnegativeInteger(
+        row.repositoryCount as JsonValue,
+        "List repository count",
+      ),
+    };
+  });
+  if (items.length > 100) {
+    return validationError("List query page cannot exceed 100 items");
+  }
+  return frozenClone({
+    coverage: "complete",
+    items,
+    total: nonnegativeInteger(root.total as JsonValue, "List query total"),
+    nextCursor: parseCursorText(root.nextCursor),
+  });
+}
+
+export function parseListMembershipQueryPage(
+  input: unknown,
+): ListMembershipQueryPage {
+  const root = asRecord(
+    canonicalJsonClone(input),
+    "List membership query page",
+  );
+  if (root.coverage !== "complete") {
+    return validationError("List membership coverage must be complete");
+  }
+  const selector = parseMembershipSelector(root.selector);
+  const common = ["coverage", "selector", "total", "nextCursor"];
+  if (selector.kind === "list") {
+    requireExactKeys(
+      root,
+      [...common, "repositoryIds"],
+      "List membership query page",
+    );
+    const repositoryIds = denseArray(root.repositoryIds, "repository IDs").map(
+      (id) => {
+        if (typeof id !== "string") {
+          return validationError("repository ID must be text");
+        }
+        return asRepositoryId(id);
+      },
+    );
+    if (repositoryIds.length > 100) {
+      return validationError("membership page cannot exceed 100 items");
+    }
+    return frozenClone({
+      coverage: "complete",
+      selector,
+      repositoryIds,
+      total: nonnegativeInteger(root.total as JsonValue, "membership total"),
+      nextCursor: parseCursorText(root.nextCursor),
+    });
+  }
+  requireExactKeys(root, [...common, "listIds"], "List membership query page");
+  const listIds = denseArray(root.listIds, "List IDs").map((id) => {
+    if (typeof id !== "string") {
+      return validationError("List ID must be text");
+    }
+    return asUserListId(id);
+  });
+  if (listIds.length > 100) {
+    return validationError("membership page cannot exceed 100 items");
+  }
+  return frozenClone({
+    coverage: "complete",
+    selector,
+    listIds,
+    total: nonnegativeInteger(root.total as JsonValue, "membership total"),
+    nextCursor: parseCursorText(root.nextCursor),
+  });
 }

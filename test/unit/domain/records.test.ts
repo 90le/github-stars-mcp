@@ -266,6 +266,7 @@ test("validates stable identities and normalizes topics", () => {
     id: asSnapshotId("snap_external"),
     binding,
     mode: "full",
+    listCoverage: "collecting",
     startedAt: "2026-07-16T00:00:00.000Z",
   };
   const counts: SnapshotCounts = {
@@ -277,6 +278,7 @@ test("validates stable identities and normalizes topics", () => {
   const sourceRateLimit: JsonValue = { remaining: 4_999 };
   const snapshot: Snapshot = {
     ...draft,
+    listCoverage: "complete",
     status: "complete",
     completedAt: "2026-07-16T02:00:00.000Z",
     failedAt: null,
