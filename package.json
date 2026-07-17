@@ -9,7 +9,7 @@
   },
   "files": [
     "dist",
-    "plugins",
+    "plugins/github-stars-mcp",
     "README.md",
     "LICENSE"
   ],

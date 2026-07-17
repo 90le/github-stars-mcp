@@ -1,9 +1,20 @@
 import { spawnSync } from "node:child_process";
-import { readFile, readdir } from "node:fs/promises";
-import { extname, join } from "node:path";
+import {
+  cp,
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { extname, join, resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 
 const PLUGIN_ROOT = "plugins/github-stars-mcp";
+const VALIDATOR_PATH = resolve("scripts/validate-plugin.mjs");
 const ENV_ALLOWLIST = Object.freeze([
   "GITHUB_STARS_TOKEN",
   "GITHUB_TOKEN",
@@ -35,6 +46,44 @@ async function filesBelow(root: string): Promise<readonly string[]> {
   }
   await visit(root);
   return result.sort();
+}
+
+async function withPluginFixture(
+  callback: (root: string) => Promise<void>,
+): Promise<void> {
+  const root = await mkdtemp(join(tmpdir(), "github-stars-mcp-plugin-"));
+  try {
+    await mkdir(join(root, "plugins"), { recursive: true });
+    await cp(PLUGIN_ROOT, join(root, PLUGIN_ROOT), { recursive: true });
+    await mkdir(join(root, ".agents/plugins"), { recursive: true });
+    await cp(
+      ".agents/plugins/marketplace.json",
+      join(root, ".agents/plugins/marketplace.json"),
+    );
+    await cp("package.json", join(root, "package.json"));
+    await callback(root);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function runFixtureValidator(root: string): ReturnType<typeof spawnSync> {
+  return spawnSync(process.execPath, [VALIDATOR_PATH, "--static-only"], {
+    cwd: root,
+    encoding: "utf8",
+    env: {},
+    timeout: 10_000,
+    windowsHide: true,
+  });
+}
+
+async function rewriteJson(
+  path: string,
+  update: (value: Record<string, unknown>) => void,
+): Promise<void> {
+  const value = await readJson(path);
+  update(value);
+  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
 describe("Codex plugin package", () => {
@@ -87,19 +136,28 @@ describe("Codex plugin package", () => {
 
   it("contains no credential value or duplicated runtime implementation", async () => {
     const files = await filesBelow(PLUGIN_ROOT);
-    const runtimeFiles = files.filter((path) =>
-      [".js", ".cjs", ".mjs", ".ts", ".cts", ".mts"].includes(extname(path)),
+    const unsupportedFiles = files.filter(
+      (path) =>
+        ![
+          ".gif",
+          ".jpeg",
+          ".jpg",
+          ".json",
+          ".md",
+          ".png",
+          ".webp",
+          ".yaml",
+          ".yml",
+        ].includes(extname(path).toLowerCase()),
     );
-    const presentation = await Promise.all(
-      files
-        .filter((path) =>
-          [".json", ".md", ".yaml", ".yml"].includes(extname(path)),
-        )
-        .map((path) => readFile(path, "utf8")),
+    const contents = await Promise.all(
+      files.map((path) =>
+        readFile(path).then((value) => value.toString("utf8")),
+      ),
     );
 
-    expect(runtimeFiles).toEqual([]);
-    expect(presentation.join("\n")).not.toMatch(
+    expect(unsupportedFiles).toEqual([]);
+    expect(contents.join("\n")).not.toMatch(
       /github_pat_|gh[pousr]_[A-Za-z0-9_]{4,}|authorization\s*:\s*bearer/iu,
     );
   });
@@ -147,5 +205,114 @@ describe("Codex plugin package", () => {
     );
     expect(result).toMatchObject({ status: 0, stderr: "" });
     expect(result.stdout).toBe("Validated Codex plugin github-stars-mcp\n");
+  });
+
+  it.each([
+    ["runtime source", "payload.py", "print('unexpected')"],
+    [
+      "runtime source disguised as an asset",
+      "payload.png",
+      "print('unexpected')",
+    ],
+    [
+      "a credential in an arbitrary extension",
+      "credential.txt",
+      "github_pat_not_a_real_value",
+    ],
+  ])("rejects %s anywhere in the plugin tree", async (_name, path, source) => {
+    await withPluginFixture(async (root) => {
+      await writeFile(join(root, PLUGIN_ROOT, path), source, "utf8");
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(
+        /PLUGIN_(?:ASSET_FORMAT|RUNTIME_SOURCE|CREDENTIAL_VALUE)/u,
+      );
+    });
+  });
+
+  it("rejects official presentation references that escape the plugin", async () => {
+    await withPluginFixture(async (root) => {
+      await rewriteJson(
+        join(root, PLUGIN_ROOT, ".codex-plugin/plugin.json"),
+        (manifest) => {
+          const interfaceMetadata = manifest.interface as Record<
+            string,
+            unknown
+          >;
+          interfaceMetadata.composerIcon = "../../outside.png";
+        },
+      );
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("MANIFEST_ASSET");
+    });
+  });
+
+  it("rejects an app manifest reference that escapes the plugin", async () => {
+    await withPluginFixture(async (root) => {
+      await rewriteJson(
+        join(root, PLUGIN_ROOT, ".codex-plugin/plugin.json"),
+        (manifest) => {
+          manifest.apps = "../../outside.app.json";
+        },
+      );
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("MANIFEST_APPS");
+    });
+  });
+
+  it("rejects an incomplete marketplace root", async () => {
+    await withPluginFixture(async (root) => {
+      await rewriteJson(
+        join(root, ".agents/plugins/marketplace.json"),
+        (marketplace) => {
+          delete marketplace.name;
+        },
+      );
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("MARKETPLACE");
+    });
+  });
+
+  it("rejects a plugin root redirected through a directory link", async () => {
+    const outside = await mkdtemp(
+      join(tmpdir(), "github-stars-mcp-plugin-outside-"),
+    );
+    try {
+      await cp(PLUGIN_ROOT, outside, { recursive: true });
+      await withPluginFixture(async (root) => {
+        const pluginRoot = join(root, PLUGIN_ROOT);
+        await rm(pluginRoot, { recursive: true });
+        await symlink(
+          outside,
+          pluginRoot,
+          process.platform === "win32" ? "junction" : "dir",
+        );
+
+        const result = runFixtureValidator(root);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("PLUGIN_ROOT_LINK");
+      });
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("requires the exact plugin directory in npm package files", async () => {
+    await withPluginFixture(async (root) => {
+      await rewriteJson(join(root, "package.json"), (packageMetadata) => {
+        packageMetadata.files = ["dist", "README.md", "LICENSE"];
+      });
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PACKAGE_FILES");
+    });
   });
 });
