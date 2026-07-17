@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { Hash } from "node:crypto";
 import { types as utilTypes } from "node:util";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import type {
   LeaseGuard,
   StoragePort,
@@ -985,6 +985,173 @@ describe("synchronous revocable transactions", () => {
     ).toThrow(/reentry|root/iu);
     expect(store.getPlan(changePlanFixture.id)).toBeNull();
   });
+
+  test("captures structuredClone before callers can alias transaction state", () => {
+    const originalStructuredClone = globalThis.structuredClone;
+    const store = openStore();
+    const restoreStructuredClone = replaceOwnPropertyForTest(
+      globalThis,
+      "structuredClone",
+      <T>(value: T): T => value,
+    );
+
+    try {
+      expect(() =>
+        store.withTransaction((tx) => {
+          tx.savePlan(changePlanFixture);
+          throw new Error("rollback");
+        }),
+      ).toThrow(/rollback/u);
+    } finally {
+      restoreStructuredClone();
+    }
+
+    expect(globalThis.structuredClone).toBe(originalStructuredClone);
+    expect(store.getPlan(changePlanFixture.id)).toBeNull();
+  });
+
+  test("captures transaction constructors before callers can replace them", () => {
+    const store = openStore();
+    const restorers = [
+      replaceOwnPropertyForTest(
+        globalThis,
+        "Map",
+        function PoisonedMap(): never {
+          throw new Error("mutable Map constructor must not run");
+        },
+      ),
+      replaceOwnPropertyForTest(Object, "create", () => {
+        throw new Error("mutable Object.create must not run");
+      }),
+      replaceOwnPropertyForTest(Proxy, "revocable", () => {
+        throw new Error("mutable Proxy.revocable must not run");
+      }),
+    ];
+    let caught: unknown;
+
+    try {
+      try {
+        store.withTransaction(() => null);
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      for (let index = restorers.length - 1; index >= 0; index -= 1) {
+        restorers[index]?.();
+      }
+    }
+
+    expect(caught).toBeUndefined();
+    store.withTransaction((tx) => tx.savePlan(changePlanFixture));
+    expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+  });
+
+  test("cleans transaction flags even when the captured revoke throws", async () => {
+    const applyForTest = Reflect.apply;
+    const originalProxyRevocable = Proxy.revocable;
+    vi.resetModules();
+    const restoreProxyRevocable = replaceOwnPropertyForTest(
+      Proxy,
+      "revocable",
+      <T extends object>(
+        target: T,
+        handler: ProxyHandler<T>,
+      ): { proxy: T; revoke: () => void } => {
+        const pair = applyForTest(originalProxyRevocable, Proxy, [
+          target,
+          handler,
+        ]);
+        return {
+          proxy: pair.proxy,
+          revoke: () => {
+            pair.revoke();
+            throw new Error("forced revoke failure");
+          },
+        };
+      },
+    );
+    let isolatedFactory: typeof createMemoryStorage;
+    try {
+      ({ createMemoryStorage: isolatedFactory } =
+        await import("../../fixtures/memory-storage.js"));
+    } finally {
+      restoreProxyRevocable();
+    }
+
+    try {
+      const store = isolatedFactory({
+        cursorKey: new Uint8Array(32).fill(7),
+      });
+      store.migrate();
+      let callbackCount = 0;
+      expect(() =>
+        store.withTransaction(() => {
+          callbackCount += 1;
+          try {
+            store.getPlan(changePlanFixture.id);
+          } catch {
+            // Exercise transactionPoisoned cleanup as well.
+          }
+          return null;
+        }),
+      ).toThrow(/forced revoke failure/u);
+      expect(() =>
+        store.withTransaction((tx) => {
+          callbackCount += 1;
+          tx.savePlan(changePlanFixture);
+          return null;
+        }),
+      ).toThrow(/forced revoke failure/u);
+      expect(callbackCount).toBe(2);
+      expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+    } finally {
+      vi.resetModules();
+    }
+  });
+
+  /* eslint-disable @typescript-eslint/unbound-method -- The test captures Map intrinsics to restore and invoke them safely. */
+  test("does not expose private transaction maps through patched Map methods", () => {
+    const originalMapSet = Map.prototype.set;
+    const originalMapClear = Map.prototype.clear;
+    const applyForTest = Reflect.apply;
+    const store = openStore();
+    let leakedPlanMap: Map<unknown, unknown> | undefined;
+    let restoreMapSet: (() => void) | undefined;
+    const rememberLeakedPlanMap = (value: Map<unknown, unknown>): void => {
+      leakedPlanMap = value;
+    };
+
+    try {
+      store.withTransaction((tx) => {
+        restoreMapSet = replaceOwnPropertyForTest(
+          Map.prototype,
+          "set",
+          function patchedMapSet(
+            this: Map<unknown, unknown>,
+            key: unknown,
+            value: unknown,
+          ): Map<unknown, unknown> {
+            if (key === changePlanFixture.id) {
+              rememberLeakedPlanMap(this);
+            }
+            return applyForTest(originalMapSet, this, [key, value]);
+          },
+        );
+        tx.savePlan(changePlanFixture);
+        return null;
+      });
+    } finally {
+      restoreMapSet?.();
+    }
+
+    if (leakedPlanMap !== undefined) {
+      applyForTest(originalMapClear, leakedPlanMap, []);
+    }
+    expect(Map.prototype.set).toBe(originalMapSet);
+    expect(leakedPlanMap).toBeUndefined();
+    expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+  });
+  /* eslint-enable @typescript-eslint/unbound-method */
 
   test("starts unready and keeps migration/close idempotent without exposing a key", () => {
     const key = new Uint8Array(32).fill(5);
@@ -2281,9 +2448,13 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
     expect(() =>
       store.recoverIncompleteSnapshots("2026-07-16T00:15:00.000Z"),
     ).toThrow(/precede|timestamp/iu);
-    expect(
-      store.recoverIncompleteSnapshots("2026-07-16T00:21:00.000Z"),
-    ).toEqual([early.id, future.id]);
+    const recovered = store.recoverIncompleteSnapshots(
+      "2026-07-16T00:21:00.000Z",
+    );
+    expect(Array.isArray(recovered)).toBe(true);
+    expect(Object.getPrototypeOf(recovered)).toBe(Array.prototype);
+    expect(Object.isFrozen(recovered)).toBe(true);
+    expect(recovered.map((id) => id)).toEqual([early.id, future.id]);
   });
 
   test("recovers pending/running audit state once and rebinds a resumed run", () => {
@@ -2487,5 +2658,376 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
       unresolved: 0,
     });
     expect(Object.isFrozen(result)).toBe(true);
+  });
+});
+
+describe("recovery isolation from mutable realm hooks", () => {
+  test("captures structuredClone so a later snapshot failure rolls back every staged recovery", () => {
+    const originalStructuredClone = globalThis.structuredClone;
+    const store = openStore();
+    store.acquireLease({
+      name: "sync:clone-atomic",
+      ownerId: "old",
+      now: "2026-07-16T00:00:00.000Z",
+      expiresAt: "2026-07-16T00:10:00.000Z",
+    });
+    const guard = {
+      name: "sync:clone-atomic",
+      ownerId: "old",
+      now: "2026-07-16T00:01:00.000Z",
+    } as const;
+    const early = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_clone_atomic_early",
+      startedAt: "2026-07-16T00:00:00.000Z",
+    });
+    const future = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_clone_atomic_future",
+      startedAt: "2026-07-16T00:20:00.000Z",
+    });
+    store.createSnapshot({ draft: early, lease: guard });
+    store.createSnapshot({ draft: future, lease: guard });
+    const restoreStructuredClone = replaceOwnPropertyForTest(
+      globalThis,
+      "structuredClone",
+      <T>(value: T): T => value,
+    );
+
+    try {
+      expect(() =>
+        store.recoverIncompleteSnapshots("2026-07-16T00:15:00.000Z"),
+      ).toThrow(/precede|timestamp/iu);
+    } finally {
+      restoreStructuredClone();
+    }
+
+    expect(globalThis.structuredClone).toBe(originalStructuredClone);
+    expect(
+      store.recoverIncompleteSnapshots("2026-07-16T00:21:00.000Z"),
+    ).toEqual([early.id, future.id]);
+  });
+
+  /* eslint-disable @typescript-eslint/unbound-method -- The test records, damages, and restores receiver-sensitive collection intrinsics through captured Reflect.apply. */
+  test("does not leak active recovery state through patched Map, Set, Array, or Object hooks", () => {
+    const applyForTest = Reflect.apply;
+    const arrayIsArrayForTest = Array.isArray;
+    const originals = {
+      mapClear: Map.prototype.clear,
+      mapGet: Map.prototype.get,
+      mapSet: Map.prototype.set,
+      mapValues: Map.prototype.values,
+      setAdd: Set.prototype.add,
+      setClear: Set.prototype.clear,
+      setHas: Set.prototype.has,
+      arrayFilter: Array.prototype.filter,
+      objectFreeze: Object.freeze,
+    };
+    const observedMaps: Map<unknown, unknown>[] = [];
+    const observedSets: Set<unknown>[] = [];
+    const restorers: Array<() => void> = [];
+    let privateArrayReceivers = 0;
+    let privateObjectArguments = 0;
+
+    function rememberMap(receiver: Map<unknown, unknown>): void {
+      for (let index = 0; index < observedMaps.length; index += 1) {
+        if (observedMaps[index] === receiver) return;
+      }
+      observedMaps[observedMaps.length] = receiver;
+    }
+
+    function rememberSet(receiver: Set<unknown>): void {
+      for (let index = 0; index < observedSets.length; index += 1) {
+        if (observedSets[index] === receiver) return;
+      }
+      observedSets[observedSets.length] = receiver;
+    }
+
+    function isPrivateRecord(value: unknown): boolean {
+      if (value === null || typeof value !== "object") return false;
+      const snapshot = getOwnPropertyDescriptorForTest(value, "snapshot");
+      const run = getOwnPropertyDescriptorForTest(value, "run");
+      const leaseName = getOwnPropertyDescriptorForTest(value, "leaseName");
+      const leaseOwnerId = getOwnPropertyDescriptorForTest(
+        value,
+        "leaseOwnerId",
+      );
+      return (
+        (snapshot !== undefined || run !== undefined) &&
+        leaseName !== undefined &&
+        leaseOwnerId !== undefined
+      );
+    }
+
+    function observeArray(receiver: unknown): void {
+      if (!arrayIsArrayForTest(receiver)) return;
+      for (let index = 0; index < receiver.length; index += 1) {
+        const descriptor = getOwnPropertyDescriptorForTest(
+          receiver,
+          String(index),
+        );
+        if (
+          descriptor !== undefined &&
+          "value" in descriptor &&
+          isPrivateRecord(descriptor.value)
+        ) {
+          privateArrayReceivers += 1;
+          return;
+        }
+      }
+    }
+
+    function patch(
+      target: object,
+      property: PropertyKey,
+      value: unknown,
+    ): void {
+      restorers[restorers.length] = replaceOwnPropertyForTest(
+        target,
+        property,
+        value,
+      );
+    }
+
+    const store = openStore();
+    const leaseName = "sync:receiver-isolation";
+    store.acquireLease({
+      name: leaseName,
+      ownerId: "live-owner",
+      now: "2026-07-16T00:00:00.000Z",
+      expiresAt: "2026-07-16T00:10:00.000Z",
+    });
+    const guard = {
+      name: leaseName,
+      ownerId: "live-owner",
+      now: "2026-07-16T00:05:00.000Z",
+    } as const;
+    const draft = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_receiver_isolation",
+    });
+    store.createSnapshot({
+      draft,
+      lease: {
+        ...guard,
+        now: "2026-07-16T00:01:00.000Z",
+      },
+    });
+
+    let activeRecovery: readonly string[] | undefined;
+    let recoveryError: unknown;
+    try {
+      patch(
+        Map.prototype,
+        "get",
+        function patchedMapGet(
+          this: Map<unknown, unknown>,
+          key: unknown,
+        ): unknown {
+          rememberMap(this);
+          return applyForTest(originals.mapGet, this, [key]) as unknown;
+        },
+      );
+      patch(
+        Map.prototype,
+        "values",
+        function patchedMapValues(
+          this: Map<unknown, unknown>,
+        ): IterableIterator<unknown> {
+          rememberMap(this);
+          return applyForTest(
+            originals.mapValues,
+            this,
+            [],
+          ) as IterableIterator<unknown>;
+        },
+      );
+      patch(
+        Set.prototype,
+        "has",
+        function patchedSetHas(this: Set<unknown>, value: unknown): boolean {
+          rememberSet(this);
+          return applyForTest(originals.setHas, this, [value]);
+        },
+      );
+      patch(
+        Array.prototype,
+        "filter",
+        function patchedArrayFilter(
+          this: unknown,
+          ...args: unknown[]
+        ): unknown {
+          observeArray(this);
+          return applyForTest(originals.arrayFilter, this, args) as unknown;
+        },
+      );
+      patch(Object, "freeze", <T>(value: T): Readonly<T> => {
+        if (
+          isPrivateRecord(value) ||
+          (arrayIsArrayForTest(value) &&
+            getOwnPropertyDescriptorForTest(value, "length")?.value === 0)
+        ) {
+          privateObjectArguments += 1;
+        }
+        return applyForTest(originals.objectFreeze, Object, [
+          value,
+        ]) as Readonly<T>;
+      });
+
+      try {
+        activeRecovery = store.recoverAbandonedSnapshots({
+          binding: accountBindingFixture,
+          lease: guard,
+        });
+      } catch (error) {
+        recoveryError = error;
+      }
+    } finally {
+      for (let index = restorers.length - 1; index >= 0; index -= 1) {
+        restorers[index]?.();
+      }
+    }
+
+    const mapBackups = observedMaps.map((receiver) => ({
+      receiver,
+      entries: [...receiver.entries()],
+    }));
+    const setBackups = observedSets.map((receiver) => ({
+      receiver,
+      values: [...receiver.values()],
+    }));
+    for (const { receiver } of mapBackups) {
+      applyForTest(originals.mapClear, receiver, []);
+    }
+    for (const { receiver } of setBackups) {
+      applyForTest(originals.setClear, receiver, []);
+    }
+
+    let leaseSurvivedReceiverDamage = true;
+    try {
+      store.assertLease(guard);
+    } catch {
+      leaseSurvivedReceiverDamage = false;
+    }
+    let recoveredAfterReceiverDamage: readonly string[] = [];
+    try {
+      recoveredAfterReceiverDamage = store.recoverIncompleteSnapshots(
+        "2026-07-16T00:11:00.000Z",
+      );
+    } finally {
+      for (const backup of mapBackups) {
+        applyForTest(originals.mapClear, backup.receiver, []);
+        for (const [key, value] of backup.entries) {
+          applyForTest(originals.mapSet, backup.receiver, [key, value]);
+        }
+      }
+      for (const backup of setBackups) {
+        applyForTest(originals.setClear, backup.receiver, []);
+        for (const value of backup.values) {
+          applyForTest(originals.setAdd, backup.receiver, [value]);
+        }
+      }
+    }
+
+    expect(recoveryError).toBeUndefined();
+    expect(activeRecovery).toEqual([]);
+    expect({
+      leaseSurvivedReceiverDamage,
+      privateArrayReceivers,
+      privateObjectArguments,
+      recoveredAfterReceiverDamage,
+    }).toEqual({
+      leaseSurvivedReceiverDamage: true,
+      privateArrayReceivers: 0,
+      privateObjectArguments: 0,
+      recoveredAfterReceiverDamage: [draft.id],
+    });
+  });
+  /* eslint-enable @typescript-eslint/unbound-method */
+
+  test("captures structuredClone so targeted run recovery rolls back before a later candidate failure", () => {
+    const originalStructuredClone = globalThis.structuredClone;
+    const store = openStore();
+    const leaseName = "apply:clone-atomic";
+    store.acquireLease({
+      name: leaseName,
+      ownerId: "old",
+      now: "2026-07-16T02:00:00.000Z",
+      expiresAt: "2026-07-16T02:10:00.000Z",
+    });
+    const oldGuard = {
+      name: leaseName,
+      ownerId: "old",
+      now: "2026-07-16T02:01:00.000Z",
+    } as const;
+
+    const createCandidate = (suffix: "early" | "future", startedAt: string) => {
+      const plan = parseChangePlan({
+        ...changePlanFixture,
+        id: `plan_clone_atomic_${suffix}`,
+      });
+      const run = parseChangeRun({
+        ...changeRunFixture,
+        id: `run_clone_atomic_${suffix}`,
+        planId: plan.id,
+        startedAt,
+      });
+      store.savePlan(plan);
+      store.compareAndSetPlanState({
+        planId: plan.id,
+        expected: ["ready"],
+        next: "applying",
+      });
+      store.createRun({ run, lease: oldGuard });
+      store.compareAndSetRunState({
+        runId: run.id,
+        expected: ["pending"],
+        next: "running",
+        finishedAt: null,
+        lease: oldGuard,
+      });
+      return run;
+    };
+
+    const early = createCandidate("early", "2026-07-16T02:00:00.000Z");
+    const future = createCandidate("future", "2026-07-16T03:00:00.000Z");
+    store.acquireLease({
+      name: leaseName,
+      ownerId: "new",
+      now: "2026-07-16T02:11:00.000Z",
+      expiresAt: "2026-07-16T04:00:00.000Z",
+    });
+    const restoreStructuredClone = replaceOwnPropertyForTest(
+      globalThis,
+      "structuredClone",
+      <T>(value: T): T => value,
+    );
+
+    try {
+      expect(() =>
+        store.recoverAbandonedRuns({
+          binding: accountBindingFixture,
+          lease: {
+            name: leaseName,
+            ownerId: "new",
+            now: "2026-07-16T02:12:00.000Z",
+          },
+        }),
+      ).toThrow(/precede|finishedAt/iu);
+    } finally {
+      restoreStructuredClone();
+    }
+
+    expect(globalThis.structuredClone).toBe(originalStructuredClone);
+    expect(
+      store.recoverAbandonedRuns({
+        binding: accountBindingFixture,
+        lease: {
+          name: leaseName,
+          ownerId: "new",
+          now: "2026-07-16T03:01:00.000Z",
+        },
+      }),
+    ).toEqual([early.id, future.id]);
   });
 });

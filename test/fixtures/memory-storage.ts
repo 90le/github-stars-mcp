@@ -103,6 +103,279 @@ import {
 } from "../../src/domain/snapshot.js";
 import { canonicalUtcTimestamp } from "../../src/domain/timestamp.js";
 
+/* eslint-disable @typescript-eslint/unbound-method -- Intrinsics are captured once and receiver-sensitive methods are invoked only through captured Reflect.apply. */
+const objectGetOwnPropertyDescriptorAtLoad = Object.getOwnPropertyDescriptor;
+const mapSizeGetterAtLoad = objectGetOwnPropertyDescriptorAtLoad(
+  Map.prototype,
+  "size",
+)?.get;
+const setSizeGetterAtLoad = objectGetOwnPropertyDescriptorAtLoad(
+  Set.prototype,
+  "size",
+)?.get;
+if (mapSizeGetterAtLoad === undefined || setSizeGetterAtLoad === undefined) {
+  throw new Error("Map and Set size getters are required");
+}
+
+const freezeMemoryIntrinsics = Object.freeze;
+const MEMORY_INTRINSICS = freezeMemoryIntrinsics({
+  arrayIsArray: Array.isArray,
+  arraySort: Array.prototype.sort,
+  bufferCompare: Buffer.compare,
+  bufferFrom: Buffer.from,
+  mapConstructor: Map,
+  mapDelete: Map.prototype.delete,
+  mapForEach: Map.prototype.forEach,
+  mapGet: Map.prototype.get,
+  mapHas: Map.prototype.has,
+  mapSet: Map.prototype.set,
+  mapSizeGetter: mapSizeGetterAtLoad,
+  numberMaxSafeInteger: Number.MAX_SAFE_INTEGER,
+  numberIsSafeInteger: Number.isSafeInteger,
+  objectCreate: Object.create,
+  objectDefineProperties: Object.defineProperties,
+  objectDefineProperty: Object.defineProperty,
+  objectFreeze: freezeMemoryIntrinsics,
+  objectGetOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
+  objectGetPrototypeOf: Object.getPrototypeOf,
+  objectHasOwn: Object.hasOwn,
+  objectIs: Object.is,
+  objectKeys: Object.keys,
+  objectPrototype: Object.prototype,
+  proxyRevocable: Proxy.revocable,
+  randomBytes,
+  reflectApply: Reflect.apply,
+  reflectDefineProperty: Reflect.defineProperty,
+  reflectDeleteProperty: Reflect.deleteProperty,
+  reflectGetPrototypeOf: Reflect.getPrototypeOf,
+  reflectOwnKeys: Reflect.ownKeys,
+  regexpTest: RegExp.prototype.test,
+  setAdd: Set.prototype.add,
+  setConstructor: Set,
+  setForEach: Set.prototype.forEach,
+  setHas: Set.prototype.has,
+  setSizeGetter: setSizeGetterAtLoad,
+  stringFromValue: String,
+  stringLocaleCompare: String.prototype.localeCompare,
+  stringTrim: String.prototype.trim,
+  structuredClone: globalThis.structuredClone,
+  uint8ArrayFill: Uint8Array.prototype.fill,
+  utilIsProxy: utilTypes.isProxy,
+  utilIsUint8Array: utilTypes.isUint8Array,
+});
+/* eslint-enable @typescript-eslint/unbound-method */
+
+function createInternalArray<T>(): T[] {
+  return [];
+}
+
+function appendInternalArray<T>(target: T[], value: T): void {
+  if (
+    !MEMORY_INTRINSICS.reflectDefineProperty(
+      target,
+      MEMORY_INTRINSICS.stringFromValue(target.length),
+      {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+      },
+    )
+  ) {
+    throw new AppError("INTERNAL_ERROR", "internal array append failed");
+  }
+}
+
+function arrayCopy<T>(input: readonly T[]): T[] {
+  const result = createInternalArray<T>();
+  for (let index = 0; index < input.length; index += 1) {
+    appendInternalArray(result, input[index] as T);
+  }
+  return result;
+}
+
+function arrayFilter<T>(
+  input: readonly T[],
+  predicate: (value: T, index: number) => boolean,
+): T[] {
+  const result = createInternalArray<T>();
+  for (let index = 0; index < input.length; index += 1) {
+    const value = input[index] as T;
+    if (predicate(value, index)) appendInternalArray(result, value);
+  }
+  return result;
+}
+
+function arrayMap<T, U>(
+  input: readonly T[],
+  transform: (value: T, index: number) => U,
+): U[] {
+  const result = createInternalArray<U>();
+  for (let index = 0; index < input.length; index += 1) {
+    appendInternalArray(result, transform(input[index] as T, index));
+  }
+  return result;
+}
+
+function arraySome<T>(
+  input: readonly T[],
+  predicate: (value: T, index: number) => boolean,
+): boolean {
+  for (let index = 0; index < input.length; index += 1) {
+    if (predicate(input[index] as T, index)) return true;
+  }
+  return false;
+}
+
+function arrayIncludes<T>(input: readonly T[], expected: T): boolean {
+  for (let index = 0; index < input.length; index += 1) {
+    const value = input[index] as T;
+    if (value === expected || MEMORY_INTRINSICS.objectIs(value, expected)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function arraySlice<T>(input: readonly T[], start: number, end: number): T[] {
+  const result = createInternalArray<T>();
+  const startFromEnd = input.length + start;
+  const endFromEnd = input.length + end;
+  const first = start < 0 ? (startFromEnd < 0 ? 0 : startFromEnd) : start;
+  const last = end < 0 ? (endFromEnd < 0 ? 0 : endFromEnd) : end;
+  for (let index = first; index < input.length && index < last; index += 1) {
+    appendInternalArray(result, input[index] as T);
+  }
+  return result;
+}
+
+function arrayAt<T>(input: readonly T[], index: number): T | undefined {
+  const normalized = index < 0 ? input.length + index : index;
+  return normalized < 0 || normalized >= input.length
+    ? undefined
+    : input[normalized];
+}
+
+function arrayIndexOf<T>(input: readonly T[], expected: T): number {
+  for (let index = 0; index < input.length; index += 1) {
+    if (input[index] === expected) return index;
+  }
+  return -1;
+}
+
+function arrayFindIndex<T>(
+  input: readonly T[],
+  predicate: (value: T, index: number) => boolean,
+): number {
+  for (let index = 0; index < input.length; index += 1) {
+    if (predicate(input[index] as T, index)) return index;
+  }
+  return -1;
+}
+
+function arraySort<T>(
+  input: readonly T[],
+  compare: (left: T, right: T) => number,
+): T[] {
+  const result = arrayCopy(input);
+  MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.arraySort, result, [
+    compare,
+  ]);
+  return result;
+}
+
+function mapGet<K, V>(target: ReadonlyMap<K, V>, key: K): V | undefined {
+  return MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.mapGet, target, [
+    key,
+  ]) as V | undefined;
+}
+
+function mapSet<K, V>(target: Map<K, V>, key: K, value: V): void {
+  MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.mapSet, target, [
+    key,
+    value,
+  ]);
+}
+
+function mapHas<K, V>(target: ReadonlyMap<K, V>, key: K): boolean {
+  return MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.mapHas, target, [
+    key,
+  ]);
+}
+
+function mapDelete<K, V>(target: Map<K, V>, key: K): boolean {
+  return MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.mapDelete, target, [
+    key,
+  ]);
+}
+
+function mapSize<K, V>(target: ReadonlyMap<K, V>): number {
+  return MEMORY_INTRINSICS.reflectApply(
+    MEMORY_INTRINSICS.mapSizeGetter,
+    target,
+    [],
+  ) as number;
+}
+
+function mapForEach<K, V>(
+  target: ReadonlyMap<K, V>,
+  callback: (value: V, key: K) => void,
+): void {
+  MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.mapForEach, target, [
+    callback,
+  ]);
+}
+
+function mapValuesArray<K, V>(target: ReadonlyMap<K, V>): V[] {
+  const result = createInternalArray<V>();
+  mapForEach(target, (value) => appendInternalArray(result, value));
+  return result;
+}
+
+function mapKeysArray<K, V>(target: ReadonlyMap<K, V>): K[] {
+  const result = createInternalArray<K>();
+  mapForEach(target, (_value, key) => appendInternalArray(result, key));
+  return result;
+}
+
+function mapEntriesArray<K, V>(target: ReadonlyMap<K, V>): [K, V][] {
+  const result = createInternalArray<[K, V]>();
+  mapForEach(target, (value, key) => appendInternalArray(result, [key, value]));
+  return result;
+}
+
+function createMap<K, V>(): Map<K, V> {
+  return new MEMORY_INTRINSICS.mapConstructor<K, V>();
+}
+
+function copyMap<K, V>(source: ReadonlyMap<K, V>): Map<K, V> {
+  const result = createMap<K, V>();
+  mapForEach(source, (value, key) => mapSet(result, key, value));
+  return result;
+}
+
+function setHas<T>(target: ReadonlySet<T>, value: T): boolean {
+  return MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.setHas, target, [
+    value,
+  ]);
+}
+
+function setAdd<T>(target: Set<T>, value: T): void {
+  MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.setAdd, target, [value]);
+}
+
+function setSize<T>(target: ReadonlySet<T>): number {
+  return MEMORY_INTRINSICS.reflectApply(
+    MEMORY_INTRINSICS.setSizeGetter,
+    target,
+    [],
+  ) as number;
+}
+
+function createSet<T>(): Set<T> {
+  return new MEMORY_INTRINSICS.setConstructor<T>();
+}
+
 interface VerificationState {
   coverage: Exclude<ListCoverage, "collecting">;
   status: "collecting" | "finished";
@@ -149,7 +422,7 @@ export interface MemoryStorageOptions {
 
 type TransactionMethodName = keyof StorageTransaction;
 
-const TRANSACTION_METHODS = Object.freeze([
+const TRANSACTION_METHODS = MEMORY_INTRINSICS.objectFreeze([
   "assertLease",
   "createSnapshot",
   "appendSnapshotBatch",
@@ -216,13 +489,17 @@ function safeObject(
   label: string,
 ): Record<string, JsonValue> {
   const clone = canonicalJsonClone(value);
-  if (clone === null || typeof clone !== "object" || Array.isArray(clone)) {
+  if (
+    clone === null ||
+    typeof clone !== "object" ||
+    MEMORY_INTRINSICS.arrayIsArray(clone)
+  ) {
     return failure("VALIDATION_ERROR", `${label} must be an object`);
   }
-  const actual = Object.keys(clone);
+  const actual = MEMORY_INTRINSICS.objectKeys(clone);
   if (
     actual.length !== keys.length ||
-    actual.some((key) => !keys.includes(key))
+    arraySome(actual, (key) => !arrayIncludes(keys, key))
   ) {
     return failure(
       "VALIDATION_ERROR",
@@ -237,7 +514,8 @@ function stableText(value: JsonValue, label: string): string {
     typeof value !== "string" ||
     value.length === 0 ||
     value.length > 256 ||
-    value !== value.trim()
+    value !==
+      MEMORY_INTRINSICS.reflectApply(MEMORY_INTRINSICS.stringTrim, value, [])
   ) {
     return failure("VALIDATION_ERROR", `${label} must be stable text`);
   }
@@ -272,17 +550,17 @@ function integer(
   value: JsonValue,
   label: string,
   minimum: number,
-  maximum = Number.MAX_SAFE_INTEGER,
+  maximum = MEMORY_INTRINSICS.numberMaxSafeInteger,
 ): number {
   if (
     typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
+    !MEMORY_INTRINSICS.numberIsSafeInteger(value) ||
     value < minimum ||
     value > maximum
   ) {
     return failure(
       "VALIDATION_ERROR",
-      `${label} must be an integer from ${String(minimum)} to ${String(maximum)}`,
+      `${label} must be an integer from ${MEMORY_INTRINSICS.stringFromValue(minimum)} to ${MEMORY_INTRINSICS.stringFromValue(maximum)}`,
     );
   }
   return value;
@@ -324,18 +602,18 @@ function cloneReconciliation(
 
 function emptyState(): MemoryState {
   return {
-    leases: new Map(),
-    snapshots: new Map(),
-    repositoryMetadata: new Map(),
-    repositoryVersions: new Map(),
-    repositoryDatabaseIds: new Map(),
-    repositoryIdsByDatabaseId: new Map(),
-    plans: new Map(),
-    runs: new Map(),
-    runByPlan: new Map(),
-    operations: new Map(),
-    attempts: new Map(),
-    reconciliations: new Map(),
+    leases: createMap(),
+    snapshots: createMap(),
+    repositoryMetadata: createMap(),
+    repositoryVersions: createMap(),
+    repositoryDatabaseIds: createMap(),
+    repositoryIdsByDatabaseId: createMap(),
+    plans: createMap(),
+    runs: createMap(),
+    runByPlan: createMap(),
+    operations: createMap(),
+    attempts: createMap(),
+    reconciliations: createMap(),
   };
 }
 
@@ -357,7 +635,7 @@ function parseBinding(input: JsonValue): AccountBinding {
   if (host !== "github.com") {
     return failure("VALIDATION_ERROR", "account host must be github.com");
   }
-  return Object.freeze({
+  return MEMORY_INTRINSICS.objectFreeze({
     host,
     login: stableText(root.login as JsonValue, "account login"),
     accountId: stableText(root.accountId as JsonValue, "account ID"),
@@ -366,7 +644,7 @@ function parseBinding(input: JsonValue): AccountBinding {
 
 function parseGuard(input: JsonValue): LeaseGuard {
   const root = safeObject(input, ["name", "ownerId", "now"], "lease guard");
-  return Object.freeze({
+  return MEMORY_INTRINSICS.objectFreeze({
     name: stableText(root.name as JsonValue, "lease name"),
     ownerId: stableText(root.ownerId as JsonValue, "lease owner"),
     now: canonicalUtcTimestamp(root.now, "lease guard now"),
@@ -384,7 +662,7 @@ function parseAcquire(input: unknown): AcquireLeaseInput {
   if (expiresAt <= now) {
     return failure("VALIDATION_ERROR", "lease expiry must be later than now");
   }
-  return Object.freeze({
+  return MEMORY_INTRINSICS.objectFreeze({
     name: stableText(root.name as JsonValue, "lease name"),
     ownerId: stableText(root.ownerId as JsonValue, "lease owner"),
     now,
@@ -394,7 +672,7 @@ function parseAcquire(input: unknown): AcquireLeaseInput {
 
 function assertLeaseCore(state: MemoryState, input: unknown): Lease {
   const guard = parseGuard(canonicalJsonClone(input));
-  const lease = state.leases.get(guard.name);
+  const lease = mapGet(state.leases, guard.name);
   if (
     lease === undefined ||
     lease.ownerId !== guard.ownerId ||
@@ -431,7 +709,7 @@ function assertRecordLease(
 }
 
 function snapshotRecord(state: MemoryState, id: SnapshotId): SnapshotRecord {
-  const record = state.snapshots.get(id);
+  const record = mapGet(state.snapshots, id);
   if (record === undefined) {
     return failure("NOT_FOUND", "snapshot was not found");
   }
@@ -442,7 +720,7 @@ function completeSnapshotRecord(
   state: MemoryState,
   id: SnapshotId,
 ): SnapshotRecord {
-  const record = state.snapshots.get(id);
+  const record = mapGet(state.snapshots, id);
   if (record === undefined || record.snapshot.status !== "complete") {
     return failure("NOT_FOUND", "complete snapshot was not found");
   }
@@ -454,7 +732,10 @@ function membershipKey(listId: UserListId, repositoryId: RepositoryId): string {
 }
 
 function binaryCompare(left: string, right: string): number {
-  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+  return MEMORY_INTRINSICS.bufferCompare(
+    MEMORY_INTRINSICS.bufferFrom(left, "utf8"),
+    MEMORY_INTRINSICS.bufferFrom(right, "utf8"),
+  );
 }
 
 function metadataClone(
@@ -481,7 +762,13 @@ function registerRepositoryVersion(
   input: Repository,
   versionHash: string,
 ): Repository {
-  if (!/^[0-9a-f]{64}$/u.test(versionHash)) {
+  if (
+    !MEMORY_INTRINSICS.reflectApply(
+      MEMORY_INTRINSICS.regexpTest,
+      /^[0-9a-f]{64}$/u,
+      [versionHash],
+    )
+  ) {
     return failure(
       "VALIDATION_ERROR",
       "repository metadata version hash is invalid",
@@ -489,7 +776,7 @@ function registerRepositoryVersion(
   }
   const repository = frozenClone(repositorySchema.parse(input));
   const key = repositoryVersionKey(repository.repositoryId, versionHash);
-  const existing = versions.get(key);
+  const existing = mapGet(versions, key);
   if (
     existing !== undefined &&
     canonicalJson(existing) !== canonicalJson(repository)
@@ -500,7 +787,7 @@ function registerRepositoryVersion(
     );
   }
   if (existing !== undefined) return existing;
-  versions.set(key, repository);
+  mapSet(versions, key, repository);
   return repository;
 }
 
@@ -517,7 +804,7 @@ function registerRepositoryIdentity(
   repositoryIds: Map<string, RepositoryId>,
   repository: Repository,
 ): void {
-  const knownDatabaseId = databaseIds.get(repository.repositoryId);
+  const knownDatabaseId = mapGet(databaseIds, repository.repositoryId);
   if (
     knownDatabaseId !== undefined &&
     knownDatabaseId !== repository.repositoryDatabaseId
@@ -527,7 +814,10 @@ function registerRepositoryIdentity(
       "repository node ID has an immutable database identity",
     );
   }
-  const knownRepositoryId = repositoryIds.get(repository.repositoryDatabaseId);
+  const knownRepositoryId = mapGet(
+    repositoryIds,
+    repository.repositoryDatabaseId,
+  );
   if (
     knownRepositoryId !== undefined &&
     knownRepositoryId !== repository.repositoryId
@@ -537,8 +827,12 @@ function registerRepositoryIdentity(
       "repository database ID is already bound to another node ID",
     );
   }
-  databaseIds.set(repository.repositoryId, repository.repositoryDatabaseId);
-  repositoryIds.set(repository.repositoryDatabaseId, repository.repositoryId);
+  mapSet(databaseIds, repository.repositoryId, repository.repositoryDatabaseId);
+  mapSet(
+    repositoryIds,
+    repository.repositoryDatabaseId,
+    repository.repositoryId,
+  );
 }
 
 function metadataIsNewer(
@@ -556,13 +850,19 @@ function buildRepositoryFilterView(
   record: SnapshotRecord,
   repositoryId: RepositoryId,
 ): RepositoryFilterView | null {
-  const observation = record.repositories.get(repositoryId);
-  const star = record.stars.get(repositoryId);
+  const observation = mapGet(record.repositories, repositoryId);
+  const star = mapGet(record.stars, repositoryId);
   if (observation === undefined || star === undefined) return null;
-  const listIds = [...record.memberships.values()]
-    .filter((entry) => entry.repositoryId === repositoryId)
-    .map((entry) => entry.listId)
-    .sort(binaryCompare);
+  const listIds = arraySort(
+    arrayMap(
+      arrayFilter(
+        mapValuesArray(record.memberships),
+        (entry) => entry.repositoryId === repositoryId,
+      ),
+      (entry) => entry.listId,
+    ),
+    binaryCompare,
+  );
   return frozenClone(
     repositoryFilterViewSchema.parse({
       ...observation.repository,
@@ -574,7 +874,7 @@ function buildRepositoryFilterView(
 
 function publicRepositoryView(view: RepositoryFilterView): RepositoryView {
   const publicView: Record<string, unknown> = { ...view };
-  Reflect.deleteProperty(publicView, "listIds");
+  MEMORY_INTRINSICS.reflectDeleteProperty(publicView, "listIds");
   return frozenClone(repositoryViewSchema.parse(publicView));
 }
 
@@ -592,9 +892,13 @@ function setEqual<T>(
   right: Map<string, T>,
   serialize: (value: T) => string,
 ): boolean {
-  if (left.size !== right.size) return false;
-  for (const [key, value] of left) {
-    const candidate = right.get(key);
+  if (mapSize(left) !== mapSize(right)) return false;
+  const entries = mapEntriesArray(left);
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index] as [string, T];
+    const key = entry[0];
+    const value = entry[1];
+    const candidate = mapGet(right, key);
     if (candidate === undefined || serialize(value) !== serialize(candidate)) {
       return false;
     }
@@ -642,7 +946,7 @@ function operationsFor(
   state: MemoryState,
   runId: RunId,
 ): Map<string, RunOperation> {
-  return state.operations.get(runId) ?? new Map<string, RunOperation>();
+  return mapGet(state.operations, runId) ?? createMap<string, RunOperation>();
 }
 
 function operationRecord(
@@ -650,7 +954,9 @@ function operationRecord(
   runId: RunId,
   operationId: string,
 ): RunOperation {
-  const operation = state.operations.get(runId)?.get(operationId);
+  const operations = mapGet(state.operations, runId);
+  const operation =
+    operations === undefined ? undefined : mapGet(operations, operationId);
   if (operation === undefined) {
     return failure("NOT_FOUND", "run operation was not found");
   }
@@ -658,13 +964,13 @@ function operationRecord(
 }
 
 function runRecord(state: MemoryState, id: RunId): RunRecord {
-  const record = state.runs.get(id);
+  const record = mapGet(state.runs, id);
   if (record === undefined) return failure("NOT_FOUND", "run was not found");
   return record;
 }
 
 function planRecord(state: MemoryState, id: PlanId): ChangePlan {
-  const plan = state.plans.get(id);
+  const plan = mapGet(state.plans, id);
   if (plan === undefined) return failure("NOT_FOUND", "plan was not found");
   return plan;
 }
@@ -697,36 +1003,43 @@ function pageResult<T>(
   sequence: (item: T) => number,
 ): { items: readonly T[]; next: number | null } {
   const remaining =
-    after === null ? all : all.filter((item) => sequence(item) > after);
-  const items = remaining.slice(0, pageSize);
+    after === null
+      ? arrayCopy(all)
+      : arrayFilter(all, (item) => sequence(item) > after);
+  const items = arraySlice(remaining, 0, pageSize);
   return {
     items,
     next:
       remaining.length > items.length && items.length > 0
-        ? sequence(items.at(-1) as T)
+        ? sequence(arrayAt(items, -1) as T)
         : null,
   };
 }
 
 function recoveryError(kind: "pending" | "running"): SerializedDomainError {
-  return Object.freeze({
+  return MEMORY_INTRINSICS.objectFreeze({
     code: kind === "running" ? "RECONCILIATION_REQUIRED" : "INTERNAL_ERROR",
     message:
       kind === "running"
         ? "Dispatch outcome is unknown after interruption"
         : "Operation was interrupted before dispatch; dispatch did not occur",
     retryable: kind === "pending",
-    details: Object.freeze({ recovered: true }),
+    details: MEMORY_INTRINSICS.objectFreeze({ recovered: true }),
   });
 }
 
 function recoverRun(state: MemoryState, record: RunRecord, now: string): void {
   const runId = record.run.id;
-  const operations = state.operations.get(runId);
+  const operations = mapGet(state.operations, runId);
   if (operations !== undefined) {
-    for (const [id, operation] of operations) {
+    const operationEntries = mapEntriesArray(operations);
+    for (let index = 0; index < operationEntries.length; index += 1) {
+      const entry = operationEntries[index] as [string, RunOperation];
+      const id = entry[0];
+      const operation = entry[1];
       if (operation.status === "pending") {
-        operations.set(
+        mapSet(
+          operations,
           id,
           parseRunOperation({
             ...operation,
@@ -750,11 +1063,15 @@ function recoverRun(state: MemoryState, record: RunRecord, now: string): void {
           error,
           finishedAt: now,
         });
-        operations.set(id, recovered);
-        const attempts = state.attempts.get(operationKey(runId, id));
-        const attempt = attempts?.get(operation.attempts);
-        if (attempt?.status === "running") {
-          attempts?.set(
+        mapSet(operations, id, recovered);
+        const attempts = mapGet(state.attempts, operationKey(runId, id));
+        const attempt =
+          attempts === undefined
+            ? undefined
+            : mapGet(attempts, operation.attempts);
+        if (attempts !== undefined && attempt?.status === "running") {
+          mapSet(
+            attempts,
             operation.attempts,
             parseRunOperationAttempt({
               ...attempt,
@@ -777,9 +1094,13 @@ function recoverRun(state: MemoryState, record: RunRecord, now: string): void {
     ),
     finishedAt: now,
   });
-  const plan = state.plans.get(record.run.planId);
+  const plan = mapGet(state.plans, record.run.planId);
   if (plan?.state === "applying") {
-    state.plans.set(plan.id, parseChangePlan({ ...plan, state: "partial" }));
+    mapSet(
+      state.plans,
+      plan.id,
+      parseChangePlan({ ...plan, state: "partial" }),
+    );
   }
 }
 
@@ -788,7 +1109,7 @@ function hasActiveStoredLease(
   record: { leaseName: string; leaseOwnerId: string },
   now: string,
 ): boolean {
-  const lease = state.leases.get(record.leaseName);
+  const lease = mapGet(state.leases, record.leaseName);
   return (
     lease !== undefined &&
     lease.ownerId === record.leaseOwnerId &&
@@ -809,17 +1130,19 @@ export function createMemoryStorage(
   let cursorKeyInput: Uint8Array | undefined;
   try {
     if (
-      utilTypes.isProxy(options) ||
-      Reflect.getPrototypeOf(options) !== Object.prototype
+      MEMORY_INTRINSICS.utilIsProxy(options) ||
+      MEMORY_INTRINSICS.reflectGetPrototypeOf(options) !==
+        MEMORY_INTRINSICS.objectPrototype
     ) {
       return failure("VALIDATION_ERROR", "storage options must be plain data");
     }
-    const descriptors = Object.getOwnPropertyDescriptors(options);
-    const keys = Reflect.ownKeys(descriptors);
+    const descriptors =
+      MEMORY_INTRINSICS.objectGetOwnPropertyDescriptors(options);
+    const keys = MEMORY_INTRINSICS.reflectOwnKeys(descriptors);
     if (
-      keys.some((key) => key !== "cursorKey") ||
+      arraySome(keys, (key) => key !== "cursorKey") ||
       (descriptors.cursorKey !== undefined &&
-        (!Object.hasOwn(descriptors.cursorKey, "value") ||
+        (!MEMORY_INTRINSICS.objectHasOwn(descriptors.cursorKey, "value") ||
           descriptors.cursorKey.enumerable !== true))
     ) {
       return failure("VALIDATION_ERROR", "storage options must be plain data");
@@ -836,8 +1159,8 @@ export function createMemoryStorage(
   if (cursorKeyInput !== undefined) {
     try {
       if (
-        utilTypes.isProxy(cursorKeyInput) ||
-        !utilTypes.isUint8Array(cursorKeyInput)
+        MEMORY_INTRINSICS.utilIsProxy(cursorKeyInput) ||
+        !MEMORY_INTRINSICS.utilIsUint8Array(cursorKeyInput)
       ) {
         return failure("VALIDATION_ERROR", "cursor key must be a Uint8Array");
       }
@@ -880,23 +1203,23 @@ export function createMemoryStorage(
         return assertLeaseCore(target, args[0]);
       case "acquireLease": {
         const input = parseAcquire(args[0]);
-        const existing = target.leases.get(input.name);
+        const existing = mapGet(target.leases, input.name);
         if (existing !== undefined && existing.expiresAt > input.now) {
           return null;
         }
-        const lease = Object.freeze({
+        const lease = MEMORY_INTRINSICS.objectFreeze({
           name: input.name,
           ownerId: input.ownerId,
           acquiredAt: input.now,
           heartbeatAt: input.now,
           expiresAt: input.expiresAt,
         });
-        target.leases.set(input.name, lease);
+        mapSet(target.leases, input.name, lease);
         return frozenClone(lease);
       }
       case "renewLease": {
         const input = parseAcquire(args[0]);
-        const existing = target.leases.get(input.name);
+        const existing = mapGet(target.leases, input.name);
         if (existing === undefined) {
           return failure("NOT_FOUND", "lease was not found");
         }
@@ -911,12 +1234,12 @@ export function createMemoryStorage(
             "lease cannot be renewed by this owner or time",
           );
         }
-        const lease = Object.freeze({
+        const lease = MEMORY_INTRINSICS.objectFreeze({
           ...existing,
           heartbeatAt: input.now,
           expiresAt: input.expiresAt,
         });
-        target.leases.set(input.name, lease);
+        mapSet(target.leases, input.name, lease);
         return frozenClone(lease);
       }
       case "releaseLease": {
@@ -927,7 +1250,7 @@ export function createMemoryStorage(
         );
         const nameValue = stableText(input.name as JsonValue, "lease name");
         const ownerId = stableText(input.ownerId as JsonValue, "lease owner");
-        const existing = target.leases.get(nameValue);
+        const existing = mapGet(target.leases, nameValue);
         if (existing === undefined) {
           return failure("NOT_FOUND", "lease was not found");
         }
@@ -937,7 +1260,7 @@ export function createMemoryStorage(
             "lease belongs to another owner",
           );
         }
-        target.leases.delete(nameValue);
+        mapDelete(target.leases, nameValue);
         return undefined;
       }
       case "createSnapshot": {
@@ -949,7 +1272,7 @@ export function createMemoryStorage(
         const draft = parseSnapshotDraft(input.draft);
         const guard = parseGuard(input.lease as JsonValue);
         assertLeaseCore(target, guard);
-        if (target.snapshots.has(draft.id)) {
+        if (mapHas(target.snapshots, draft.id)) {
           return failure("PRECONDITION_FAILED", "snapshot ID already exists");
         }
         const snapshot = parseSnapshot({
@@ -961,12 +1284,15 @@ export function createMemoryStorage(
           warningCount: 0,
           sourceRateLimit: null,
         });
-        target.snapshots.set(draft.id, {
+        mapSet(target.snapshots, draft.id, {
           snapshot,
-          repositories: new Map(),
-          stars: new Map(),
-          lists: new Map(),
-          memberships: new Map(),
+          repositories: createMap<string, ObservedRepositoryMetadata>(),
+          stars: createMap<string, StarRecord>(),
+          lists: createMap<string, UserList>(),
+          memberships: createMap<
+            string,
+            { listId: UserListId; repositoryId: RepositoryId }
+          >(),
           verification: null,
           leaseName: guard.name,
           leaseOwnerId: guard.ownerId,
@@ -998,26 +1324,30 @@ export function createMemoryStorage(
             "snapshot without List collection cannot accept List rows",
           );
         }
-        const seenRepositories = new Set<string>();
-        const seenStars = new Set<string>();
-        const seenLists = new Set<string>();
-        const seenMemberships = new Set<string>();
-        const stagedVersions = new Map(target.repositoryVersions);
-        const stagedDatabaseIds = new Map(target.repositoryDatabaseIds);
-        const stagedRepositoryIds = new Map(target.repositoryIdsByDatabaseId);
-        const stagedObservations: ObservedRepositoryMetadata[] = [];
-        for (const observation of batch.repositories) {
+        const seenRepositories = createSet<string>();
+        const seenStars = createSet<string>();
+        const seenLists = createSet<string>();
+        const seenMemberships = createSet<string>();
+        const stagedVersions = copyMap(target.repositoryVersions);
+        const stagedDatabaseIds = copyMap(target.repositoryDatabaseIds);
+        const stagedRepositoryIds = copyMap(target.repositoryIdsByDatabaseId);
+        const stagedObservations =
+          createInternalArray<ObservedRepositoryMetadata>();
+        for (let index = 0; index < batch.repositories.length; index += 1) {
+          const observation = batch.repositories[
+            index
+          ] as ObservedRepositoryMetadata;
           const idValue = observation.repository.repositoryId;
           if (
-            record.repositories.has(idValue) ||
-            seenRepositories.has(idValue)
+            mapHas(record.repositories, idValue) ||
+            setHas(seenRepositories, idValue)
           ) {
             return failure(
               "PRECONDITION_FAILED",
               "duplicate repository observation in snapshot",
             );
           }
-          seenRepositories.add(idValue);
+          setAdd(seenRepositories, idValue);
           registerRepositoryIdentity(
             stagedDatabaseIds,
             stagedRepositoryIds,
@@ -1028,57 +1358,77 @@ export function createMemoryStorage(
             observation.repository,
             repositoryVersionHash(observation),
           );
-          stagedObservations.push(
+          appendInternalArray(
+            stagedObservations,
             metadataClone({
               repository,
               observedAt: observation.observedAt,
             }),
           );
         }
-        for (const star of batch.stars) {
+        for (let index = 0; index < batch.stars.length; index += 1) {
+          const star = batch.stars[index] as StarRecord;
           if (
-            record.stars.has(star.repositoryId) ||
-            seenStars.has(star.repositoryId)
+            mapHas(record.stars, star.repositoryId) ||
+            setHas(seenStars, star.repositoryId)
           ) {
             return failure("PRECONDITION_FAILED", "duplicate Star in snapshot");
           }
-          seenStars.add(star.repositoryId);
+          setAdd(seenStars, star.repositoryId);
         }
-        for (const list of batch.lists) {
-          if (record.lists.has(list.listId) || seenLists.has(list.listId)) {
+        for (let index = 0; index < batch.lists.length; index += 1) {
+          const list = batch.lists[index] as UserList;
+          if (
+            mapHas(record.lists, list.listId) ||
+            setHas(seenLists, list.listId)
+          ) {
             return failure("PRECONDITION_FAILED", "duplicate List in snapshot");
           }
-          seenLists.add(list.listId);
+          setAdd(seenLists, list.listId);
         }
-        for (const membership of batch.memberships) {
+        for (let index = 0; index < batch.memberships.length; index += 1) {
+          const membership = batch.memberships[index] as {
+            listId: UserListId;
+            repositoryId: RepositoryId;
+          };
           const key = membershipKey(membership.listId, membership.repositoryId);
-          if (record.memberships.has(key) || seenMemberships.has(key)) {
+          if (mapHas(record.memberships, key) || setHas(seenMemberships, key)) {
             return failure(
               "PRECONDITION_FAILED",
               "duplicate List membership in snapshot",
             );
           }
-          seenMemberships.add(key);
+          setAdd(seenMemberships, key);
         }
         target.repositoryVersions = stagedVersions;
         target.repositoryDatabaseIds = stagedDatabaseIds;
         target.repositoryIdsByDatabaseId = stagedRepositoryIds;
-        for (const cloned of stagedObservations) {
+        for (let index = 0; index < stagedObservations.length; index += 1) {
+          const cloned = stagedObservations[
+            index
+          ] as ObservedRepositoryMetadata;
           const idValue = cloned.repository.repositoryId;
-          record.repositories.set(idValue, cloned);
-          const current = target.repositoryMetadata.get(idValue);
+          mapSet(record.repositories, idValue, cloned);
+          const current = mapGet(target.repositoryMetadata, idValue);
           if (current === undefined || metadataIsNewer(cloned, current)) {
-            target.repositoryMetadata.set(idValue, cloned);
+            mapSet(target.repositoryMetadata, idValue, cloned);
           }
         }
-        for (const star of batch.stars) {
-          record.stars.set(star.repositoryId, frozenClone(star));
+        for (let index = 0; index < batch.stars.length; index += 1) {
+          const star = batch.stars[index] as StarRecord;
+          mapSet(record.stars, star.repositoryId, frozenClone(star));
         }
-        for (const list of batch.lists) {
-          record.lists.set(list.listId, frozenClone(list));
+        for (let index = 0; index < batch.lists.length; index += 1) {
+          const list = batch.lists[index] as UserList;
+          mapSet(record.lists, list.listId, frozenClone(list));
         }
-        for (const membership of batch.memberships) {
-          record.memberships.set(
+        for (let index = 0; index < batch.memberships.length; index += 1) {
+          const membership = batch.memberships[index] as {
+            listId: UserListId;
+            repositoryId: RepositoryId;
+          };
+          mapSet(
+            record.memberships,
             membershipKey(membership.listId, membership.repositoryId),
             frozenClone(membership),
           );
@@ -1127,9 +1477,12 @@ export function createMemoryStorage(
         record.verification = {
           coverage,
           status: "collecting",
-          stars: new Map(),
-          lists: new Map(),
-          memberships: new Map(),
+          stars: createMap<string, StarRecord>(),
+          lists: createMap<string, UserList>(),
+          memberships: createMap<
+            string,
+            { listId: UserListId; repositoryId: RepositoryId }
+          >(),
         };
         return undefined;
       }
@@ -1163,48 +1516,64 @@ export function createMemoryStorage(
             "verification without List coverage cannot accept List rows",
           );
         }
-        const seenStars = new Set<string>();
-        const seenLists = new Set<string>();
-        const seenMemberships = new Set<string>();
-        for (const star of batch.stars) {
+        const seenStars = createSet<string>();
+        const seenLists = createSet<string>();
+        const seenMemberships = createSet<string>();
+        for (let index = 0; index < batch.stars.length; index += 1) {
+          const star = batch.stars[index] as StarRecord;
           if (
-            verification.stars.has(star.repositoryId) ||
-            seenStars.has(star.repositoryId)
+            mapHas(verification.stars, star.repositoryId) ||
+            setHas(seenStars, star.repositoryId)
           ) {
             return collectionChanged(
               "collection changed: duplicate verification Star",
             );
           }
-          seenStars.add(star.repositoryId);
+          setAdd(seenStars, star.repositoryId);
         }
-        for (const list of batch.lists) {
+        for (let index = 0; index < batch.lists.length; index += 1) {
+          const list = batch.lists[index] as UserList;
           if (
-            verification.lists.has(list.listId) ||
-            seenLists.has(list.listId)
+            mapHas(verification.lists, list.listId) ||
+            setHas(seenLists, list.listId)
           ) {
             return collectionChanged(
               "collection changed: duplicate verification List",
             );
           }
-          seenLists.add(list.listId);
+          setAdd(seenLists, list.listId);
         }
-        for (const membership of batch.memberships) {
+        for (let index = 0; index < batch.memberships.length; index += 1) {
+          const membership = batch.memberships[index] as {
+            listId: UserListId;
+            repositoryId: RepositoryId;
+          };
           const key = membershipKey(membership.listId, membership.repositoryId);
-          if (verification.memberships.has(key) || seenMemberships.has(key)) {
+          if (
+            mapHas(verification.memberships, key) ||
+            setHas(seenMemberships, key)
+          ) {
             return collectionChanged(
               "collection changed: duplicate verification membership",
             );
           }
-          seenMemberships.add(key);
+          setAdd(seenMemberships, key);
         }
-        for (const star of batch.stars) {
-          verification.stars.set(star.repositoryId, frozenClone(star));
+        for (let index = 0; index < batch.stars.length; index += 1) {
+          const star = batch.stars[index] as StarRecord;
+          mapSet(verification.stars, star.repositoryId, frozenClone(star));
         }
-        for (const list of batch.lists) {
-          verification.lists.set(list.listId, frozenClone(list));
+        for (let index = 0; index < batch.lists.length; index += 1) {
+          const list = batch.lists[index] as UserList;
+          mapSet(verification.lists, list.listId, frozenClone(list));
         }
-        for (const membership of batch.memberships) {
-          verification.memberships.set(
+        for (let index = 0; index < batch.memberships.length; index += 1) {
+          const membership = batch.memberships[index] as {
+            listId: UserListId;
+            repositoryId: RepositoryId;
+          };
+          mapSet(
+            verification.memberships,
             membershipKey(membership.listId, membership.repositoryId),
             frozenClone(membership),
           );
@@ -1258,10 +1627,10 @@ export function createMemoryStorage(
         }
         const counts = parseSnapshotCounts(input.counts);
         const actual = {
-          repositories: record.repositories.size,
-          stars: record.stars.size,
-          lists: record.lists.size,
-          memberships: record.memberships.size,
+          repositories: mapSize(record.repositories),
+          stars: mapSize(record.stars),
+          lists: mapSize(record.lists),
+          memberships: mapSize(record.memberships),
         };
         if (canonicalJson(counts) !== canonicalJson(actual)) {
           return failure(
@@ -1274,18 +1643,25 @@ export function createMemoryStorage(
             "collection changed during snapshot verification",
           );
         }
-        for (const repositoryId of record.stars.keys()) {
-          if (!record.repositories.has(repositoryId)) {
+        const repositoryIds = mapKeysArray(record.stars);
+        for (let index = 0; index < repositoryIds.length; index += 1) {
+          const repositoryId = repositoryIds[index] as string;
+          if (!mapHas(record.repositories, repositoryId)) {
             return failure(
               "PRECONDITION_FAILED",
               "Star lacks pinned repository metadata",
             );
           }
         }
-        for (const membership of record.memberships.values()) {
+        const memberships = mapValuesArray(record.memberships);
+        for (let index = 0; index < memberships.length; index += 1) {
+          const membership = memberships[index] as {
+            listId: UserListId;
+            repositoryId: RepositoryId;
+          };
           if (
-            !record.stars.has(membership.repositoryId) ||
-            !record.lists.has(membership.listId)
+            !mapHas(record.stars, membership.repositoryId) ||
+            !mapHas(record.lists, membership.listId)
           ) {
             return failure(
               "PRECONDITION_FAILED",
@@ -1336,10 +1712,10 @@ export function createMemoryStorage(
           completedAt: null,
           failedAt: canonicalUtcTimestamp(input.failedAt, "snapshot failedAt"),
           counts: {
-            repositories: record.repositories.size,
-            stars: record.stars.size,
-            lists: record.lists.size,
-            memberships: record.memberships.size,
+            repositories: mapSize(record.repositories),
+            stars: mapSize(record.stars),
+            lists: mapSize(record.lists),
+            memberships: mapSize(record.memberships),
           },
           sourceRateLimit: input.sourceRateLimit,
         });
@@ -1350,27 +1726,31 @@ export function createMemoryStorage(
         const id = asSnapshotId(
           stableText(args[0] as JsonValue, "snapshot ID"),
         );
-        const record = target.snapshots.get(id);
+        const record = mapGet(target.snapshots, id);
         return record?.snapshot.status === "complete"
           ? cloneSnapshot(record.snapshot)
           : null;
       }
       case "getLatestCompleteSnapshot": {
         const binding = parseBinding(canonicalJsonClone(args[0]));
-        const candidates = [...target.snapshots.values()]
-          .filter(
+        const candidates = arraySort(
+          arrayFilter(
+            mapValuesArray(target.snapshots),
             (record) =>
               record.snapshot.status === "complete" &&
               sameBinding(record.snapshot.binding, binding),
-          )
-          .sort((left, right) => {
-            const byTime = (right.snapshot.completedAt as string).localeCompare(
-              left.snapshot.completedAt as string,
+          ),
+          (left, right) => {
+            const byTime = MEMORY_INTRINSICS.reflectApply(
+              MEMORY_INTRINSICS.stringLocaleCompare,
+              right.snapshot.completedAt as string,
+              [left.snapshot.completedAt as string],
             );
             return byTime === 0
               ? binaryCompare(right.snapshot.id, left.snapshot.id)
               : byTime;
-          });
+          },
+        );
         return candidates[0] === undefined
           ? null
           : cloneSnapshot(candidates[0].snapshot);
@@ -1379,7 +1759,7 @@ export function createMemoryStorage(
         const id = asRepositoryId(
           stableText(args[0] as JsonValue, "repository ID"),
         );
-        const metadata = target.repositoryMetadata.get(id);
+        const metadata = mapGet(target.repositoryMetadata, id);
         return metadata === undefined ? null : metadataClone(metadata);
       }
       case "getSnapshotRepository": {
@@ -1389,7 +1769,7 @@ export function createMemoryStorage(
         const repositoryId = asRepositoryId(
           stableText(args[1] as JsonValue, "repository ID"),
         );
-        const record = target.snapshots.get(snapshotId);
+        const record = mapGet(target.snapshots, snapshotId);
         if (record?.snapshot.status !== "complete") return null;
         const view = buildRepositoryFilterView(record, repositoryId);
         return view === null ? null : publicRepositoryView(view);
@@ -1401,14 +1781,15 @@ export function createMemoryStorage(
         const listId = asUserListId(
           stableText(args[1] as JsonValue, "List ID"),
         );
-        const record = target.snapshots.get(snapshotId);
+        const record = mapGet(target.snapshots, snapshotId);
         if (record?.snapshot.status !== "complete") return null;
         requireListCoverage(record);
-        const list = record.lists.get(listId);
+        const list = mapGet(record.lists, listId);
         if (list === undefined) return null;
         return frozenClone({
           ...list,
-          repositoryCount: [...record.memberships.values()].filter(
+          repositoryCount: arrayFilter(
+            mapValuesArray(record.memberships),
             (membership) => membership.listId === listId,
           ).length,
         } satisfies ListSummary);
@@ -1426,10 +1807,10 @@ export function createMemoryStorage(
         const repositoryId = asRepositoryId(
           stableText(args[1] as JsonValue, "repository ID"),
         );
-        const record = target.snapshots.get(snapshotId);
+        const record = mapGet(target.snapshots, snapshotId);
         return (
           record?.snapshot.status === "complete" &&
-          record.stars.has(repositoryId)
+          mapHas(record.stars, repositoryId)
         );
       }
       case "savePlan": {
@@ -1440,7 +1821,7 @@ export function createMemoryStorage(
             "a new plan must be in ready state",
           );
         }
-        const current = target.plans.get(plan.id);
+        const current = mapGet(target.plans, plan.id);
         if (current !== undefined) {
           if (
             canonicalJson({ ...current, state: "ready" }) !==
@@ -1453,12 +1834,12 @@ export function createMemoryStorage(
           }
           return undefined;
         }
-        target.plans.set(plan.id, plan);
+        mapSet(target.plans, plan.id, plan);
         return undefined;
       }
       case "getPlan": {
         const id = asPlanId(stableText(args[0] as JsonValue, "plan ID"));
-        const plan = target.plans.get(id);
+        const plan = mapGet(target.plans, id);
         return plan === undefined ? null : clonePlan(plan);
       }
       case "compareAndSetPlanState": {
@@ -1468,16 +1849,24 @@ export function createMemoryStorage(
           "plan state input",
         );
         const planId = stablePlanId(input.planId as JsonValue);
-        if (!Array.isArray(input.expected) || input.expected.length === 0) {
+        if (
+          !MEMORY_INTRINSICS.arrayIsArray(input.expected) ||
+          input.expected.length === 0
+        ) {
           return failure(
             "VALIDATION_ERROR",
             "expected plan states must be non-empty",
           );
         }
-        const expected = (input.expected as readonly JsonValue[]).map((value) =>
-          stableText(value, "expected plan state"),
-        ) as PlanState[];
-        if (new Set(expected).size !== expected.length) {
+        const expected = arrayMap(
+          input.expected as readonly JsonValue[],
+          (value) => stableText(value, "expected plan state") as PlanState,
+        );
+        const uniqueExpected = createSet<PlanState>();
+        for (let index = 0; index < expected.length; index += 1) {
+          setAdd(uniqueExpected, expected[index] as PlanState);
+        }
+        if (setSize(uniqueExpected) !== expected.length) {
           return failure(
             "VALIDATION_ERROR",
             "expected plan states must be unique",
@@ -1487,18 +1876,18 @@ export function createMemoryStorage(
           input.next as JsonValue,
           "next plan state",
         ) as PlanState;
-        for (const stateValue of expected) {
-          transitionPlanState(stateValue, next);
+        for (let index = 0; index < expected.length; index += 1) {
+          transitionPlanState(expected[index] as PlanState, next);
         }
         const current = planRecord(target, planId);
-        if (!expected.includes(current.state)) {
+        if (!arrayIncludes(expected, current.state)) {
           return failure(
             "PRECONDITION_FAILED",
             "plan state does not match expected",
           );
         }
         const changed = parseChangePlan({ ...current, state: next });
-        target.plans.set(planId, changed);
+        mapSet(target.plans, planId, changed);
         return clonePlan(changed);
       }
       case "createRun": {
@@ -1516,11 +1905,11 @@ export function createMemoryStorage(
             "run binding does not match its plan",
           );
         }
-        const existingPlanRun = target.runByPlan.get(run.planId);
+        const existingPlanRun = mapGet(target.runByPlan, run.planId);
         if (existingPlanRun !== undefined && existingPlanRun !== run.id) {
           return failure("PRECONDITION_FAILED", "a plan may have only one run");
         }
-        const current = target.runs.get(run.id);
+        const current = mapGet(target.runs, run.id);
         if (current !== undefined) {
           if (
             canonicalJson({
@@ -1542,24 +1931,25 @@ export function createMemoryStorage(
             "a new run requires an applying plan",
           );
         }
-        target.runs.set(run.id, {
+        mapSet(target.runs, run.id, {
           run,
           leaseName: guard.name,
           leaseOwnerId: guard.ownerId,
         });
-        target.runByPlan.set(run.planId, run.id);
-        target.operations.set(run.id, new Map());
+        mapSet(target.runByPlan, run.planId, run.id);
+        mapSet(target.operations, run.id, createMap<string, RunOperation>());
         return undefined;
       }
       case "getRun": {
         const id = asRunId(stableText(args[0] as JsonValue, "run ID"));
-        const run = target.runs.get(id);
+        const run = mapGet(target.runs, id);
         return run === undefined ? null : cloneRun(run.run);
       }
       case "getLatestRunForPlan": {
         const planId = asPlanId(stableText(args[0] as JsonValue, "plan ID"));
-        const runId = target.runByPlan.get(planId);
-        const run = runId === undefined ? undefined : target.runs.get(runId);
+        const runId = mapGet(target.runByPlan, planId);
+        const run =
+          runId === undefined ? undefined : mapGet(target.runs, runId);
         return run === undefined ? null : cloneRun(run.run);
       }
       case "compareAndSetRunState": {
@@ -1569,16 +1959,24 @@ export function createMemoryStorage(
           "run state input",
         );
         const runId = stableRunId(input.runId as JsonValue);
-        if (!Array.isArray(input.expected) || input.expected.length === 0) {
+        if (
+          !MEMORY_INTRINSICS.arrayIsArray(input.expected) ||
+          input.expected.length === 0
+        ) {
           return failure(
             "VALIDATION_ERROR",
             "expected run states must be non-empty",
           );
         }
-        const expected = (input.expected as readonly JsonValue[]).map((value) =>
-          stableText(value, "expected run state"),
-        ) as RunState[];
-        if (new Set(expected).size !== expected.length) {
+        const expected = arrayMap(
+          input.expected as readonly JsonValue[],
+          (value) => stableText(value, "expected run state") as RunState,
+        );
+        const uniqueExpected = createSet<RunState>();
+        for (let index = 0; index < expected.length; index += 1) {
+          setAdd(uniqueExpected, expected[index] as RunState);
+        }
+        if (setSize(uniqueExpected) !== expected.length) {
           return failure(
             "VALIDATION_ERROR",
             "expected run states must be unique",
@@ -1588,8 +1986,8 @@ export function createMemoryStorage(
           input.next as JsonValue,
           "next run state",
         ) as RunState;
-        for (const stateValue of expected) {
-          transitionRunState(stateValue, next);
+        for (let index = 0; index < expected.length; index += 1) {
+          transitionRunState(expected[index] as RunState, next);
         }
         const record = runRecord(target, runId);
         const guard = parseGuard(input.lease as JsonValue);
@@ -1604,7 +2002,7 @@ export function createMemoryStorage(
             "mutation lease does not own this run",
           );
         }
-        if (!expected.includes(record.run.state)) {
+        if (!arrayIncludes(expected, record.run.state)) {
           return failure(
             "PRECONDITION_FAILED",
             "run state does not match expected",
@@ -1670,11 +2068,11 @@ export function createMemoryStorage(
             "run operation does not match the immutable plan",
           );
         }
-        const operations = target.operations.get(operation.runId) as Map<
+        const operations = mapGet(target.operations, operation.runId) as Map<
           string,
           RunOperation
         >;
-        const current = operations.get(operation.operationId);
+        const current = mapGet(operations, operation.operationId);
         if (current !== undefined) {
           if (
             canonicalJson({
@@ -1704,7 +2102,8 @@ export function createMemoryStorage(
           );
         }
         if (
-          [...operations.values()].some(
+          arraySome(
+            mapValuesArray(operations),
             (candidate) => candidate.sequence === operation.sequence,
           )
         ) {
@@ -1713,7 +2112,7 @@ export function createMemoryStorage(
             "operation sequence already exists",
           );
         }
-        operations.set(operation.operationId, operation);
+        mapSet(operations, operation.operationId, operation);
         return undefined;
       }
       case "startRunOperation": {
@@ -1779,18 +2178,22 @@ export function createMemoryStorage(
           error: null,
           finishedAt: null,
         });
-        target.operations.get(runId)?.set(operationId, changed);
+        const runOperations = mapGet(target.operations, runId);
+        if (runOperations !== undefined) {
+          mapSet(runOperations, operationId, changed);
+        }
         const key = operationKey(runId, operationId);
         const attempts =
-          target.attempts.get(key) ?? new Map<number, RunOperationAttempt>();
-        if (attempts.has(changed.attempts)) {
+          mapGet(target.attempts, key) ??
+          createMap<number, RunOperationAttempt>();
+        if (mapHas(attempts, changed.attempts)) {
           return failure(
             "PRECONDITION_FAILED",
             "attempt number already exists",
           );
         }
-        attempts.set(changed.attempts, attempt);
-        target.attempts.set(key, attempts);
+        mapSet(attempts, changed.attempts, attempt);
+        mapSet(target.attempts, key, attempts);
         return cloneOperation(changed);
       }
       case "getRunOperation": {
@@ -1804,7 +2207,11 @@ export function createMemoryStorage(
           input.operationId as JsonValue,
           "operation ID",
         );
-        const operation = target.operations.get(runId)?.get(operationId);
+        const runOperations = mapGet(target.operations, runId);
+        const operation =
+          runOperations === undefined
+            ? undefined
+            : mapGet(runOperations, operationId);
         return operation === undefined ? null : cloneOperation(operation);
       }
       case "retryRunOperation": {
@@ -1850,15 +2257,22 @@ export function createMemoryStorage(
           startedAt: null,
           finishedAt: null,
         });
-        target.operations.get(runId)?.set(operationId, changed);
+        const runOperations = mapGet(target.operations, runId);
+        if (runOperations !== undefined) {
+          mapSet(runOperations, operationId, changed);
+        }
         return cloneOperation(changed);
       }
       case "listRunOperations": {
         const runId = asRunId(stableText(args[0] as JsonValue, "run ID"));
-        return Object.freeze(
-          [...operationsFor(target, runId).values()]
-            .sort((left, right) => left.sequence - right.sequence)
-            .map(cloneOperation),
+        return MEMORY_INTRINSICS.objectFreeze(
+          arrayMap(
+            arraySort(
+              mapValuesArray(operationsFor(target, runId)),
+              (left, right) => left.sequence - right.sequence,
+            ),
+            cloneOperation,
+          ),
         );
       }
       case "listRunOperationsPage": {
@@ -1874,10 +2288,11 @@ export function createMemoryStorage(
           1,
           100,
         );
-        const all = [...operationsFor(target, runId).values()].sort(
+        const all = arraySort(
+          mapValuesArray(operationsFor(target, runId)),
           (left, right) => left.sequence - right.sequence,
         );
-        const maximum = all.at(-1)?.sequence;
+        const maximum = arrayAt(all, -1)?.sequence;
         const after = parsePageBoundary(
           input.afterSequence as JsonValue,
           "operation sequence boundary",
@@ -1885,7 +2300,7 @@ export function createMemoryStorage(
         );
         const page = pageResult(all, after, pageSize, (item) => item.sequence);
         return frozenClone({
-          items: page.items.map(cloneOperation),
+          items: arrayMap(page.items, cloneOperation),
           total: all.length,
           nextSequence: page.next,
         } satisfies AuditPage);
@@ -1910,9 +2325,12 @@ export function createMemoryStorage(
           "attempt number",
           1,
         );
-        const attempt = target.attempts
-          .get(operationKey(runId, operationId))
-          ?.get(attemptNumber);
+        const attempts = mapGet(
+          target.attempts,
+          operationKey(runId, operationId),
+        );
+        const attempt =
+          attempts === undefined ? undefined : mapGet(attempts, attemptNumber);
         return attempt === undefined ? null : cloneAttempt(attempt);
       }
       case "listRunOperationAttemptsPage": {
@@ -1932,18 +2350,24 @@ export function createMemoryStorage(
           1,
           100,
         );
-        const all = [
-          ...(target.attempts.get(operationKey(runId, operationId))?.values() ??
-            []),
-        ].sort((left, right) => left.attempt - right.attempt);
+        const attempts = mapGet(
+          target.attempts,
+          operationKey(runId, operationId),
+        );
+        const all = arraySort(
+          attempts === undefined
+            ? createInternalArray<RunOperationAttempt>()
+            : mapValuesArray(attempts),
+          (left, right) => left.attempt - right.attempt,
+        );
         const after = parsePageBoundary(
           input.afterAttempt as JsonValue,
           "attempt boundary",
-          all.at(-1)?.attempt,
+          arrayAt(all, -1)?.attempt,
         );
         const page = pageResult(all, after, pageSize, (item) => item.attempt);
         return frozenClone({
-          items: page.items.map(cloneAttempt),
+          items: arrayMap(page.items, cloneAttempt),
           total: all.length,
           nextAttempt: page.next,
         } satisfies RunOperationAttemptPage);
@@ -1965,14 +2389,20 @@ export function createMemoryStorage(
           1,
           100,
         );
-        const all = [
-          ...(target.reconciliations.get(operationKey(runId, operationId)) ??
-            []),
-        ].sort((left, right) => left.eventSequence - right.eventSequence);
+        const stored = mapGet(
+          target.reconciliations,
+          operationKey(runId, operationId),
+        );
+        const all = arraySort(
+          stored === undefined
+            ? createInternalArray<RunOperationReconciliation>()
+            : arrayCopy(stored),
+          (left, right) => left.eventSequence - right.eventSequence,
+        );
         const after = parsePageBoundary(
           input.afterEventSequence as JsonValue,
           "reconciliation event boundary",
-          all.at(-1)?.eventSequence,
+          arrayAt(all, -1)?.eventSequence,
         );
         const page = pageResult(
           all,
@@ -1981,7 +2411,7 @@ export function createMemoryStorage(
           (item) => item.eventSequence,
         );
         return frozenClone({
-          items: page.items.map(cloneReconciliation),
+          items: arrayMap(page.items, cloneReconciliation),
           total: all.length,
           nextEventSequence: page.next,
         } satisfies RunOperationReconciliationPage);
@@ -1997,25 +2427,44 @@ export function createMemoryStorage(
     const query = parseRepositoryQuery(raw);
     const record = completeSnapshotRecord(target, query.snapshotId);
     if (filterRequiresListCoverage(query.filter)) requireListCoverage(record);
-    const selected = [...record.stars.keys()]
-      .map((id) => buildRepositoryFilterView(record, asRepositoryId(id)))
-      .filter((view): view is RepositoryFilterView => view !== null)
-      .filter((view) =>
-        query.filter === null ? true : matchesFilter(view, query.filter),
-      )
-      .sort((left, right) => compareRepositories(left, right, query.sort));
-    const languageCounts = new Map<string | null, number>();
-    for (const view of selected) {
-      languageCounts.set(
+    const unsorted = createInternalArray<RepositoryFilterView>();
+    const starredRepositoryIds = mapKeysArray(record.stars);
+    for (let index = 0; index < starredRepositoryIds.length; index += 1) {
+      const view = buildRepositoryFilterView(
+        record,
+        asRepositoryId(starredRepositoryIds[index] as string),
+      );
+      if (
+        view !== null &&
+        (query.filter === null || matchesFilter(view, query.filter))
+      ) {
+        appendInternalArray(unsorted, view);
+      }
+    }
+    const selected = arraySort(unsorted, (left, right) =>
+      compareRepositories(left, right, query.sort),
+    );
+    const languageCounts = createMap<string | null, number>();
+    for (let index = 0; index < selected.length; index += 1) {
+      const view = selected[index] as RepositoryFilterView;
+      mapSet(
+        languageCounts,
         view.primaryLanguage,
-        (languageCounts.get(view.primaryLanguage) ?? 0) + 1,
+        (mapGet(languageCounts, view.primaryLanguage) ?? 0) + 1,
       );
     }
-    const languages = [...languageCounts.entries()]
-      .sort(([left], [right]) =>
-        left === null ? -1 : right === null ? 1 : binaryCompare(left, right),
-      )
-      .map(([language, count]) => ({ language, count }));
+    const languages = arrayMap(
+      arraySort(mapEntriesArray(languageCounts), (left, right) => {
+        const leftLanguage = left[0];
+        const rightLanguage = right[0];
+        return leftLanguage === null
+          ? -1
+          : rightLanguage === null
+            ? 1
+            : binaryCompare(leftLanguage, rightLanguage);
+      }),
+      (entry) => ({ language: entry[0], count: entry[1] }),
+    );
     let start = 0;
     const context = {
       kind: "repositories",
@@ -2025,7 +2474,7 @@ export function createMemoryStorage(
     } as const;
     if (query.cursor !== null) {
       const decoded = cursorCodec.decodeRepository(query.cursor, context);
-      const index = selected.findIndex((view) => {
+      const index = arrayFindIndex(selected, (view) => {
         const position = repositoryCursorPosition(view, query.sort);
         return (
           view.repositoryId === decoded.repositoryId &&
@@ -2041,24 +2490,24 @@ export function createMemoryStorage(
       }
       start = index + 1;
     }
-    const items = selected.slice(start, start + query.pageSize);
+    const items = arraySlice(selected, start, start + query.pageSize);
     const nextCursor =
       start + items.length < selected.length && items.length > 0
         ? cursorCodec.encodeRepository(
             context,
             repositoryCursorPosition(
-              items.at(-1) as RepositoryFilterView,
+              arrayAt(items, -1) as RepositoryFilterView,
               query.sort,
             ),
           )
         : null;
     return parseRepositoryQueryPage({
-      items: items.map(publicRepositoryView),
+      items: arrayMap(items, publicRepositoryView),
       total: selected.length,
       aggregates: {
         languages,
-        archived: selected.filter((view) => view.isArchived).length,
-        forks: selected.filter((view) => view.isFork).length,
+        archived: arrayFilter(selected, (view) => view.isArchived).length,
+        forks: arrayFilter(selected, (view) => view.isFork).length,
       },
       nextCursor,
     });
@@ -2072,17 +2521,20 @@ export function createMemoryStorage(
     const query = parseListQuery(raw);
     const record = completeSnapshotRecord(target, query.snapshotId);
     requireListCoverage(record);
-    const lists = [...record.lists.values()]
-      .map((list) => ({
+    const membershipValues = mapValuesArray(record.memberships);
+    const lists = arraySort(
+      arrayMap(mapValuesArray(record.lists), (list) => ({
         ...list,
-        repositoryCount: [...record.memberships.values()].filter(
+        repositoryCount: arrayFilter(
+          membershipValues,
           (membership) => membership.listId === list.listId,
         ).length,
-      }))
-      .sort((left, right) => {
+      })),
+      (left, right) => {
         const name = binaryCompare(left.name, right.name);
         return name === 0 ? binaryCompare(left.listId, right.listId) : name;
-      });
+      },
+    );
     const context = {
       v: 1,
       kind: "lists",
@@ -2091,7 +2543,8 @@ export function createMemoryStorage(
     let start = 0;
     if (query.cursor !== null) {
       const decoded = cursorCodec.decodeList(query.cursor, context);
-      const index = lists.findIndex(
+      const index = arrayFindIndex(
+        lists,
         (list) =>
           list.listId === decoded.listId &&
           canonicalJson([list.name]) === canonicalJson(decoded.values),
@@ -2104,7 +2557,7 @@ export function createMemoryStorage(
       }
       start = index + 1;
     }
-    const items = lists.slice(start, start + query.pageSize);
+    const items = arraySlice(lists, start, start + query.pageSize);
     return parseListQueryPage({
       coverage: "complete",
       items,
@@ -2112,8 +2565,8 @@ export function createMemoryStorage(
       nextCursor:
         start + items.length < lists.length && items.length > 0
           ? cursorCodec.encodeList(context, {
-              values: [(items.at(-1) as ListSummary).name],
-              listId: (items.at(-1) as ListSummary).listId,
+              values: [(arrayAt(items, -1) as ListSummary).name],
+              listId: (arrayAt(items, -1) as ListSummary).listId,
             })
           : null,
     });
@@ -2135,17 +2588,23 @@ export function createMemoryStorage(
         snapshotId: query.snapshotId,
         selector,
       } as const;
-      const ids = [...record.memberships.values()]
-        .filter((entry) => entry.listId === selector.listId)
-        .map((entry) => entry.repositoryId)
-        .sort(binaryCompare);
+      const ids = arraySort(
+        arrayMap(
+          arrayFilter(
+            mapValuesArray(record.memberships),
+            (entry) => entry.listId === selector.listId,
+          ),
+          (entry) => entry.repositoryId,
+        ),
+        binaryCompare,
+      );
       let start = 0;
       if (query.cursor !== null) {
         const decoded = cursorCodec.decodeListMembership(query.cursor, context);
         if (!("boundaryRepositoryId" in decoded)) {
           return failure("VALIDATION_ERROR", "membership cursor is invalid");
         }
-        const index = ids.indexOf(decoded.boundaryRepositoryId);
+        const index = arrayIndexOf(ids, decoded.boundaryRepositoryId);
         if (index < 0) {
           return failure(
             "VALIDATION_ERROR",
@@ -2154,7 +2613,7 @@ export function createMemoryStorage(
         }
         start = index + 1;
       }
-      const repositoryIds = ids.slice(start, start + query.pageSize);
+      const repositoryIds = arraySlice(ids, start, start + query.pageSize);
       return parseListMembershipQueryPage({
         coverage: "complete",
         selector,
@@ -2164,7 +2623,10 @@ export function createMemoryStorage(
           start + repositoryIds.length < ids.length && repositoryIds.length > 0
             ? cursorCodec.encodeListMembership(context, {
                 selector,
-                boundaryRepositoryId: repositoryIds.at(-1) as RepositoryId,
+                boundaryRepositoryId: arrayAt(
+                  repositoryIds,
+                  -1,
+                ) as RepositoryId,
               })
             : null,
       });
@@ -2176,17 +2638,23 @@ export function createMemoryStorage(
       snapshotId: query.snapshotId,
       selector,
     } as const;
-    const ids = [...record.memberships.values()]
-      .filter((entry) => entry.repositoryId === selector.repositoryId)
-      .map((entry) => entry.listId)
-      .sort(binaryCompare);
+    const ids = arraySort(
+      arrayMap(
+        arrayFilter(
+          mapValuesArray(record.memberships),
+          (entry) => entry.repositoryId === selector.repositoryId,
+        ),
+        (entry) => entry.listId,
+      ),
+      binaryCompare,
+    );
     let start = 0;
     if (query.cursor !== null) {
       const decoded = cursorCodec.decodeListMembership(query.cursor, context);
       if (!("boundaryListId" in decoded)) {
         return failure("VALIDATION_ERROR", "membership cursor is invalid");
       }
-      const index = ids.indexOf(decoded.boundaryListId);
+      const index = arrayIndexOf(ids, decoded.boundaryListId);
       if (index < 0) {
         return failure(
           "VALIDATION_ERROR",
@@ -2195,7 +2663,7 @@ export function createMemoryStorage(
       }
       start = index + 1;
     }
-    const listIds = ids.slice(start, start + query.pageSize);
+    const listIds = arraySlice(ids, start, start + query.pageSize);
     return parseListMembershipQueryPage({
       coverage: "complete",
       selector,
@@ -2205,7 +2673,7 @@ export function createMemoryStorage(
         start + listIds.length < ids.length && listIds.length > 0
           ? cursorCodec.encodeListMembership(context, {
               selector,
-              boundaryListId: listIds.at(-1) as UserListId,
+              boundaryListId: arrayAt(listIds, -1) as UserListId,
             })
           : null,
     });
@@ -2216,7 +2684,11 @@ export function createMemoryStorage(
     raw: unknown,
   ): RunOperation {
     const root = canonicalJsonClone(raw);
-    if (root === null || typeof root !== "object" || Array.isArray(root)) {
+    if (
+      root === null ||
+      typeof root !== "object" ||
+      MEMORY_INTRINSICS.arrayIsArray(root)
+    ) {
       return failure("VALIDATION_ERROR", "finish input must be an object");
     }
     const phase = (root as Record<string, JsonValue>).phase;
@@ -2314,28 +2786,37 @@ export function createMemoryStorage(
         finishedAt,
       });
       const key = operationKey(runId, operationId);
-      const attempts = target.attempts.get(key);
-      const attempt = attempts?.get(operation.attempts);
+      const attempts = mapGet(target.attempts, key);
+      const attempt =
+        attempts === undefined
+          ? undefined
+          : mapGet(attempts, operation.attempts);
       if (attempt?.status !== "running") {
         return failure(
           "PRECONDITION_FAILED",
           "current dispatch attempt is not running",
         );
       }
-      attempts?.set(
-        operation.attempts,
-        parseRunOperationAttempt({
-          ...attempt,
-          status: input.status,
-          reconciliation: input.reconciliation,
-          after: input.after,
-          externalRequestId: input.externalRequestId,
-          error,
-          finishedAt,
-        }),
-      );
+      if (attempts !== undefined) {
+        mapSet(
+          attempts,
+          operation.attempts,
+          parseRunOperationAttempt({
+            ...attempt,
+            status: input.status,
+            reconciliation: input.reconciliation,
+            after: input.after,
+            externalRequestId: input.externalRequestId,
+            error,
+            finishedAt,
+          }),
+        );
+      }
     }
-    target.operations.get(runId)?.set(operationId, changed);
+    const operations = mapGet(target.operations, runId);
+    if (operations !== undefined) {
+      mapSet(operations, operationId, changed);
+    }
     return cloneOperation(changed);
   }
 
@@ -2394,7 +2875,9 @@ export function createMemoryStorage(
     }
     const error = input.error === null ? null : parseError(input.error);
     const key = operationKey(runId, operationId);
-    const events = target.reconciliations.get(key) ?? [];
+    const events =
+      mapGet(target.reconciliations, key) ??
+      createInternalArray<RunOperationReconciliation>();
     const event = parseRunOperationReconciliation({
       runId,
       operationId,
@@ -2414,9 +2897,12 @@ export function createMemoryStorage(
       error,
       finishedAt: observedAt,
     });
-    events.push(event);
-    target.reconciliations.set(key, events);
-    target.operations.get(runId)?.set(operationId, changed);
+    appendInternalArray(events, event);
+    mapSet(target.reconciliations, key, events);
+    const operations = mapGet(target.operations, runId);
+    if (operations !== undefined) {
+      mapSet(operations, operationId, changed);
+    }
     return cloneOperation(changed);
   }
 
@@ -2458,11 +2944,14 @@ export function createMemoryStorage(
     }
     transactionActive = true;
     transactionPoisoned = false;
-    const working = structuredClone(state);
+    const working = MEMORY_INTRINSICS.structuredClone(state);
     const token = { active: true };
-    const methodCache = new Map<PropertyKey, (...args: unknown[]) => unknown>();
-    const target = Object.create(null) as object;
-    const revocable = Proxy.revocable(target, {
+    const methodCache = createMap<
+      PropertyKey,
+      (...args: unknown[]) => unknown
+    >();
+    const target = MEMORY_INTRINSICS.objectCreate(null) as object;
+    const revocable = MEMORY_INTRINSICS.proxyRevocable(target, {
       get(_target, property) {
         if (!token.active) {
           return failure(
@@ -2472,11 +2961,11 @@ export function createMemoryStorage(
         }
         if (
           typeof property !== "string" ||
-          !TRANSACTION_METHODS.includes(property as TransactionMethodName)
+          !arrayIncludes(TRANSACTION_METHODS, property as TransactionMethodName)
         ) {
           return undefined;
         }
-        const cached = methodCache.get(property);
+        const cached = mapGet(methodCache, property);
         if (cached !== undefined) return cached;
         const method = (...args: unknown[]): unknown => {
           if (!token.active) {
@@ -2487,18 +2976,20 @@ export function createMemoryStorage(
           }
           return callCore(property as TransactionMethodName, working, args);
         };
-        methodCache.set(property, method);
+        mapSet(methodCache, property, method);
         return method;
       },
       has(_target, property) {
         return (
           typeof property === "string" &&
-          TRANSACTION_METHODS.includes(property as TransactionMethodName)
+          arrayIncludes(TRANSACTION_METHODS, property as TransactionMethodName)
         );
       },
     });
+    const facade = revocable.proxy as StorageTransaction;
+    const revoke = revocable.revoke;
     try {
-      const result = fn(revocable.proxy as StorageTransaction);
+      const result = fn(facade);
       const preparedResult = prepareTransactionResult(result);
       if (transactionPoisoned) {
         return failure(
@@ -2516,9 +3007,12 @@ export function createMemoryStorage(
       return preparedResult.value as T;
     } finally {
       token.active = false;
-      revocable.revoke();
-      transactionActive = false;
-      transactionPoisoned = false;
+      try {
+        revoke();
+      } finally {
+        transactionActive = false;
+        transactionPoisoned = false;
+      }
     }
   }
 
@@ -2528,31 +3022,33 @@ export function createMemoryStorage(
     now: string,
     leaseName: string | null,
   ): readonly SnapshotId[] {
-    const recovered: SnapshotId[] = [];
-    const candidates = [...target.snapshots.values()].filter(
+    const recovered = createInternalArray<SnapshotId>();
+    const candidates = arrayFilter(
+      mapValuesArray(target.snapshots),
       (record) =>
         record.snapshot.status === "building" &&
         (binding === null || sameBinding(record.snapshot.binding, binding)) &&
         (leaseName === null || record.leaseName === leaseName) &&
         !hasActiveStoredLease(target, record, now),
     );
-    for (const record of candidates) {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const record = candidates[index] as SnapshotRecord;
       record.snapshot = parseSnapshot({
         ...record.snapshot,
         status: "failed",
         failedAt: now,
         completedAt: null,
         counts: {
-          repositories: record.repositories.size,
-          stars: record.stars.size,
-          lists: record.lists.size,
-          memberships: record.memberships.size,
+          repositories: mapSize(record.repositories),
+          stars: mapSize(record.stars),
+          lists: mapSize(record.lists),
+          memberships: mapSize(record.memberships),
         },
       });
       record.verification = null;
-      recovered.push(record.snapshot.id);
+      appendInternalArray(recovered, record.snapshot.id);
     }
-    return Object.freeze(recovered.sort(binaryCompare));
+    return MEMORY_INTRINSICS.objectFreeze(arraySort(recovered, binaryCompare));
   }
 
   function recoverRuns(
@@ -2561,29 +3057,32 @@ export function createMemoryStorage(
     now: string,
     leaseName: string | null,
   ): readonly RunId[] {
-    const recovered: RunId[] = [];
-    const candidates = [...target.runs.values()].filter(
+    const recovered = createInternalArray<RunId>();
+    const candidates = arrayFilter(
+      mapValuesArray(target.runs),
       (record) =>
         (record.run.state === "pending" || record.run.state === "running") &&
         (binding === null || sameBinding(record.run.binding, binding)) &&
         (leaseName === null || record.leaseName === leaseName) &&
         !hasActiveStoredLease(target, record, now),
     );
-    for (const record of candidates) {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const record = candidates[index] as RunRecord;
       recoverRun(target, record, now);
-      recovered.push(record.run.id);
+      appendInternalArray(recovered, record.run.id);
     }
-    return Object.freeze(recovered.sort(binaryCompare));
+    return MEMORY_INTRINSICS.objectFreeze(arraySort(recovered, binaryCompare));
   }
 
-  const root = Object.create(null) as Record<string, unknown>;
-  for (const name of TRANSACTION_METHODS) {
-    Object.defineProperty(root, name, {
+  const root = MEMORY_INTRINSICS.objectCreate(null) as Record<string, unknown>;
+  for (let index = 0; index < TRANSACTION_METHODS.length; index += 1) {
+    const name = TRANSACTION_METHODS[index] as TransactionMethodName;
+    MEMORY_INTRINSICS.objectDefineProperty(root, name, {
       enumerable: true,
       value: (...args: unknown[]) => rootCall(name, args),
     });
   }
-  Object.defineProperties(root, {
+  MEMORY_INTRINSICS.objectDefineProperties(root, {
     migrate: {
       enumerable: true,
       value: () => {
@@ -2593,11 +3092,17 @@ export function createMemoryStorage(
         }
         if (migrated) return;
         const temporaryKey =
-          injectedKey === null ? randomBytes(32) : injectedKey;
+          injectedKey === null
+            ? MEMORY_INTRINSICS.randomBytes(32)
+            : injectedKey;
         try {
           codec = createCursorCodec(temporaryKey);
         } finally {
-          temporaryKey.fill(0);
+          MEMORY_INTRINSICS.reflectApply(
+            MEMORY_INTRINSICS.uint8ArrayFill,
+            temporaryKey,
+            [0],
+          );
           injectedKey = null;
         }
         migrated = true;
@@ -2632,19 +3137,25 @@ export function createMemoryStorage(
           1,
           100,
         );
-        const runs = [...state.runs.values()]
-          .filter(
+        const runs = arraySort(
+          arrayFilter(
+            mapValuesArray(state.runs),
             (record) =>
               (record.run.state === "pending" ||
                 record.run.state === "running" ||
                 record.run.state === "partial") &&
               sameBinding(record.run.binding, binding),
-          )
-          .sort((left, right) => {
-            const time = left.run.startedAt.localeCompare(right.run.startedAt);
+          ),
+          (left, right) => {
+            const time = MEMORY_INTRINSICS.reflectApply(
+              MEMORY_INTRINSICS.stringLocaleCompare,
+              left.run.startedAt,
+              [right.run.startedAt],
+            );
             return time === 0 ? binaryCompare(left.run.id, right.run.id) : time;
-          });
-        const items = runs.slice(0, limit).map(({ run }) => {
+          },
+        );
+        const items = arrayMap(arraySlice(runs, 0, limit), ({ run }) => {
           const counts: Record<RunOperationStatus, number> = {
             pending: 0,
             running: 0,
@@ -2653,7 +3164,9 @@ export function createMemoryStorage(
             failed: 0,
             unresolved: 0,
           };
-          for (const operation of operationsFor(state, run.id).values()) {
+          const operationValues = mapValuesArray(operationsFor(state, run.id));
+          for (let index = 0; index < operationValues.length; index += 1) {
+            const operation = operationValues[index] as RunOperation;
             counts[operation.status] += 1;
           }
           const incompleteState: "pending" | "running" | "partial" =
@@ -2691,7 +3204,7 @@ export function createMemoryStorage(
         const binding = parseBinding(input.binding as JsonValue);
         const guard = parseGuard(input.lease as JsonValue);
         assertLeaseCore(state, guard);
-        const working = structuredClone(state);
+        const working = MEMORY_INTRINSICS.structuredClone(state);
         const recovered = recoverSnapshots(
           working,
           binding,
@@ -2715,7 +3228,7 @@ export function createMemoryStorage(
         const binding = parseBinding(input.binding as JsonValue);
         const guard = parseGuard(input.lease as JsonValue);
         assertLeaseCore(state, guard);
-        const working = structuredClone(state);
+        const working = MEMORY_INTRINSICS.structuredClone(state);
         const recovered = recoverRuns(working, binding, guard.now, guard.name);
         state = working;
         return recovered;
@@ -2727,7 +3240,7 @@ export function createMemoryStorage(
         ensureRoot();
         ensureReady();
         const now = canonicalUtcTimestamp(rawNow, "recovery now");
-        const working = structuredClone(state);
+        const working = MEMORY_INTRINSICS.structuredClone(state);
         const recovered = recoverSnapshots(working, null, now, null);
         state = working;
         return recovered;
@@ -2739,7 +3252,7 @@ export function createMemoryStorage(
         ensureRoot();
         ensureReady();
         const now = canonicalUtcTimestamp(rawNow, "recovery now");
-        const working = structuredClone(state);
+        const working = MEMORY_INTRINSICS.structuredClone(state);
         const recovered = recoverRuns(working, null, now, null);
         state = working;
         return recovered;
@@ -2752,10 +3265,16 @@ export function createMemoryStorage(
         if (closed) return;
         closed = true;
         codec = null;
-        injectedKey?.fill(0);
+        if (injectedKey !== null) {
+          MEMORY_INTRINSICS.reflectApply(
+            MEMORY_INTRINSICS.uint8ArrayFill,
+            injectedKey,
+            [0],
+          );
+        }
         injectedKey = null;
       },
     },
   });
-  return Object.freeze(root) as unknown as StoragePort;
+  return MEMORY_INTRINSICS.objectFreeze(root) as unknown as StoragePort;
 }

@@ -1017,6 +1017,18 @@ commit/rollback returns, so a captured
 `tx` cannot mutate later. It exposes no raw SQL, generic query, `execute`, or
 async transaction.
 
+The in-memory contract oracle separately captures at module initialization
+every mutable realm intrinsic that can touch its private state, including
+`structuredClone`, Map/Set constructors and methods, Array/Object/Reflect
+operations, `Proxy.revocable`, binary comparison helpers, key wiping, and
+random cursor-key generation. Transaction and recovery work occurs only in a
+captured clone and publishes after every candidate succeeds. Callback or
+recovery-time monkey-patching cannot observe private receivers, retain a
+working Map, or create a partial commit. Transaction activity/poison flags are
+cleared even if the captured facade revoke throws. Public recovery methods
+return detached, deeply frozen standard arrays with `Array.prototype`; private
+iteration never changes the public readonly-array behavior.
+
 - [ ] **Step 4: Verify exact structural compliance**
 Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.test.ts test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect all tests pass, including:
 
@@ -1028,7 +1040,10 @@ Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.te
   undetectable prototype-erased private-slot instances; callback replacement
   of representative util.types, JSON, Object, Reflect, Array, Number, Buffer,
   Set, and Hash operations with full realm restoration; nested transaction;
-  root-store reentry; and leaked facade calls after commit and rollback;
+  root-store reentry; pre-call replacement of `structuredClone`, Map,
+  `Object.create`, and `Proxy.revocable`; cleanup after a throwing revoke;
+  private-receiver isolation for callback/recovery Map/Set/Array/Object hooks;
+  and leaked facade calls after commit and rollback;
 - detached/deep-frozen reads after caller mutation, hostile
   accessor/proxy/symbol/sparse/custom-prototype input, and inert
   `__proto__` language values;
@@ -1045,7 +1060,8 @@ Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.te
   reconciliation events, max-attempt boundary, and bounded audit pages;
 - active same-owner reacquire rejection, lease renewal/takeover/wrong
   owner/backward time, exact-owner recovery skip, idempotent expired recovery,
-  and bounded incomplete-run totals.
+  staged all-or-nothing recovery under hostile realm hooks, standard frozen
+  recovery-result arrays, and bounded incomplete-run totals.
 
 - [ ] **Step 5: Commit**
 
