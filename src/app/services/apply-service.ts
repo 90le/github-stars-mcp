@@ -1225,6 +1225,9 @@ export class ApplyService {
       });
     }
     assertPlanHash(plan, parsed.expectedHash);
+    if (plan.state !== "applied") {
+      assertPlanAvailable(plan, safeNow(this.#runtime));
+    }
 
     let viewer: AccountBinding;
     try {
@@ -1280,6 +1283,7 @@ export class ApplyService {
 
     return scope.run(async (lease) => {
       let primary: unknown;
+      let hasPrimary = false;
       let result: ApplyResult | undefined;
       try {
         lease.assertActive();
@@ -1443,23 +1447,38 @@ export class ApplyService {
         }
       } catch (error) {
         primary = error;
+        hasPrimary = true;
       }
 
-      let cleanup: unknown;
-      let safetyLeaseRenewed = false;
+      const cleanupFailures: unknown[] = [];
       try {
         lease.renew(this.#writeIntervalMs + LEASE_HEARTBEAT_MS);
-        safetyLeaseRenewed = true;
-        await this.#pacer.waitForSafetyWindow();
       } catch (error) {
-        if (safetyLeaseRenewed) lease.retainUntilExpiry();
-        cleanup = error;
+        cleanupFailures.push(error);
       }
-      if (primary !== undefined) {
-        if (cleanup !== undefined) appendCleanupDiagnostic(primary, cleanup);
-        throw errorObject(primary);
+      let safetyWaitCompleted = false;
+      try {
+        await this.#pacer.waitForSafetyWindow();
+        safetyWaitCompleted = true;
+      } catch (error) {
+        cleanupFailures.push(error);
       }
-      if (cleanup !== undefined) throw errorObject(cleanup);
+      if (!safetyWaitCompleted) lease.retainUntilExpiry();
+
+      if (hasPrimary || cleanupFailures.length > 0) {
+        const authoritative = errorObject(
+          hasPrimary ? primary : cleanupFailures[0],
+        );
+        const diagnosticStart = hasPrimary ? 0 : 1;
+        for (
+          let index = diagnosticStart;
+          index < cleanupFailures.length;
+          index += 1
+        ) {
+          appendCleanupDiagnostic(authoritative, cleanupFailures[index]);
+        }
+        throw authoritative;
+      }
       return result as ApplyResult;
     });
   }

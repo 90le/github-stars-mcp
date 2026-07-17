@@ -20,6 +20,7 @@ import type {
   StoragePort,
 } from "../../../src/app/ports/storage-port.js";
 import {
+  appendCleanupDiagnostic,
   LeaseScope,
   type LeaseScheduler,
 } from "../../../src/app/services/lease-scope.js";
@@ -1248,6 +1249,29 @@ describe("LeaseScope", () => {
     expect(
       `${cleanup.message}${JSON.stringify(cleanup.details)}`,
     ).not.toContain("raw-cleanup-secret");
+  });
+
+  it("bounds repeated sanitized cleanup diagnostics without changing the primary cause", () => {
+    const cause = new Error("original cause");
+    const primary = new AppError("INTERNAL_ERROR", "primary failure", {
+      cause,
+    });
+
+    for (let index = 0; index < 12; index += 1) {
+      appendCleanupDiagnostic(
+        primary,
+        new Error(`raw-cleanup-credential-${String(index)}`),
+      );
+    }
+
+    const diagnostics = (
+      primary as AppError & {
+        cleanupDiagnostics?: readonly unknown[];
+      }
+    ).cleanupDiagnostics;
+    expect(primary.cause).toBe(cause);
+    expect(diagnostics).toHaveLength(4);
+    expect(JSON.stringify(diagnostics)).not.toContain("credential");
   });
 });
 

@@ -14,6 +14,7 @@ import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
 
 const LEASE_TTL_MS = 10 * 60_000;
 const HEARTBEAT_INTERVAL_MS = 60_000;
+const MAX_CLEANUP_DIAGNOSTICS = 4;
 
 export interface LeaseScheduler {
   setInterval(callback: () => void, intervalMs: number): unknown;
@@ -185,10 +186,11 @@ export function appendCleanupDiagnostic(
       Array.isArray(descriptor.value)
         ? (descriptor.value as readonly unknown[])
         : [];
-    const diagnostics = Object.freeze([
-      ...previous,
-      Object.freeze(serializeError(cleanup)),
-    ]);
+    const diagnostics = Object.freeze(
+      previous.length >= MAX_CLEANUP_DIAGNOSTICS
+        ? previous.slice(0, MAX_CLEANUP_DIAGNOSTICS)
+        : [...previous, Object.freeze(serializeError(cleanup))],
+    );
     Object.defineProperty(primary, "cleanupDiagnostics", {
       configurable: true,
       enumerable: false,

@@ -232,6 +232,59 @@ describe("ApplyService admission", () => {
     );
     expect(fixture.github.statusCalls).toEqual([]);
   });
+
+  it("returns PLAN_EXPIRED without calling a throwing viewer", async () => {
+    const fixture = await applyFixture({
+      planTtlMinutes: 1,
+      now: "2026-07-16T02:00:00.000Z",
+    });
+    fixture.github.getViewer = () => {
+      fixture.github.statusCalls.push("getViewer");
+      return Promise.reject(new Error("raw viewer failure"));
+    };
+
+    await admissionRejection(fixture, fixture.service.apply(fixture.input), {
+      code: "PLAN_EXPIRED",
+      retryable: false,
+    });
+    expect(fixture.github.statusCalls).toEqual([]);
+  });
+
+  it.each(["failed", "superseded"] as const)(
+    "rejects a %s plan before calling a throwing viewer",
+    async (planState) => {
+      const fixture = await applyFixture({ planState });
+      fixture.github.getViewer = () => {
+        fixture.github.statusCalls.push("getViewer");
+        return Promise.reject(new Error("raw viewer failure"));
+      };
+
+      await admissionRejection(fixture, fixture.service.apply(fixture.input), {
+        code: "PRECONDITION_FAILED",
+        retryable: false,
+        details: { state: planState },
+      });
+      expect(fixture.github.statusCalls).toEqual([]);
+    },
+  );
+
+  it("revalidates expiry after awaiting the viewer before probing capabilities", async () => {
+    const fixture = await applyFixture({
+      planTtlMinutes: 61,
+      now: "2026-07-16T02:00:00.000Z",
+    });
+    fixture.github.getViewer = () => {
+      fixture.github.statusCalls.push("getViewer");
+      fixture.runtime.setNow("2026-07-16T02:02:00.000Z");
+      return Promise.resolve(plannerBinding);
+    };
+
+    await admissionRejection(fixture, fixture.service.apply(fixture.input), {
+      code: "PLAN_EXPIRED",
+      retryable: false,
+    });
+    expect(fixture.github.statusCalls).toEqual(["getViewer"]);
+  });
 });
 
 describe("ApplyService account lease", () => {
@@ -366,6 +419,125 @@ describe("ApplyService account lease", () => {
     await expect(
       fixture.createService("takeover-process").apply(secondInput),
     ).resolves.toMatchObject({ run: { state: "completed" } });
+  });
+
+  it("waits after cleanup renewal fails before releasing for another process mutation", async () => {
+    const fixture = await applyFixture({ instanceId: "renew-failure-process" });
+    const secondPlan = await createPlan(fixture, [
+      {
+        kind: "list_create",
+        clientRef: "after-safety-wait",
+        name: "After Safety Wait",
+        description: null,
+        isPrivate: false,
+      },
+    ]);
+    let releaseSafetyWait!: () => void;
+    fixture.runtime.waitGate = new Promise<void>((resolve) => {
+      releaseSafetyWait = resolve;
+    });
+    fixture.runtime.onWait = () => {
+      fixture.tracking.events.push("safety:wait");
+    };
+    fixture.github.onMutation = (call) => {
+      if (call.kind === "unstar") {
+        fixture.tracking.renewLeaseFailure = new Error("raw-renew-credential");
+      }
+    };
+
+    const first = fixture.service.apply(fixture.input).then(
+      (result) => ({ error: null, result }),
+      (error: unknown) => ({ error, result: null }),
+    );
+    await vi.waitFor(() => {
+      expect(fixture.tracking.events).toContain("safety:wait");
+    });
+
+    const secondInput = {
+      planId: secondPlan.plan.id,
+      expectedHash: secondPlan.plan.hash,
+      failureMode: "stop" as const,
+    };
+    await expect(
+      fixture.createService("blocked-process").apply(secondInput),
+    ).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "lease_held" },
+    });
+    expect(fixture.github.mutationCalls).toHaveLength(1);
+
+    releaseSafetyWait();
+    const firstOutcome = await first;
+    expect(firstOutcome.result).toBeNull();
+    expect(firstOutcome.error).toMatchObject({
+      code: "STORAGE_ERROR",
+      details: { reason: "lease_storage_failure" },
+    });
+
+    fixture.runtime.waitGate = null;
+    await expect(
+      fixture.createService("next-process").apply(secondInput),
+    ).resolves.toMatchObject({ run: { state: "completed" } });
+
+    const events = fixture.tracking.events;
+    const firstMutation = events.indexOf("mutation:unstar");
+    const cleanupRenew = events.indexOf("lease:renew", firstMutation + 1);
+    const safetyWait = events.indexOf("safety:wait", cleanupRenew + 1);
+    const release = events.indexOf("lease:release", safetyWait + 1);
+    const secondMutation = events.indexOf(
+      "mutation:createUserList",
+      release + 1,
+    );
+    expect(firstMutation).toBeLessThan(cleanupRenew);
+    expect(cleanupRenew).toBeLessThan(safetyWait);
+    expect(safetyWait).toBeLessThan(release);
+    expect(release).toBeLessThan(secondMutation);
+  });
+
+  it("keeps the primary error and records both cleanup failures safely", async () => {
+    const fixture = await applyFixture({ instanceId: "dual-cleanup-process" });
+    const originalCause = new Error("original primary cause");
+    const primary = new AppError("STORAGE_ERROR", "audit finish failed", {
+      retryable: false,
+      details: { reason: "primary_audit_failure" },
+      cause: originalCause,
+    });
+    fixture.github.onMutation = () => {
+      fixture.tracking.finishRunOperationFailure = primary;
+      fixture.tracking.renewLeaseFailure = new Error(
+        "raw-renew-cleanup-credential",
+      );
+    };
+    fixture.runtime.onWait = () => {
+      throw new Error("raw-wait-cleanup-credential");
+    };
+
+    const received = await fixture.service
+      .apply(fixture.input)
+      .catch((error: unknown) => error);
+    const error = received as Error & {
+      cleanupDiagnostics?: readonly unknown[];
+    };
+
+    expect(received).toBe(primary);
+    expect(error.cause).toBe(originalCause);
+    expect(error.cleanupDiagnostics).toMatchObject([
+      {
+        code: "STORAGE_ERROR",
+        retryable: false,
+        details: { reason: "lease_storage_failure" },
+      },
+      {
+        code: "INTERNAL_ERROR",
+        retryable: false,
+        details: { reason: "mutation_pacing_wait_failed" },
+      },
+    ]);
+    expect(error.cleanupDiagnostics).toHaveLength(2);
+    expect(JSON.stringify(error.cleanupDiagnostics)).not.toContain(
+      "credential",
+    );
+    expect(fixture.tracking.releaseLease).toEqual([]);
   });
 
   it("keeps one owner and heartbeat while rejecting a second process for the same account", async () => {

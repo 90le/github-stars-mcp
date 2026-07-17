@@ -981,6 +981,7 @@ interface ApplyTracking {
   >;
   globalRecoveries: number;
   loseLeaseOnNextRenew: boolean;
+  renewLeaseFailure: Error | null;
   afterStartRunOperation: (() => void) | null;
   finishRunOperationFailure: Error | null;
   transactions: number;
@@ -1028,6 +1029,11 @@ function trackedApplyStorage(
     renewLease(input: AcquireLeaseInput): Lease {
       tracking.renewLease.push(input);
       tracking.events.push("lease:renew");
+      const failure = tracking.renewLeaseFailure;
+      if (failure !== null) {
+        tracking.renewLeaseFailure = null;
+        throw failure;
+      }
       if (tracking.loseLeaseOnNextRenew) {
         tracking.loseLeaseOnNextRenew = false;
         raw.releaseLease({ name: input.name, ownerId: input.ownerId });
@@ -1124,6 +1130,7 @@ export async function applyFixture(options: ApplyFixtureOptions = {}) {
     recovery: [],
     globalRecoveries: 0,
     loseLeaseOnNextRenew: false,
+    renewLeaseFailure: null,
     afterStartRunOperation: null,
     finishRunOperationFailure: null,
     transactions: 0,
