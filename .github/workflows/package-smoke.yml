@@ -1,0 +1,40 @@
+name: Package smoke
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GITHUB_STARS_MCP_READ_ONLY: "true"
+
+jobs:
+  package-smoke:
+    name: Package on ${{ matrix.os }} with Node ${{ matrix.node-version }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node-version: [22, 24]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install exact dependencies
+        run: npm ci
+      - name: Build the package
+        run: npm run build
+      - name: Pack, install, and run --help, --version, and fixture-backed --doctor
+        run: npm run package:verify
