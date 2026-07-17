@@ -941,7 +941,6 @@ export function defineStoragePortContract(
             "withTransaction",
             "getIncompleteRunSummaries",
             "recoverAbandonedSnapshots",
-            "recoverAbandonedRuns",
             "recoverIncompleteSnapshots",
             "recoverInterruptedRuns",
             "database",
@@ -961,6 +960,8 @@ export function defineStoragePortContract(
           }
           expect("savePlan" in surface).toBe(true);
           expect(typeof surface.savePlan).toBe("function");
+          expect("recoverAbandonedRuns" in surface).toBe(true);
+          expect(typeof surface.recoverAbandonedRuns).toBe("function");
           return undefined;
         });
       } finally {

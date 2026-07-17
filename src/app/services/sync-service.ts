@@ -11,7 +11,7 @@ import type { RateStateReader } from "../ports/rate-state-reader.js";
 import type { Clock, IdGenerator } from "../ports/runtime-port.js";
 import type { StoragePort } from "../ports/storage-port.js";
 import { canonicalJsonClone, sha256Hex } from "../../domain/canonical-json.js";
-import { AppError, serializeError } from "../../domain/errors.js";
+import { AppError } from "../../domain/errors.js";
 import {
   asRepositoryId,
   asSnapshotId,
@@ -36,7 +36,11 @@ import type {
   SnapshotVerificationBatch,
 } from "../../domain/snapshot.js";
 import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
-import { LeaseScope, type LeaseScheduler } from "./lease-scope.js";
+import {
+  appendCleanupDiagnostic,
+  LeaseScope,
+  type LeaseScheduler,
+} from "./lease-scope.js";
 
 export type SyncInput = Readonly<{
   mode: "full" | "incremental";
@@ -590,27 +594,6 @@ function sanitizeCollectionError(error: unknown): unknown {
   return githubFailure("collection_failed");
 }
 
-function attachCleanupDiagnostic(primary: unknown, cleanup: unknown): void {
-  if (
-    (typeof primary !== "object" && typeof primary !== "function") ||
-    primary === null
-  ) {
-    return;
-  }
-  try {
-    Object.defineProperty(primary, "cause", {
-      configurable: true,
-      enumerable: false,
-      value: Object.freeze({
-        cleanup: Object.freeze(serializeError(cleanup)),
-      }),
-      writable: true,
-    });
-  } catch {
-    // A non-extensible primary still remains authoritative.
-  }
-}
-
 function storageCall<T>(action: () => T): T {
   try {
     return action();
@@ -1045,7 +1028,7 @@ export class SyncService {
             try {
               guard = active.tryFreshGuard();
             } catch (cleanup) {
-              attachCleanupDiagnostic(primary, cleanup);
+              appendCleanupDiagnostic(primary, cleanup);
               throw primary;
             }
             if (guard === null) {
@@ -1062,7 +1045,7 @@ export class SyncService {
                 }),
               );
             } catch (cleanup) {
-              attachCleanupDiagnostic(primary, cleanup);
+              appendCleanupDiagnostic(primary, cleanup);
               throw primary;
             }
           }

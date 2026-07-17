@@ -25,6 +25,7 @@ export type LeaseScopeOptions = Readonly<{
   runtime: Clock;
   name: string;
   ownerId: string;
+  ttlMs?: number;
   signal?: AbortSignal;
   scheduler?: LeaseScheduler;
 }>;
@@ -107,6 +108,17 @@ function addMilliseconds(timestamp: string, milliseconds: number): string {
   }
 }
 
+function leaseTtl(value: number | undefined): number {
+  const ttl = value ?? LEASE_TTL_MS;
+  if (!Number.isSafeInteger(ttl) || ttl < 1) {
+    throw new AppError("VALIDATION_ERROR", "Lease TTL is invalid", {
+      retryable: false,
+      details: { reason: "invalid_lease_ttl" },
+    });
+  }
+  return ttl;
+}
+
 function safeNow(runtime: Clock): string {
   try {
     return canonicalUtcTimestamp(runtime.now(), "lease time");
@@ -119,13 +131,14 @@ function acquireInput(
   runtime: Clock,
   name: string,
   ownerId: string,
+  ttlMs: number,
 ): AcquireLeaseInput {
   const now = safeNow(runtime);
   return Object.freeze({
     name,
     ownerId,
     now,
-    expiresAt: addMilliseconds(now, LEASE_TTL_MS),
+    expiresAt: addMilliseconds(now, ttlMs),
   });
 }
 
@@ -151,22 +164,36 @@ function validateLease(lease: Lease, name: string, ownerId: string): string {
   }
 }
 
-function attachCleanupDiagnostic(primary: unknown, cleanup: AppError): void {
+export function appendCleanupDiagnostic(
+  primary: unknown,
+  cleanup: unknown,
+): void {
   if (
     (typeof primary !== "object" && typeof primary !== "function") ||
     primary === null
   ) {
     return;
   }
-  const diagnostic = Object.freeze({
-    cleanup: Object.freeze(serializeError(cleanup)),
-  });
   try {
-    Object.defineProperty(primary, "cause", {
+    const descriptor = Object.getOwnPropertyDescriptor(
+      primary,
+      "cleanupDiagnostics",
+    );
+    const previous =
+      descriptor !== undefined &&
+      Object.hasOwn(descriptor, "value") &&
+      Array.isArray(descriptor.value)
+        ? (descriptor.value as readonly unknown[])
+        : [];
+    const diagnostics = Object.freeze([
+      ...previous,
+      Object.freeze(serializeError(cleanup)),
+    ]);
+    Object.defineProperty(primary, "cleanupDiagnostics", {
       configurable: true,
       enumerable: false,
-      value: diagnostic,
-      writable: true,
+      value: diagnostics,
+      writable: false,
     });
   } catch {
     // The primary error remains authoritative even when it is non-extensible.
@@ -187,15 +214,18 @@ export class LeaseScope {
   #started = false;
   #stopped = false;
   #lost = false;
+  #retainUntilExpiry = false;
   #callerCancelled = false;
   #heartbeatFailure: AppError | null = null;
   #expiresAt: string;
+  #ttlMs: number;
 
   private constructor(options: LeaseScopeOptions, lease: Lease) {
     this.#storage = options.storage;
     this.#runtime = options.runtime;
     this.#name = options.name;
     this.#ownerId = options.ownerId;
+    this.#ttlMs = leaseTtl(options.ttlMs);
     this.#scheduler = options.scheduler ?? NODE_SCHEDULER;
     this.#callerSignal = options.signal;
     this.#expiresAt = validateLease(lease, this.#name, this.#ownerId);
@@ -217,7 +247,12 @@ export class LeaseScope {
   }
 
   static acquire(options: LeaseScopeOptions): LeaseScope {
-    const input = acquireInput(options.runtime, options.name, options.ownerId);
+    const input = acquireInput(
+      options.runtime,
+      options.name,
+      options.ownerId,
+      leaseTtl(options.ttlMs),
+    );
     let lease: Lease | null;
     try {
       lease = options.storage.acquireLease(input);
@@ -275,6 +310,37 @@ export class LeaseScope {
     }
   }
 
+  renew(minimumTtlMs = this.#ttlMs): LeaseGuard {
+    if (this.#lost) throw leaseLost();
+    if (this.#heartbeatFailure !== null) throw this.#heartbeatFailure;
+    this.#ttlMs = Math.max(this.#ttlMs, leaseTtl(minimumTtlMs));
+    const input = acquireInput(
+      this.#runtime,
+      this.#name,
+      this.#ownerId,
+      this.#ttlMs,
+    );
+    try {
+      const lease = this.#storage.renewLease(input);
+      this.#expiresAt = validateLease(lease, this.#name, this.#ownerId);
+      return Object.freeze({
+        name: this.#name,
+        ownerId: this.#ownerId,
+        now: input.now,
+      });
+    } catch (error) {
+      if (ownershipFailure(error)) {
+        this.#markLost();
+        throw leaseLost();
+      }
+      throw error instanceof AppError ? error : leaseStorageFailure();
+    }
+  }
+
+  retainUntilExpiry(): void {
+    this.#retainUntilExpiry = true;
+  }
+
   async run<T>(action: (scope: LeaseScope) => Promise<T>): Promise<T> {
     if (this.#started) {
       throw new AppError(
@@ -307,7 +373,7 @@ export class LeaseScope {
 
     const cleanup = this.#cleanup();
     if (hasPrimary) {
-      if (cleanup !== null) attachCleanupDiagnostic(primary, cleanup);
+      if (cleanup !== null) appendCleanupDiagnostic(primary, cleanup);
       throw primary;
     }
     if (cleanup !== null) throw cleanup;
@@ -316,24 +382,12 @@ export class LeaseScope {
 
   #heartbeat(): void {
     if (this.#stopped || this.#lost || this.#heartbeatFailure !== null) return;
-    let input: AcquireLeaseInput;
     try {
-      input = acquireInput(this.#runtime, this.#name, this.#ownerId);
+      this.renew();
     } catch (error) {
+      if (this.#lost) return;
       this.#heartbeatFailure =
-        error instanceof AppError ? error : runtimeFailure();
-      this.#abortInternal();
-      return;
-    }
-    try {
-      const lease = this.#storage.renewLease(input);
-      this.#expiresAt = validateLease(lease, this.#name, this.#ownerId);
-    } catch (error) {
-      if (ownershipFailure(error)) {
-        this.#markLost();
-        return;
-      }
-      this.#heartbeatFailure = leaseStorageFailure();
+        error instanceof AppError ? error : leaseStorageFailure();
       this.#abortInternal();
     }
   }
@@ -355,6 +409,7 @@ export class LeaseScope {
     }
 
     if (this.#lost) return null;
+    if (this.#retainUntilExpiry) return this.#heartbeatFailure;
     let guard: LeaseGuard | null;
     try {
       guard = this.tryFreshGuard();

@@ -591,6 +591,7 @@ class ApplyRuntime implements Clock, IdGenerator, MutationPacerRuntime {
   #wallMs: number;
   #monotonic = 0;
   #runSequence = 0;
+  #requestSequence = 0;
   readonly events: string[] = [];
   waitGate: Promise<void> | null = null;
   onWait: (() => void) | null = null;
@@ -636,7 +637,8 @@ class ApplyRuntime implements Clock, IdGenerator, MutationPacerRuntime {
   }
 
   requestId(): string {
-    return "request_apply_fixture";
+    this.#requestSequence += 1;
+    return `request_apply_${String(this.#requestSequence)}`;
   }
 
   operationId(): string {
@@ -979,7 +981,30 @@ interface ApplyTracking {
   >;
   globalRecoveries: number;
   loseLeaseOnNextRenew: boolean;
+  afterStartRunOperation: (() => void) | null;
+  finishRunOperationFailure: Error | null;
   transactions: number;
+}
+
+function trackedApplyTransaction(
+  transaction: StorageTransaction,
+  tracking: ApplyTracking,
+): StorageTransaction {
+  return new Proxy(transaction, {
+    get(target, property, receiver) {
+      if (property === "recoverAbandonedRuns") {
+        return (input: {
+          readonly binding: AccountBinding;
+          readonly lease: LeaseGuard;
+        }): readonly RunId[] => {
+          tracking.recovery.push(input);
+          tracking.events.push("run:recover");
+          return target.recoverAbandonedRuns(input);
+        };
+      }
+      return Reflect.get(target, property, receiver) as unknown;
+    },
+  });
 }
 
 function trackedApplyStorage(
@@ -1034,9 +1059,26 @@ function trackedApplyStorage(
       tracking.globalRecoveries += 1;
       return raw.recoverInterruptedRuns(now);
     },
+    startRunOperation(input: Parameters<StoragePort["startRunOperation"]>[0]) {
+      const operation = raw.startRunOperation(input);
+      tracking.afterStartRunOperation?.();
+      return operation;
+    },
+    finishRunOperation(
+      input: Parameters<StoragePort["finishRunOperation"]>[0],
+    ) {
+      const failure = tracking.finishRunOperationFailure;
+      if (failure !== null) {
+        tracking.finishRunOperationFailure = null;
+        throw failure;
+      }
+      return raw.finishRunOperation(input);
+    },
     withTransaction<T>(callback: (transaction: StorageTransaction) => T): T {
       tracking.transactions += 1;
-      return raw.withTransaction(callback);
+      return raw.withTransaction((transaction) =>
+        callback(trackedApplyTransaction(transaction, tracking)),
+      );
     },
   });
 }
@@ -1082,6 +1124,8 @@ export async function applyFixture(options: ApplyFixtureOptions = {}) {
     recovery: [],
     globalRecoveries: 0,
     loseLeaseOnNextRenew: false,
+    afterStartRunOperation: null,
+    finishRunOperationFailure: null,
     transactions: 0,
   };
   const storage = trackedApplyStorage(

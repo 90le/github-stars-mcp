@@ -460,6 +460,7 @@ const TRANSACTION_METHODS = MEMORY_INTRINSICS.objectFreeze([
   "getRunOperationAttempt",
   "listRunOperationAttemptsPage",
   "listRunOperationReconciliationsPage",
+  "recoverAbandonedRuns",
   "acquireLease",
   "renewLease",
   "releaseLease",
@@ -1263,6 +1264,17 @@ export function createMemoryStorage(
     switch (name) {
       case "assertLease":
         return assertLeaseCore(target, args[0]);
+      case "recoverAbandonedRuns": {
+        const input = safeObject(
+          args[0],
+          ["binding", "lease"],
+          "targeted run recovery input",
+        );
+        const binding = parseBinding(input.binding as JsonValue);
+        const guard = parseGuard(input.lease as JsonValue);
+        assertLeaseCore(target, guard);
+        return recoverRuns(target, binding, guard.now, guard.name);
+      }
       case "acquireLease": {
         const input = parseAcquire(args[0]);
         const existing = mapGet(target.leases, input.name);
@@ -3184,6 +3196,7 @@ export function createMemoryStorage(
   const root = MEMORY_INTRINSICS.objectCreate(null) as Record<string, unknown>;
   for (let index = 0; index < TRANSACTION_METHODS.length; index += 1) {
     const name = TRANSACTION_METHODS[index] as TransactionMethodName;
+    if (name === "recoverAbandonedRuns") continue;
     MEMORY_INTRINSICS.objectDefineProperty(root, name, {
       enumerable: true,
       value: (...args: unknown[]) => rootCall(name, args),

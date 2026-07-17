@@ -68,6 +68,7 @@ const TRANSACTION_METHODS = Object.freeze([
   "getRunOperationAttempt",
   "listRunOperationAttemptsPage",
   "listRunOperationReconciliationsPage",
+  "recoverAbandonedRuns",
   "acquireLease",
   "renewLease",
   "releaseLease",
@@ -308,6 +309,7 @@ export class SQLiteStore implements StoragePort {
         plans.listRunOperationAttemptsPage(input),
       listRunOperationReconciliationsPage: (input) =>
         plans.listRunOperationReconciliationsPage(input),
+      recoverAbandonedRuns: (input) => plans.recoverAbandonedRuns(input),
       acquireLease: (input) => leases.acquireLease(input),
       renewLease: (input) => leases.renewLease(input),
       releaseLease: (input) => leases.releaseLease(input),

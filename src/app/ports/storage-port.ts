@@ -305,6 +305,10 @@ export interface StorageTransaction {
     readonly afterEventSequence: number | null;
     readonly pageSize: number;
   }): RunOperationReconciliationPage;
+  recoverAbandonedRuns(input: {
+    readonly binding: AccountBinding;
+    readonly lease: LeaseGuard;
+  }): readonly RunId[];
   acquireLease(input: AcquireLeaseInput): Lease | null;
   renewLease(input: AcquireLeaseInput): Lease;
   releaseLease(input: {
@@ -325,10 +329,6 @@ export interface StoragePort extends StorageTransaction {
     readonly binding: AccountBinding;
     readonly lease: LeaseGuard;
   }): readonly SnapshotId[];
-  recoverAbandonedRuns(input: {
-    readonly binding: AccountBinding;
-    readonly lease: LeaseGuard;
-  }): readonly RunId[];
   recoverIncompleteSnapshots(now: string): readonly SnapshotId[];
   recoverInterruptedRuns(now: string): readonly RunId[];
   close(): void;

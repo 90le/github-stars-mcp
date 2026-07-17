@@ -1170,10 +1170,15 @@ describe("LeaseScope", () => {
   });
 
   it("preserves a primary error with only sanitized cleanup diagnostics and surfaces cleanup failure by itself", async () => {
+    const originalCause = new Error("original primary cause");
     const primary = new AppError(
       "GITHUB_UNAVAILABLE",
       "primary collection failed",
-      { retryable: true, details: { reason: "primary" } },
+      {
+        retryable: true,
+        details: { reason: "primary" },
+        cause: originalCause,
+      },
     );
     const firstTracked = trackedMemoryStorage();
     const firstStorage: StoragePort = {
@@ -1195,15 +1200,28 @@ describe("LeaseScope", () => {
       .catch((error: unknown) => error);
 
     expect(received).toBe(primary);
+    expect((received as Error & { cause?: unknown }).cause).toBe(originalCause);
     expect(
-      JSON.stringify((received as Error & { cause?: unknown }).cause),
+      JSON.stringify(
+        (
+          received as Error & {
+            cleanupDiagnostics?: readonly unknown[];
+          }
+        ).cleanupDiagnostics,
+      ),
     ).not.toContain("raw-cleanup-secret");
-    expect((received as Error & { cause?: unknown }).cause).toMatchObject({
-      cleanup: {
+    expect(
+      (
+        received as Error & {
+          cleanupDiagnostics?: readonly unknown[];
+        }
+      ).cleanupDiagnostics,
+    ).toMatchObject([
+      {
         code: "STORAGE_ERROR",
         retryable: false,
       },
-    });
+    ]);
 
     const secondTracked = trackedMemoryStorage();
     const secondStorage: StoragePort = {
@@ -2028,14 +2046,26 @@ describe("SyncService consistency, coverage, and cancellation", () => {
       details: { reason: "unsupported_list_item" },
     });
     expect(
-      JSON.stringify((error as Error & { cause?: unknown }).cause),
+      JSON.stringify(
+        (
+          error as Error & {
+            cleanupDiagnostics?: readonly unknown[];
+          }
+        ).cleanupDiagnostics,
+      ),
     ).not.toContain("raw-fail-cleanup-secret");
-    expect((error as Error & { cause?: unknown }).cause).toMatchObject({
-      cleanup: {
+    expect(
+      (
+        error as Error & {
+          cleanupDiagnostics?: readonly unknown[];
+        }
+      ).cleanupDiagnostics,
+    ).toMatchObject([
+      {
         code: "STORAGE_ERROR",
         retryable: false,
       },
-    });
+    ]);
     expect(tracked.tracking.completed).toEqual([]);
     expect(tracked.tracking.releases).toBe(1);
   });

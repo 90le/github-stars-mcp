@@ -819,7 +819,7 @@ export class PlanRunRepository {
       | undefined,
   ): readonly RunId[] {
     try {
-      return runInNewImmediateTransaction(this.#database, () => {
+      const recover = (): readonly RunId[] => {
         if (targeted !== undefined) {
           this.#leases.assertLease(targeted.guard);
         }
@@ -856,7 +856,10 @@ export class PlanRunRepository {
           this.#recoverRun(this.#requireRun(id), now);
         }
         return frozenIds;
-      });
+      };
+      return this.#database.inTransaction
+        ? recover()
+        : runInNewImmediateTransaction(this.#database, recover);
     } catch (error) {
       if (error instanceof AppError) throw error;
       return storageFailure("run recovery failed");

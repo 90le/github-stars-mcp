@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { sha256Hex } from "../../../src/domain/canonical-json.js";
+import {
+  canonicalJson,
+  sha256Hex,
+} from "../../../src/domain/canonical-json.js";
 import { AppError } from "../../../src/domain/errors.js";
 import type { PlanAction } from "../../../src/domain/plan.js";
 import type { GitHubCapabilities } from "../../../src/app/ports/github-port.js";
@@ -243,15 +246,16 @@ describe("ApplyService account lease", () => {
     });
 
     await expect(fixture.service.apply(fixture.input)).rejects.toMatchObject({
-      code: "STORAGE_ERROR",
+      code: "INTERNAL_ERROR",
       retryable: false,
+      details: { reason: "lease_scheduler_failure" },
     });
 
     expect(fixture.tracking.acquireLease).toHaveLength(1);
     expect(fixture.tracking.releaseLease).toEqual([
       {
         name: fixture.tracking.acquireLease[0]?.name,
-        ownerId: "apply-instance-1",
+        ownerId: "apply-instance-1:request_apply_1",
       },
     ]);
     expect(fixture.rawStorage.getLatestRunForPlan(fixture.plan.id)).toBeNull();
@@ -300,7 +304,7 @@ describe("ApplyService account lease", () => {
       plannerBinding.accountId,
     ).slice(0, 16)}`;
     expect(fixture.tracking.acquireLease).toMatchObject([
-      { name: expectedName, ownerId: "process-alpha" },
+      { name: expectedName, ownerId: "process-alpha:request_apply_1" },
     ]);
     expect(fixture.tracking.recovery).toHaveLength(1);
     expect(fixture.tracking.recovery[0]?.binding).toEqual(plannerBinding);
@@ -321,6 +325,49 @@ describe("ApplyService account lease", () => {
     expect(safety).toBeLessThan(release);
   });
 
+  it("retains the lease until expiry when the safety window wait fails", async () => {
+    const fixture = await applyFixture({ instanceId: "safety-process" });
+    const secondPlan = await fixture.planner.service.create(
+      fixture.planner.validInput,
+    );
+    const safetyFailure = new Error("fixture safety wait failed");
+    fixture.runtime.onWait = () => {
+      throw safetyFailure;
+    };
+
+    await expect(fixture.service.apply(fixture.input)).rejects.toMatchObject({
+      code: "INTERNAL_ERROR",
+      details: { reason: "mutation_pacing_wait_failed" },
+    });
+    const firstLease = fixture.tracking.acquireLease[0]!;
+    expect(fixture.github.mutationCalls).toHaveLength(1);
+    expect(fixture.tracking.releaseLease).not.toContainEqual({
+      name: firstLease.name,
+      ownerId: firstLease.ownerId,
+    });
+
+    fixture.runtime.onWait = null;
+    const secondInput = {
+      planId: secondPlan.plan.id,
+      expectedHash: secondPlan.plan.hash,
+      failureMode: "stop" as const,
+    };
+    await expect(
+      fixture.createService("competing-process").apply(secondInput),
+    ).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "lease_held" },
+    });
+    expect(
+      fixture.rawStorage.getLatestRunForPlan(secondPlan.plan.id),
+    ).toBeNull();
+
+    fixture.runtime.setNow("2026-07-16T03:00:00.000Z");
+    await expect(
+      fixture.createService("takeover-process").apply(secondInput),
+    ).resolves.toMatchObject({ run: { state: "completed" } });
+  });
+
   it("keeps one owner and heartbeat while rejecting a second process for the same account", async () => {
     const fixture = await applyFixture({ instanceId: "process-first" });
     let releaseMutation!: () => void;
@@ -334,7 +381,7 @@ describe("ApplyService account lease", () => {
 
     fixture.scheduler.tick();
     expect(fixture.tracking.renewLease.at(-1)).toMatchObject({
-      ownerId: "process-first",
+      ownerId: "process-first:request_apply_1",
     });
 
     const secondPlan = await fixture.planner.service.create(
@@ -357,6 +404,73 @@ describe("ApplyService account lease", () => {
     releaseMutation();
     await expect(first).resolves.toMatchObject({
       run: { state: "completed" },
+    });
+  });
+
+  it("uses a unique owner for each invocation of the same service", async () => {
+    const fixture = await applyFixture({ instanceId: "same-process" });
+    const secondPlan = await fixture.planner.service.create(
+      fixture.planner.validInput,
+    );
+
+    await fixture.service.apply(fixture.input);
+    await fixture.service.apply({
+      planId: secondPlan.plan.id,
+      expectedHash: secondPlan.plan.hash,
+      failureMode: "stop",
+    });
+
+    expect(fixture.tracking.acquireLease.map(({ ownerId }) => ownerId)).toEqual(
+      ["same-process:request_apply_1", "same-process:request_apply_2"],
+    );
+  });
+
+  it("prevents a stale heartbeat and cleanup from touching a takeover owner", async () => {
+    const fixture = await applyFixture({ instanceId: "aba-process" });
+    let releaseMutation!: () => void;
+    fixture.github.mutationGate = new Promise<void>((resolve) => {
+      releaseMutation = resolve;
+    });
+    const running = fixture.service.apply(fixture.input);
+    await vi.waitFor(() => {
+      expect(fixture.github.mutationCalls).toHaveLength(1);
+    });
+    const stale = fixture.tracking.acquireLease[0]!;
+    expect(stale.ownerId).toBe("aba-process:request_apply_1");
+
+    const takeoverNow = "2026-07-16T03:00:00.000Z";
+    fixture.runtime.setNow(takeoverNow);
+    const takeover = fixture.rawStorage.acquireLease({
+      name: stale.name,
+      ownerId: "aba-process:request_apply_2",
+      now: takeoverNow,
+      expiresAt: "2026-07-16T03:10:00.000Z",
+    })!;
+
+    fixture.scheduler.tick();
+    expect(
+      fixture.rawStorage.assertLease({
+        name: takeover.name,
+        ownerId: takeover.ownerId,
+        now: takeoverNow,
+      }).ownerId,
+    ).toBe("aba-process:request_apply_2");
+
+    releaseMutation();
+    await expect(running).rejects.toMatchObject({
+      code: "CAPABILITY_UNAVAILABLE",
+      details: { reason: "lease_lost" },
+    });
+    expect(
+      fixture.rawStorage.assertLease({
+        name: takeover.name,
+        ownerId: takeover.ownerId,
+        now: takeoverNow,
+      }).ownerId,
+    ).toBe("aba-process:request_apply_2");
+    expect(fixture.tracking.releaseLease).not.toContainEqual({
+      name: takeover.name,
+      ownerId: takeover.ownerId,
     });
   });
 });
@@ -422,6 +536,72 @@ describe("ApplyService durable orchestration", () => {
     expect(fixture.tracking.globalRecoveries).toBe(0);
   });
 
+  it("records a storage-triggered abort after attempt start without entering remote dispatch", async () => {
+    const fixture = await applyFixture();
+    const controller = new AbortController();
+    fixture.tracking.afterStartRunOperation = () => controller.abort();
+
+    await expect(
+      fixture.service.apply(fixture.input, controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    const run = fixture.rawStorage.getLatestRunForPlan(fixture.plan.id)!;
+    expect(run.state).toBe("partial");
+    expect(fixture.rawStorage.listRunOperations(run.id)).toMatchObject([
+      {
+        status: "failed",
+        attempts: 1,
+        reconciliation: "confirmed_not_applied",
+        error: {
+          retryable: true,
+          details: { reason: "cancelled_before_dispatch" },
+        },
+      },
+    ]);
+    expect(fixture.github.mutationCalls).toEqual([]);
+  });
+
+  it("recovers a successful remote mutation after its audit finish write fails", async () => {
+    const fixture = await applyFixture();
+    const finishFailure = new AppError(
+      "STORAGE_ERROR",
+      "fixture audit finish failed",
+      {
+        retryable: false,
+        details: { reason: "fixture_finish_failure" },
+      },
+    );
+    fixture.tracking.finishRunOperationFailure = finishFailure;
+
+    await expect(fixture.service.apply(fixture.input)).rejects.toBe(
+      finishFailure,
+    );
+
+    const abandoned = fixture.rawStorage.getLatestRunForPlan(fixture.plan.id)!;
+    expect(abandoned.state).toBe("running");
+    expect(fixture.rawStorage.listRunOperations(abandoned.id)).toMatchObject([
+      { status: "running", attempts: 1, reconciliation: "pending" },
+    ]);
+    expect(fixture.github.mutationCalls).toHaveLength(1);
+
+    const resumed = await fixture
+      .createService("audit-recovery-process")
+      .apply(fixture.input);
+    const rows = fixture.rawStorage.listRunOperations(resumed.run.id);
+
+    expect(resumed.run.id).toBe(abandoned.id);
+    expect(resumed.run.state).toBe("completed");
+    expect(rows).toMatchObject([
+      {
+        status: "succeeded",
+        attempts: 1,
+        reconciliation: "confirmed_applied",
+      },
+    ]);
+    expect(rows.some((row) => row.status === "running")).toBe(false);
+    expect(fixture.github.mutationCalls).toHaveLength(1);
+  });
+
   it("returns the persisted completed run idempotently without a second mutation", async () => {
     const fixture = await applyFixture();
 
@@ -432,6 +612,41 @@ describe("ApplyService durable orchestration", () => {
     expect(second).toEqual(first);
     expect(second.run.id).toBe(first.run.id);
     expect(fixture.github.mutationCalls).toHaveLength(mutationCount);
+  });
+
+  it("replays an applied run before expiry, capability, failure-mode, lease, or recovery checks", async () => {
+    const fixture = await applyFixture();
+    const first = await fixture.service.apply(fixture.input);
+    const leaseName = fixture.tracking.acquireLease[0]!.name;
+    const expiredNow = "2030-01-01T00:00:00.000Z";
+    fixture.runtime.setNow(expiredNow);
+    fixture.github.capabilities = Object.freeze({
+      starRead: "available",
+      starWrite: "unavailable",
+      listRead: "available",
+      listWrite: "unavailable",
+    });
+    fixture.github.statusCalls.length = 0;
+    fixture.tracking.acquireLease.length = 0;
+    fixture.tracking.recovery.length = 0;
+    fixture.rawStorage.acquireLease({
+      name: leaseName,
+      ownerId: "competing-replay-owner",
+      now: expiredNow,
+      expiresAt: "2030-01-01T00:10:00.000Z",
+    });
+
+    const replay = await fixture.service.apply({
+      ...fixture.input,
+      failureMode: "continue",
+    });
+
+    expect(replay).toEqual(first);
+    expect(replay.run).toEqual(first.run);
+    expect(fixture.github.statusCalls).toEqual(["getViewer"]);
+    expect(fixture.tracking.acquireLease).toEqual([]);
+    expect(fixture.tracking.recovery).toEqual([]);
+    expect(fixture.github.mutationCalls).toHaveLength(1);
   });
 
   it("audits the first real permission rejection as nonretryable without retry", async () => {
@@ -622,6 +837,36 @@ describe("ApplyService durable orchestration", () => {
     expect(fixture.github.mutationCalls).toHaveLength(beforeMutations);
   });
 
+  it("leaves an abandoned running run byte-for-byte unchanged when claim validation fails", async () => {
+    const fixture = await applyFixture({ instanceId: "atomic-recovery" });
+    fixture.tracking.loseLeaseOnNextRenew = true;
+    await expect(fixture.service.apply(fixture.input)).rejects.toMatchObject({
+      details: { reason: "lease_lost" },
+    });
+    const run = fixture.rawStorage.getLatestRunForPlan(fixture.plan.id)!;
+    expect(run.state).toBe("running");
+    const storedState = () =>
+      canonicalJson({
+        plan: fixture.rawStorage.getPlan(fixture.plan.id),
+        run: fixture.rawStorage.getRun(run.id),
+        operations: fixture.rawStorage.listRunOperations(run.id),
+      });
+    const before = storedState();
+    fixture.runtime.setNow("2026-07-16T03:00:00.000Z");
+
+    await expect(
+      fixture.service.apply({
+        ...fixture.input,
+        failureMode: "continue",
+      }),
+    ).rejects.toMatchObject({
+      code: "PRECONDITION_FAILED",
+      details: { reason: "failure_mode_conflict" },
+    });
+
+    expect(storedState()).toBe(before);
+  });
+
   it("reconciles an unknown applied outcome without dispatching twice", async () => {
     const fixture = await applyFixture();
     fixture.github.failNextMutation(
@@ -731,7 +976,7 @@ describe("ApplyService durable orchestration", () => {
     ).toMatchObject({ status: "succeeded", attempts: 1 });
   });
 
-  it("uses targeted recovery after lease loss and resumes without a global scan", async () => {
+  it("uses targeted recovery after lease loss and resumes the same run through the same service", async () => {
     const fixture = await applyFixture({ instanceId: "losing-process" });
     fixture.tracking.loseLeaseOnNextRenew = true;
 
@@ -746,11 +991,15 @@ describe("ApplyService durable orchestration", () => {
     );
 
     fixture.runtime.setNow("2026-07-16T03:00:00.000Z");
-    const recovered = await fixture
-      .createService("recovery-process")
-      .apply(fixture.input);
+    const recovered = await fixture.service.apply(fixture.input);
 
     expect(recovered.run.state).toBe("completed");
+    expect(recovered.run.id).toBe(
+      fixture.rawStorage.getLatestRunForPlan(fixture.plan.id)?.id,
+    );
+    expect(fixture.tracking.acquireLease[0]?.ownerId).not.toBe(
+      fixture.tracking.acquireLease.at(-1)?.ownerId,
+    );
     expect(fixture.tracking.recovery.length).toBeGreaterThanOrEqual(2);
     expect(fixture.tracking.globalRecoveries).toBe(0);
     expect(fixture.github.mutationCalls).toHaveLength(1);

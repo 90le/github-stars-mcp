@@ -34,8 +34,6 @@ import type {
 } from "../ports/github-port.js";
 import type { Clock, IdGenerator } from "../ports/runtime-port.js";
 import type {
-  AcquireLeaseInput,
-  Lease,
   LeaseGuard,
   StoragePort,
   StorageTransaction,
@@ -47,7 +45,11 @@ import type {
   PrepareMutationResult,
 } from "./mutation-executor.js";
 import type { ExecutionOutcome, MutationPacer } from "./mutation-pacer.js";
-import type { LeaseScheduler } from "./lease-scope.js";
+import {
+  appendCleanupDiagnostic,
+  LeaseScope,
+  type LeaseScheduler,
+} from "./lease-scope.js";
 
 export type ApplyInput = Readonly<{
   planId: PlanId;
@@ -63,7 +65,7 @@ export type ApplyResult = Readonly<{
   auditCursor: string | null;
 }>;
 
-type ApplyRuntime = Clock & Pick<IdGenerator, "runId">;
+type ApplyRuntime = Clock & Pick<IdGenerator, "requestId" | "runId">;
 type ApplyExecutor = Pick<
   MutationExecutor,
   | "readCurrentState"
@@ -89,7 +91,7 @@ export type ApplyServiceOptions = Readonly<{
 const HASH = /^[a-f0-9]{64}$/u;
 const DEFAULT_WRITE_INTERVAL_MS = 1_000;
 const BASE_LEASE_MS = 10 * 60_000;
-const HEARTBEAT_MS = 60_000;
+const LEASE_HEARTBEAT_MS = 60_000;
 const MAX_ERRORS = 20;
 const MAX_ATTEMPTS = 3;
 
@@ -136,28 +138,6 @@ function invalidRuntime(reason: string): AppError {
     retryable: false,
     details: { reason },
   });
-}
-
-function leaseHeld(): AppError {
-  return new AppError(
-    "CAPABILITY_UNAVAILABLE",
-    "Another process currently holds the account apply lease",
-    {
-      retryable: true,
-      details: { reason: "lease_held" },
-    },
-  );
-}
-
-function leaseLost(): AppError {
-  return new AppError(
-    "CAPABILITY_UNAVAILABLE",
-    "The account apply lease is no longer owned by this process",
-    {
-      retryable: true,
-      details: { reason: "lease_lost" },
-    },
-  );
 }
 
 function fixedAbortError(): DOMException {
@@ -227,25 +207,6 @@ function safeNow(runtime: Clock): string {
   }
 }
 
-function addMilliseconds(timestamp: string, milliseconds: number): string {
-  const value = Date.parse(timestamp);
-  const next = value + milliseconds;
-  if (
-    !Number.isFinite(value) ||
-    !Number.isSafeInteger(milliseconds) ||
-    milliseconds < 1 ||
-    !Number.isSafeInteger(next) ||
-    next <= value
-  ) {
-    throw invalidRuntime("invalid_lease_expiry");
-  }
-  try {
-    return canonicalUtcTimestamp(new Date(next).toISOString(), "lease expiry");
-  } catch {
-    throw invalidRuntime("invalid_lease_expiry");
-  }
-}
-
 function stableInstanceId(value: string): string {
   if (
     typeof value !== "string" ||
@@ -273,6 +234,25 @@ function runId(runtime: Pick<IdGenerator, "runId">) {
   } catch {
     throw invalidRuntime("invalid_run_id");
   }
+}
+
+function requestId(runtime: Pick<IdGenerator, "requestId">): string {
+  let value: string;
+  try {
+    value = runtime.requestId();
+  } catch {
+    throw invalidRuntime("invalid_request_id");
+  }
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 128 ||
+    value !== value.trim() ||
+    value.includes("\0")
+  ) {
+    throw invalidRuntime("invalid_request_id");
+  }
+  return value;
 }
 
 function storageCall<T>(action: () => T): T {
@@ -466,286 +446,30 @@ function warningsFor(
   return Object.freeze(warnings);
 }
 
-function leaseStorageError(error: unknown): AppError {
+function completedReplay(
+  storage: StoragePort,
+  plan: ChangePlan,
+  binding: AccountBinding,
+): ChangeRun | null {
+  if (plan.state !== "applied") return null;
+  const run = storageCall(() => storage.getLatestRunForPlan(plan.id));
   if (
-    error instanceof AppError &&
-    (error.code === "NOT_FOUND" || error.code === "PRECONDITION_FAILED")
+    run === null ||
+    run.state !== "completed" ||
+    run.planId !== plan.id ||
+    !sameBinding(run.binding, binding)
   ) {
-    return leaseLost();
+    throw new AppError(
+      "PRECONDITION_FAILED",
+      "The applied plan does not have a valid completed run",
+      {
+        retryable: false,
+        details: { reason: "completed_replay_invalid" },
+      },
+    );
   }
-  return storageFailure("lease_storage_failure", error);
+  return run;
 }
-
-function validLease(value: Lease, name: string, ownerId: string): Lease {
-  if (
-    value.name !== name ||
-    value.ownerId !== ownerId ||
-    typeof value.expiresAt !== "string"
-  ) {
-    throw storageFailure("invalid_lease_record");
-  }
-  try {
-    canonicalUtcTimestamp(value.acquiredAt, "lease acquiredAt");
-    canonicalUtcTimestamp(value.heartbeatAt, "lease heartbeatAt");
-    canonicalUtcTimestamp(value.expiresAt, "lease expiresAt");
-  } catch {
-    throw storageFailure("invalid_lease_record");
-  }
-  return value;
-}
-
-class ApplyLease {
-  readonly #storage: StoragePort;
-  readonly #runtime: Clock;
-  readonly #name: string;
-  readonly #ownerId: string;
-  readonly #scheduler: LeaseScheduler;
-  readonly #callerSignal: AbortSignal | undefined;
-  readonly #controller = new AbortController();
-  readonly #callerAbort: () => void;
-  #interval: unknown;
-  #durationMs: number;
-  #expiresAt: string;
-  #stopped = false;
-  #lost = false;
-  #callerCancelled = false;
-  #failure: AppError | null = null;
-
-  private constructor(
-    options: {
-      storage: StoragePort;
-      runtime: Clock;
-      name: string;
-      ownerId: string;
-      scheduler: LeaseScheduler;
-      durationMs: number;
-      signal?: AbortSignal;
-    },
-    lease: Lease,
-  ) {
-    this.#storage = options.storage;
-    this.#runtime = options.runtime;
-    this.#name = options.name;
-    this.#ownerId = options.ownerId;
-    this.#scheduler = options.scheduler;
-    this.#durationMs = options.durationMs;
-    this.#expiresAt = validLease(lease, this.#name, this.#ownerId).expiresAt;
-    this.#callerSignal = options.signal;
-    this.#callerAbort = () => {
-      this.#callerCancelled = true;
-      this.#abort();
-    };
-    if (signalAborted(this.#callerSignal)) {
-      this.#callerAbort();
-    } else {
-      try {
-        this.#callerSignal?.addEventListener("abort", this.#callerAbort, {
-          once: true,
-        });
-      } catch {
-        this.#callerAbort();
-      }
-    }
-    try {
-      this.#interval = this.#scheduler.setInterval(
-        () => this.#heartbeat(),
-        HEARTBEAT_MS,
-      );
-    } catch (error) {
-      this.#failure = storageFailure("lease_scheduler_failure", error);
-      this.#stopped = true;
-      try {
-        this.#callerSignal?.removeEventListener("abort", this.#callerAbort);
-      } catch {
-        // Listener cleanup cannot change lease ownership.
-      }
-      this.#abort();
-      throw this.#failure;
-    }
-  }
-
-  static acquire(options: {
-    storage: StoragePort;
-    runtime: Clock;
-    name: string;
-    ownerId: string;
-    scheduler: LeaseScheduler;
-    durationMs: number;
-    signal?: AbortSignal;
-  }): ApplyLease {
-    const now = safeNow(options.runtime);
-    let lease: Lease | null;
-    try {
-      lease = options.storage.acquireLease({
-        name: options.name,
-        ownerId: options.ownerId,
-        now,
-        expiresAt: addMilliseconds(now, options.durationMs),
-      });
-    } catch (error) {
-      throw leaseStorageError(error);
-    }
-    if (lease === null) throw leaseHeld();
-    try {
-      return new ApplyLease(options, lease);
-    } catch (error) {
-      const primary = errorObject(error);
-      try {
-        options.storage.releaseLease({
-          name: options.name,
-          ownerId: options.ownerId,
-        });
-      } catch (cleanupError) {
-        attachCleanupDiagnostic(primary, leaseStorageError(cleanupError));
-      }
-      throw primary;
-    }
-  }
-
-  get signal(): AbortSignal {
-    return this.#controller.signal;
-  }
-
-  assertActive(): void {
-    if (this.#callerCancelled || signalAborted(this.#callerSignal)) {
-      throw fixedAbortError();
-    }
-    if (this.#lost) throw leaseLost();
-    if (this.#failure !== null) throw this.#failure;
-    if (safeNow(this.#runtime) >= this.#expiresAt) {
-      this.#lost = true;
-      this.#abort();
-      throw leaseLost();
-    }
-  }
-
-  guard(): LeaseGuard {
-    this.assertActive();
-    return this.#ownedGuard();
-  }
-
-  auditGuard(): LeaseGuard {
-    if (this.#lost) throw leaseLost();
-    return this.#ownedGuard();
-  }
-
-  renew(minimumDurationMs = this.#durationMs): LeaseGuard {
-    this.assertActive();
-    return this.#renew(minimumDurationMs);
-  }
-
-  async cleanup(pacer: ApplyPacer, safetyIntervalMs: number): Promise<unknown> {
-    let cleanupError: unknown;
-    try {
-      this.#renew(safetyIntervalMs + HEARTBEAT_MS);
-    } catch (error) {
-      cleanupError = error;
-    }
-    try {
-      await pacer.waitForSafetyWindow();
-    } catch (error) {
-      cleanupError ??= error;
-    }
-    this.#stopped = true;
-    try {
-      this.#scheduler.clearInterval(this.#interval);
-    } catch (error) {
-      cleanupError ??= storageFailure("lease_scheduler_failure", error);
-    }
-    try {
-      this.#callerSignal?.removeEventListener("abort", this.#callerAbort);
-    } catch {
-      // Listener cleanup cannot change lease ownership.
-    }
-
-    if (!this.#lost) {
-      try {
-        const guard = this.#ownedGuard();
-        this.#storage.releaseLease({
-          name: guard.name,
-          ownerId: guard.ownerId,
-        });
-      } catch (error) {
-        cleanupError ??= leaseStorageError(error);
-      }
-    }
-    return cleanupError;
-  }
-
-  #ownedGuard(): LeaseGuard {
-    const guard = Object.freeze({
-      name: this.#name,
-      ownerId: this.#ownerId,
-      now: safeNow(this.#runtime),
-    });
-    try {
-      const lease = this.#storage.assertLease(guard);
-      this.#expiresAt = validLease(lease, this.#name, this.#ownerId).expiresAt;
-      return guard;
-    } catch (error) {
-      this.#lost = true;
-      this.#abort();
-      throw leaseStorageError(error);
-    }
-  }
-
-  #renew(minimumDurationMs: number): LeaseGuard {
-    if (this.#lost) throw leaseLost();
-    this.#durationMs = Math.max(this.#durationMs, minimumDurationMs);
-    const now = safeNow(this.#runtime);
-    const input: AcquireLeaseInput = Object.freeze({
-      name: this.#name,
-      ownerId: this.#ownerId,
-      now,
-      expiresAt: addMilliseconds(now, this.#durationMs),
-    });
-    try {
-      const lease = this.#storage.renewLease(input);
-      this.#expiresAt = validLease(lease, this.#name, this.#ownerId).expiresAt;
-      return Object.freeze({
-        name: this.#name,
-        ownerId: this.#ownerId,
-        now,
-      });
-    } catch (error) {
-      this.#lost = true;
-      this.#abort();
-      throw leaseStorageError(error);
-    }
-  }
-
-  #heartbeat(): void {
-    if (this.#stopped || this.#lost || this.#failure !== null) return;
-    try {
-      this.#renew(this.#durationMs);
-    } catch (error) {
-      this.#failure =
-        error instanceof AppError
-          ? error
-          : storageFailure("lease_heartbeat_failure", error);
-      this.#abort();
-    }
-  }
-
-  #abort(): void {
-    try {
-      this.#controller.abort();
-    } catch {
-      // Synchronous ownership checks remain authoritative.
-    }
-  }
-}
-
-const NODE_SCHEDULER: LeaseScheduler = Object.freeze({
-  setInterval(callback: () => void, intervalMs: number): unknown {
-    const handle = setInterval(callback, intervalMs);
-    handle.unref();
-    return handle;
-  },
-  clearInterval(handle: unknown): void {
-    clearInterval(handle as NodeJS.Timeout);
-  },
-});
 
 type Claim = Readonly<{
   plan: ChangePlan;
@@ -953,7 +677,7 @@ async function executePendingOperation(input: {
   runtime: ApplyRuntime;
   executor: ApplyExecutor;
   pacer: ApplyPacer;
-  lease: ApplyLease;
+  lease: LeaseScope;
   run: ChangeRun;
   operation: ResolvedOperation;
   sequence: number;
@@ -966,7 +690,7 @@ async function executePendingOperation(input: {
     storageCall(() =>
       input.storage.createRunOperation({
         operation: row,
-        lease: input.lease.guard(),
+        lease: input.lease.freshGuard(),
       }),
     );
   } else {
@@ -981,7 +705,9 @@ async function executePendingOperation(input: {
     }
   }
 
-  let started = false;
+  let attemptStarted = false;
+  let remoteDispatchEntered = false;
+  let executionOutcomeAvailable = false;
   let prepared: PreparedMutation | null = null;
   try {
     const outcome = await input.pacer.run({
@@ -1006,7 +732,9 @@ async function executePendingOperation(input: {
             lease: guard,
           }),
         );
-        started = true;
+        attemptStarted = true;
+        input.lease.assertActive();
+        remoteDispatchEntered = true;
         return input.executor.dispatchPrepared(
           value,
           input.context,
@@ -1014,9 +742,10 @@ async function executePendingOperation(input: {
         );
       },
     });
+    executionOutcomeAvailable = true;
 
     if (outcome.kind === "skipped") {
-      const guard = input.lease.auditGuard();
+      const guard = input.lease.freshGuard();
       return storageCall(() =>
         input.storage.finishRunOperation({
           phase: "before_dispatch",
@@ -1030,7 +759,7 @@ async function executePendingOperation(input: {
         }),
       );
     }
-    const guard = input.lease.auditGuard();
+    const guard = input.lease.freshGuard();
     return storageCall(() =>
       input.storage.finishRunOperation({
         phase: "after_dispatch",
@@ -1046,10 +775,11 @@ async function executePendingOperation(input: {
       }),
     );
   } catch (error) {
+    if (executionOutcomeAvailable) throw error;
     const cancelled = isCancellation(error, input.callerSignal);
     let finished: RunOperation;
-    if (!started) {
-      const guard = input.lease.auditGuard();
+    if (!attemptStarted) {
+      const guard = input.lease.freshGuard();
       finished = storageCall(() =>
         input.storage.finishRunOperation({
           phase: "before_dispatch",
@@ -1062,12 +792,28 @@ async function executePendingOperation(input: {
           lease: guard,
         }),
       );
+    } else if (!remoteDispatchEntered) {
+      const guard = input.lease.freshGuard();
+      finished = storageCall(() =>
+        input.storage.finishRunOperation({
+          phase: "after_dispatch",
+          runId: input.run.id,
+          operationId: input.operation.operationId,
+          status: "failed",
+          reconciliation: "confirmed_not_applied",
+          externalRequestId: null,
+          after: prepared?.before ?? null,
+          error: cancelled ? retryableCancellation() : serializeError(error),
+          finishedAt: safeNow(input.runtime),
+          lease: guard,
+        }),
+      );
     } else if (
       error instanceof AppError &&
       error.code !== "RECONCILIATION_REQUIRED" &&
       !cancelled
     ) {
-      const guard = input.lease.auditGuard();
+      const guard = input.lease.freshGuard();
       finished = storageCall(() =>
         input.storage.finishRunOperation({
           phase: "after_dispatch",
@@ -1083,7 +829,7 @@ async function executePendingOperation(input: {
         }),
       );
     } else {
-      const guard = input.lease.auditGuard();
+      const guard = input.lease.freshGuard();
       finished = storageCall(() =>
         input.storage.finishRunOperation({
           phase: "after_dispatch",
@@ -1126,7 +872,7 @@ function dependencyBlockedError(
 function recordDependencyBlocked(input: {
   storage: StoragePort;
   runtime: ApplyRuntime;
-  lease: ApplyLease;
+  lease: LeaseScope;
   run: ChangeRun;
   operation: ResolvedOperation;
   sequence: number;
@@ -1136,10 +882,10 @@ function recordDependencyBlocked(input: {
   storageCall(() =>
     input.storage.createRunOperation({
       operation: pendingOperation(input.run, input.operation, input.sequence),
-      lease: input.lease.guard(),
+      lease: input.lease.freshGuard(),
     }),
   );
-  const guard = input.lease.auditGuard();
+  const guard = input.lease.freshGuard();
   return storageCall(() =>
     input.storage.finishRunOperation({
       phase: "before_dispatch",
@@ -1239,7 +985,7 @@ async function reconcileForResume(input: {
   storage: StoragePort;
   runtime: ApplyRuntime;
   executor: ApplyExecutor;
-  lease: ApplyLease;
+  lease: LeaseScope;
   run: ChangeRun;
   operation: ResolvedOperation;
   row: RunOperation;
@@ -1269,7 +1015,7 @@ async function reconcileForResume(input: {
     if (isCancellation(error, input.callerSignal)) throw fixedAbortError();
     input.lease.assertActive();
     if (input.row.status === "unresolved") {
-      const guard = input.lease.auditGuard();
+      const guard = input.lease.freshGuard();
       const row = storageCall(() =>
         input.storage.reconcileRunOperation({
           runId: input.run.id,
@@ -1299,7 +1045,7 @@ async function reconcileForResume(input: {
   );
   if (input.row.status === "unresolved") {
     if (matchesAfter) {
-      const guard = input.lease.auditGuard();
+      const guard = input.lease.freshGuard();
       const row = storageCall(() =>
         input.storage.reconcileRunOperation({
           runId: input.run.id,
@@ -1321,7 +1067,7 @@ async function reconcileForResume(input: {
           input.operation.operationId,
         ))
     ) {
-      const guard = input.lease.auditGuard();
+      const guard = input.lease.freshGuard();
       const row = storageCall(() =>
         input.storage.reconcileRunOperation({
           runId: input.run.id,
@@ -1336,7 +1082,7 @@ async function reconcileForResume(input: {
       );
       return Object.freeze({ row, execute: false });
     }
-    const guard = input.lease.auditGuard();
+    const guard = input.lease.freshGuard();
     input.row = storageCall(() =>
       input.storage.reconcileRunOperation({
         runId: input.run.id,
@@ -1353,7 +1099,7 @@ async function reconcileForResume(input: {
     return Object.freeze({ row: input.row, execute: false });
   }
 
-  const guard = input.lease.guard();
+  const guard = input.lease.freshGuard();
   const queued = storageCall(() =>
     input.storage.retryRunOperation({
       runId: input.run.id,
@@ -1400,14 +1146,19 @@ function resultFor(storage: StoragePort, run: ChangeRun): ApplyResult {
 function finalizeRun(input: {
   storage: StoragePort;
   runtime: ApplyRuntime;
-  lease: ApplyLease;
+  lease: LeaseScope;
   plan: ChangePlan;
   run: ChangeRun;
 }): ChangeRun {
-  const guard = input.lease.auditGuard();
+  const guard = input.lease.freshGuard();
   return storageCall(() =>
     input.storage.withTransaction((tx) => {
       const rows = tx.listRunOperations(input.run.id);
+      if (
+        rows.some((row) => row.status === "pending" || row.status === "running")
+      ) {
+        throw storageFailure("run_operations_in_flight");
+      }
       const complete =
         rows.length === input.plan.operations.length &&
         rows.every(
@@ -1431,27 +1182,6 @@ function finalizeRun(input: {
   );
 }
 
-function attachCleanupDiagnostic(primary: unknown, cleanup: unknown): void {
-  if (
-    (typeof primary !== "object" && typeof primary !== "function") ||
-    primary === null
-  ) {
-    return;
-  }
-  try {
-    Object.defineProperty(primary, "cause", {
-      configurable: true,
-      enumerable: false,
-      value: Object.freeze({
-        cleanup: Object.freeze(serializeError(cleanup)),
-      }),
-      writable: true,
-    });
-  } catch {
-    // A non-extensible primary error remains authoritative.
-  }
-}
-
 export class ApplyService {
   readonly #github: GitHubStatusReadPort;
   readonly #storage: StoragePort;
@@ -1461,7 +1191,7 @@ export class ApplyService {
   readonly #readOnly: boolean;
   readonly #writeIntervalMs: number;
   readonly #instanceId: string;
-  readonly #leaseScheduler: LeaseScheduler;
+  readonly #leaseScheduler: LeaseScheduler | undefined;
 
   constructor(options: ApplyServiceOptions) {
     this.#github = options.github;
@@ -1472,7 +1202,7 @@ export class ApplyService {
     this.#readOnly = options.config.readOnly;
     this.#writeIntervalMs = writeInterval(options.config.writeIntervalMs);
     this.#instanceId = stableInstanceId(options.instanceId);
-    this.#leaseScheduler = options.leaseScheduler ?? NODE_SCHEDULER;
+    this.#leaseScheduler = options.leaseScheduler;
   }
 
   async apply(input: ApplyInput, signal?: AbortSignal): Promise<ApplyResult> {
@@ -1495,16 +1225,10 @@ export class ApplyService {
       });
     }
     assertPlanHash(plan, parsed.expectedHash);
-    assertPlanAvailable(plan, safeNow(this.#runtime));
 
     let viewer: AccountBinding;
-    let capabilities: GitHubCapabilities;
     try {
       viewer = parseBinding(await this.#github.getViewer(signal));
-      assertNotAborted(signal);
-      capabilities = parseCapabilities(
-        await this.#github.probeCapabilities(signal),
-      );
       assertNotAborted(signal);
     } catch (error) {
       assertNotAborted(signal);
@@ -1518,6 +1242,21 @@ export class ApplyService {
         { retryable: false },
       );
     }
+    const replay = completedReplay(this.#storage, plan, viewer);
+    if (replay !== null) return resultFor(this.#storage, replay);
+    assertPlanAvailable(plan, safeNow(this.#runtime));
+
+    let capabilities: GitHubCapabilities;
+    try {
+      capabilities = parseCapabilities(
+        await this.#github.probeCapabilities(signal),
+      );
+      assertNotAborted(signal);
+    } catch (error) {
+      assertNotAborted(signal);
+      if (error instanceof AppError) throw error;
+      throw githubFailure("admission_failed", error);
+    }
     const warnings = warningsFor(plan, capabilities);
     const leaseName = `apply:${viewer.host}:${sha256Hex(viewer.accountId).slice(
       0,
@@ -1525,179 +1264,203 @@ export class ApplyService {
     )}`;
     const durationMs = Math.max(
       BASE_LEASE_MS,
-      this.#writeIntervalMs + HEARTBEAT_MS,
+      this.#writeIntervalMs + LEASE_HEARTBEAT_MS,
     );
-    const lease = ApplyLease.acquire({
+    const scope = LeaseScope.acquire({
       storage: this.#storage,
       runtime: this.#runtime,
       name: leaseName,
-      ownerId: this.#instanceId,
-      scheduler: this.#leaseScheduler,
-      durationMs,
+      ownerId: `${this.#instanceId}:${requestId(this.#runtime)}`,
+      ttlMs: durationMs,
       ...(signal === undefined ? {} : { signal }),
+      ...(this.#leaseScheduler === undefined
+        ? {}
+        : { scheduler: this.#leaseScheduler }),
     });
 
-    let primary: unknown;
-    let result: ApplyResult | undefined;
-    try {
-      lease.assertActive();
-      storageCall(() =>
-        this.#storage.recoverAbandonedRuns({
-          binding: viewer,
-          lease: lease.guard(),
-        }),
-      );
-      const claimGuard = lease.guard();
-      const claim = storageCall(() =>
-        this.#storage.withTransaction((tx) =>
-          claimRun(
-            tx,
-            parsed,
-            plan,
-            viewer,
-            warnings,
-            this.#runtime,
-            claimGuard,
-          ),
-        ),
-      );
-      if (claim.completed) {
-        result = resultFor(this.#storage, claim.run);
-      } else {
-        const existingRows = storageCall(() =>
-          this.#storage.listRunOperations(claim.run.id),
+    return scope.run(async (lease) => {
+      let primary: unknown;
+      let result: ApplyResult | undefined;
+      try {
+        lease.assertActive();
+        const claimGuard = lease.freshGuard();
+        const claim = storageCall(() =>
+          this.#storage.withTransaction((tx) => {
+            tx.recoverAbandonedRuns({
+              binding: viewer,
+              lease: claimGuard,
+            });
+            return claimRun(
+              tx,
+              parsed,
+              plan,
+              viewer,
+              warnings,
+              this.#runtime,
+              claimGuard,
+            );
+          }),
         );
-        const context = rebuildExecutionContext(claim.plan, existingRows);
-        const rowsById = new Map(
-          existingRows.map((row) => [row.operationId, row]),
-        );
-        const byId = new Map(
-          claim.plan.operations.map((operation) => [
-            operation.operationId,
-            operation,
-          ]),
-        );
-        const sequenceById = new Map(
-          claim.plan.operations.map((operation, sequence) => [
-            operation.operationId,
-            sequence,
-          ]),
-        );
-        let operationFailure: unknown;
-        for (const operationId of topologicalOperationIds(
-          claim.plan.operations,
-          claim.plan.dependencies,
-        )) {
-          const operation = byId.get(operationId);
-          const sequence = sequenceById.get(operationId);
-          if (operation === undefined || sequence === undefined) {
-            throw storageFailure("plan_operation_missing");
-          }
-          let current = rowsById.get(operation.operationId) ?? null;
-          if (
-            current?.status === "succeeded" ||
-            current?.status === "skipped"
-          ) {
-            continue;
-          }
-          const dependenciesComplete = operation.dependsOn.every(
-            (dependencyId) => {
-              const dependency = rowsById.get(dependencyId);
-              return (
-                dependency?.status === "succeeded" ||
-                dependency?.status === "skipped"
-              );
-            },
+        if (claim.completed) {
+          result = resultFor(this.#storage, claim.run);
+        } else {
+          const existingRows = storageCall(() =>
+            this.#storage.listRunOperations(claim.run.id),
           );
-          if (!dependenciesComplete) {
-            current = recordDependencyBlocked({
-              storage: this.#storage,
-              runtime: this.#runtime,
-              lease,
-              run: claim.run,
+          const context = rebuildExecutionContext(claim.plan, existingRows);
+          const rowsById = new Map(
+            existingRows.map((row) => [row.operationId, row]),
+          );
+          const byId = new Map(
+            claim.plan.operations.map((operation) => [
+              operation.operationId,
               operation,
+            ]),
+          );
+          const sequenceById = new Map(
+            claim.plan.operations.map((operation, sequence) => [
+              operation.operationId,
               sequence,
-              existing: current,
-            });
-            rowsById.set(operation.operationId, current);
-            if (parsed.failureMode === "stop") break;
-            continue;
-          }
+            ]),
+          );
+          let operationFailure: unknown;
+          for (const operationId of topologicalOperationIds(
+            claim.plan.operations,
+            claim.plan.dependencies,
+          )) {
+            const operation = byId.get(operationId);
+            const sequence = sequenceById.get(operationId);
+            if (operation === undefined || sequence === undefined) {
+              throw storageFailure("plan_operation_missing");
+            }
+            let current = rowsById.get(operation.operationId) ?? null;
+            if (
+              current?.status === "succeeded" ||
+              current?.status === "skipped"
+            ) {
+              continue;
+            }
+            const dependenciesComplete = operation.dependsOn.every(
+              (dependencyId) => {
+                const dependency = rowsById.get(dependencyId);
+                return (
+                  dependency?.status === "succeeded" ||
+                  dependency?.status === "skipped"
+                );
+              },
+            );
+            if (!dependenciesComplete) {
+              current = recordDependencyBlocked({
+                storage: this.#storage,
+                runtime: this.#runtime,
+                lease,
+                run: claim.run,
+                operation,
+                sequence,
+                existing: current,
+              });
+              rowsById.set(operation.operationId, current);
+              if (parsed.failureMode === "stop") break;
+              continue;
+            }
 
-          let createWriteAhead = current === null;
-          if (current !== null) {
-            const decision = await reconcileForResume({
-              storage: this.#storage,
-              runtime: this.#runtime,
-              executor: this.#executor,
-              lease,
-              run: claim.run,
-              operation,
-              row: current,
-              context,
-              ...(signal === undefined ? {} : { callerSignal: signal }),
-            });
-            current = decision.row;
-            rowsById.set(operation.operationId, current);
-            if (!decision.execute) {
+            let createWriteAhead = current === null;
+            if (current !== null) {
+              const decision = await reconcileForResume({
+                storage: this.#storage,
+                runtime: this.#runtime,
+                executor: this.#executor,
+                lease,
+                run: claim.run,
+                operation,
+                row: current,
+                context,
+                ...(signal === undefined ? {} : { callerSignal: signal }),
+              });
+              current = decision.row;
+              rowsById.set(operation.operationId, current);
+              if (!decision.execute) {
+                if (
+                  parsed.failureMode === "stop" &&
+                  current.status !== "succeeded" &&
+                  current.status !== "skipped"
+                ) {
+                  break;
+                }
+                continue;
+              }
+              createWriteAhead = false;
+            }
+            try {
+              const finished = await executePendingOperation({
+                storage: this.#storage,
+                runtime: this.#runtime,
+                executor: this.#executor,
+                pacer: this.#pacer,
+                lease,
+                run: claim.run,
+                operation,
+                sequence,
+                context,
+                createWriteAhead,
+                ...(signal === undefined ? {} : { callerSignal: signal }),
+              });
+              rowsById.set(operation.operationId, finished);
               if (
                 parsed.failureMode === "stop" &&
-                current.status !== "succeeded" &&
-                current.status !== "skipped"
+                finished.status !== "succeeded" &&
+                finished.status !== "skipped"
               ) {
                 break;
               }
-              continue;
-            }
-            createWriteAhead = false;
-          }
-          try {
-            const finished = await executePendingOperation({
-              storage: this.#storage,
-              runtime: this.#runtime,
-              executor: this.#executor,
-              pacer: this.#pacer,
-              lease,
-              run: claim.run,
-              operation,
-              sequence,
-              context,
-              createWriteAhead,
-              ...(signal === undefined ? {} : { callerSignal: signal }),
-            });
-            rowsById.set(operation.operationId, finished);
-            if (
-              parsed.failureMode === "stop" &&
-              finished.status !== "succeeded" &&
-              finished.status !== "skipped"
-            ) {
+            } catch (error) {
+              operationFailure = error;
               break;
             }
-          } catch (error) {
-            operationFailure = error;
-            break;
           }
+          if (operationFailure !== undefined) {
+            const interruptedRows = storageCall(() =>
+              this.#storage.listRunOperations(claim.run.id),
+            );
+            if (
+              interruptedRows.some(
+                (row) => row.status === "pending" || row.status === "running",
+              )
+            ) {
+              throw errorObject(operationFailure);
+            }
+          }
+          const run = finalizeRun({
+            storage: this.#storage,
+            runtime: this.#runtime,
+            lease,
+            plan: claim.plan,
+            run: claim.run,
+          });
+          if (operationFailure !== undefined)
+            throw errorObject(operationFailure);
+          result = resultFor(this.#storage, run);
         }
-        const run = finalizeRun({
-          storage: this.#storage,
-          runtime: this.#runtime,
-          lease,
-          plan: claim.plan,
-          run: claim.run,
-        });
-        if (operationFailure !== undefined) throw errorObject(operationFailure);
-        result = resultFor(this.#storage, run);
+      } catch (error) {
+        primary = error;
       }
-    } catch (error) {
-      primary = error;
-    }
 
-    const cleanup = await lease.cleanup(this.#pacer, this.#writeIntervalMs);
-    if (primary !== undefined) {
-      if (cleanup !== undefined) attachCleanupDiagnostic(primary, cleanup);
-      throw errorObject(primary);
-    }
-    if (cleanup !== undefined) throw errorObject(cleanup);
-    return result as ApplyResult;
+      let cleanup: unknown;
+      let safetyLeaseRenewed = false;
+      try {
+        lease.renew(this.#writeIntervalMs + LEASE_HEARTBEAT_MS);
+        safetyLeaseRenewed = true;
+        await this.#pacer.waitForSafetyWindow();
+      } catch (error) {
+        if (safetyLeaseRenewed) lease.retainUntilExpiry();
+        cleanup = error;
+      }
+      if (primary !== undefined) {
+        if (cleanup !== undefined) appendCleanupDiagnostic(primary, cleanup);
+        throw errorObject(primary);
+      }
+      if (cleanup !== undefined) throw errorObject(cleanup);
+      return result as ApplyResult;
+    });
   }
 }
