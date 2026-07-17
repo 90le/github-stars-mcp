@@ -214,7 +214,11 @@ export interface RepositoryView extends Repository { readonly starredAt: string;
 export interface ObservedRepositoryMetadata { readonly repository: Repository; readonly observedAt: string }
 ```
 
-`repositorySchema` trims names, preserves ID case, lowercases/trim/deduplicates/sorts topics, requires HTTPS GitHub URL, nonnegative integer stars, and ISO timestamps.
+`repositorySchema` has output type `Repository`, so parsed fields and topic
+arrays remain readonly at compile time. It trims names, preserves ID case,
+lowercases/trims/deduplicates/sorts topics, requires an HTTPS GitHub URL,
+nonnegative integer stars, and canonical UTC ISO timestamps ending in `Z`;
+numeric-offset timestamps are rejected rather than stored in mixed forms.
 
 ```ts
 export interface SnapshotDraft { readonly id: SnapshotId; readonly binding: AccountBinding; readonly mode: "full" | "incremental"; readonly startedAt: string }
