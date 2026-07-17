@@ -356,6 +356,149 @@ async function readJsonLines(
     .map((line) => JSON.parse(line) as Record<string, unknown>);
 }
 
+const ALLOWED_PACK_PREFIXES = Object.freeze(["dist", PLUGIN_ROOT]);
+
+function mixedCase(value: string): string {
+  return [...value]
+    .map((character, index) =>
+      index % 2 === 0 ? character.toUpperCase() : character.toLowerCase(),
+    )
+    .join("");
+}
+
+const WAVE3_DOTENV_NAMES = Object.freeze([
+  ".env-local",
+  ".env_test",
+  ".envrc",
+  ".env~",
+  ".envrc.1",
+  ".env-production.swp",
+  ".env_backup.2",
+  ".env-local.bak.gz",
+]);
+const WAVE3_SENSITIVE_DIRECTORY_FAMILIES = Object.freeze([
+  "credential",
+  "token",
+  "secret",
+  "private-key",
+  "auth",
+  "cookie",
+  "session",
+  "state",
+  "database",
+  "cache",
+  "temp",
+  "log",
+]);
+const WAVE3_LOCAL_ARTIFACT_NAMES = Object.freeze([
+  ".credential",
+  "TOKEN",
+  "secret.backup.1",
+  "private_key.old",
+  ".auth-history",
+  "cookie.session",
+  "session_2",
+  "github-stars-state.json",
+  "app_cache.data",
+  "runtime-temp.json",
+  "debug.log.1",
+  "debug.log.gz",
+  "github-stars.sqlite.1",
+  "app.database.backup",
+  ".eslintcache",
+  "package-lock.json",
+  "npm-debug.log.1",
+  "yarn-error.log.gz",
+  ".node_repl_history",
+  "tsconfig.tsbuildinfo",
+  "module.js~",
+  "crash.dump",
+  ".DS_Store",
+  "desktop.ini",
+  ".pnpm-debug.log.2",
+  "coverage-final.json",
+  ".nyc_output",
+]);
+const WAVE3_SENSITIVE_PACK_PATHS: readonly (readonly [string, string])[] = [
+  ...WAVE3_DOTENV_NAMES.flatMap((name) =>
+    ALLOWED_PACK_PREFIXES.map(
+      (prefix) =>
+        [
+          `dotenv ${name} under ${prefix}`,
+          `${prefix}/config/${mixedCase(name)}`,
+        ] as const,
+    ),
+  ),
+  ...WAVE3_SENSITIVE_DIRECTORY_FAMILIES.flatMap((family) =>
+    ALLOWED_PACK_PREFIXES.map((prefix, index) => {
+      const varied =
+        index === 0
+          ? `${mixedCase(family)}-data`
+          : `.${mixedCase(family)}_backup`;
+      return [
+        `${family} component ${varied} under ${prefix}`,
+        `${prefix}/nested/${varied}/module.js`,
+      ] as const;
+    }),
+  ),
+  ...WAVE3_LOCAL_ARTIFACT_NAMES.map(
+    (name, index) =>
+      [
+        `local artifact ${name}`,
+        `${ALLOWED_PACK_PREFIXES[index % ALLOWED_PACK_PREFIXES.length]}/nested/${mixedCase(name)}`,
+      ] as const,
+  ),
+];
+
+const WAVE3_BEARER_ENCODINGS = Object.freeze([
+  [
+    "double-quoted JSON",
+    "eyJhbGciOiJIUzI1NiJ9.payload.signature",
+    '{"Authorization":"Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature"}',
+  ],
+  [
+    "single-quoted object",
+    "opaque_token-one",
+    "{'authorization':'bearer opaque_token-one'}",
+  ],
+  [
+    "quoted YAML",
+    "opaque.token-two",
+    "\"AUTHORIZATION\": 'BEARER opaque.token-two'",
+  ],
+  [
+    "unquoted env",
+    "opaque-token-three",
+    "AUTHORIZATION=Bearer opaque-token-three",
+  ],
+  [
+    "quoted env",
+    "opaque_token-four",
+    'AUTHORIZATION = "Bearer opaque_token-four"',
+  ],
+  [
+    "whitespace-separated config",
+    "opaque.token-five",
+    "Authorization Bearer opaque.token-five",
+  ],
+  [
+    "JS-like quoted value",
+    "opaque-token-six",
+    'const headers = { Authorization: "Bearer opaque-token-six" };',
+  ],
+  [
+    "quoted key and bare value",
+    "opaque_token-seven",
+    "'Authorization' : Bearer opaque_token-seven",
+  ],
+  [
+    "backtick JS-like assignment",
+    "opaque.token-eight",
+    "`Authorization` = `Bearer opaque.token-eight`",
+  ],
+  ["padded token68", "abc/DEF+123==", "authorization:\t'Bearer abc/DEF+123=='"],
+] as const);
+
 describe("Codex plugin package", () => {
   it("uses official plugin layout and pins the exact MCP package", async () => {
     const manifest = await readJson(`${PLUGIN_ROOT}/.codex-plugin/plugin.json`);
@@ -914,6 +1057,25 @@ describe("Codex plugin package", () => {
     });
   });
 
+  it.each(WAVE3_SENSITIVE_PACK_PATHS)(
+    "rejects the generated sensitive path family: %s",
+    async (_name, path) => {
+      await withPluginFixture(async (root) => {
+        const npmEntry = await fakeNpmPackCommand(root, [
+          ...PACKED_PLUGIN_PATHS,
+          path,
+        ]);
+
+        const result = runFixtureValidator(root, {
+          staticOnly: false,
+          env: { npm_execpath: npmEntry, PATH: "" },
+        });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("PACKAGE_DRY_RUN_SENSITIVE_PATH");
+      });
+    },
+  );
+
   it.each([
     [
       "fine-grained GitHub token",
@@ -956,13 +1118,72 @@ describe("Codex plugin package", () => {
     },
   );
 
+  it.each(WAVE3_BEARER_ENCODINGS)(
+    "rejects a complete Bearer credential in %s syntax without echoing it",
+    async (name, credential, encoded) => {
+      await withPluginFixture(async (root) => {
+        const slug = name.toLowerCase().replaceAll(/[^a-z0-9]+/gu, "-");
+        const path = `dist/generated/bearer-${slug}.js`;
+        await mkdir(resolve(root, path, ".."), { recursive: true });
+        await writeFile(join(root, path), `${encoded}\n`, "utf8");
+        const npmEntry = await fakeNpmPackCommand(root, [
+          ...PACKED_PLUGIN_PATHS,
+          path,
+        ]);
+
+        const result = runFixtureValidator(root, {
+          staticOnly: false,
+          env: { npm_execpath: npmEntry, PATH: "" },
+        });
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("PACKAGE_DRY_RUN_SENSITIVE_CONTENT");
+        expect(result.stderr).not.toContain(credential);
+      });
+    },
+  );
+
+  it.each([
+    [
+      "a template interpolation",
+      "const headers = { Authorization: `Bearer ${token}` };\n",
+    ],
+    ["an explicit placeholder", '{"Authorization":"Bearer <token>"}\n'],
+    ["a different scheme", '{"Authorization":"Basic Zm9vOmJhcg=="}\n'],
+    [
+      "separate field and scheme names",
+      'const field = "Authorization"; const scheme = "Bearer";\n',
+    ],
+    ["a Bearer value without an authorization field", "Bearer opaque-token\n"],
+  ])("accepts non-credential Bearer control: %s", async (_name, contents) => {
+    await withPluginFixture(async (root) => {
+      const path = "dist/generated/bearer-control.js";
+      await mkdir(resolve(root, path, ".."), { recursive: true });
+      await writeFile(join(root, path), contents, "utf8");
+      const npmEntry = await fakeNpmPackCommand(root, [
+        ...PACKED_PLUGIN_PATHS,
+        path,
+      ]);
+
+      const result = runFixtureValidator(root, {
+        staticOnly: false,
+        env: { npm_execpath: npmEntry, PATH: "" },
+      });
+      expect(result.status).toBe(0);
+      expect(result.stderr).toBe("");
+    });
+  });
+
   it("accepts legitimate compiled runtime artifacts and package metadata", async () => {
     await withPluginFixture(async (root) => {
       const paths = [
         "dist/auth/credential-provider.js",
+        "dist/auth/auth-provider.js",
         "dist/storage/runtime-secret-repository.d.ts",
+        "dist/storage/runtime-state.js",
         "dist/storage/sqlite-database.js.map",
+        "dist/storage/sqlite-store.js",
         "dist/storage/state-directory.js",
+        "dist/security/secret-redactor.js.map",
         "dist/package.json",
       ];
       for (const path of paths) {

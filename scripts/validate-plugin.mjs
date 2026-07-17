@@ -50,27 +50,6 @@ const EXPECTED_PACKAGE_FILES = Object.freeze([
   "README.md",
   "LICENSE",
 ]);
-const LOCAL_STATE_COMPONENTS = new Set([
-  ".cache",
-  ".cookies",
-  ".credentials",
-  ".logs",
-  ".secrets",
-  ".sessions",
-  ".state",
-  ".temp",
-  ".tmp",
-  "cache",
-  "cookies",
-  "credentials",
-  "logs",
-  "secrets",
-  "sessions",
-  "state",
-  "temp",
-  "tmp",
-  "tokens",
-]);
 const SENSITIVE_MATERIAL_TOKENS = new Set([
   "auth",
   "authentication",
@@ -85,18 +64,25 @@ const SENSITIVE_MATERIAL_TOKENS = new Set([
   "token",
   "tokens",
 ]);
-const SENSITIVE_MATERIAL_EXTENSIONS = new Set([
-  ".bin",
-  ".conf",
-  ".config",
-  ".dat",
-  ".ini",
-  ".json",
-  ".toml",
-  ".txt",
-  ".xml",
-  ".yaml",
-  ".yml",
+const LOCAL_STATE_TOKENS = new Set([
+  "cache",
+  "database",
+  "db",
+  "history",
+  "log",
+  "logs",
+  "sqlite",
+  "sqlite3",
+  "state",
+  "temp",
+  "tmp",
+]);
+const LOCAL_DIAGNOSTIC_TOKENS = new Set([
+  "core",
+  "coverage",
+  "crash",
+  "diagnostic",
+  "dump",
 ]);
 const PRIVATE_KEY_EXTENSIONS = new Set([
   ".jks",
@@ -105,6 +91,21 @@ const PRIVATE_KEY_EXTENSIONS = new Set([
   ".p12",
   ".pem",
   ".pfx",
+]);
+const LOCAL_ARTIFACT_FILENAMES = new Set([
+  ".ds_store",
+  ".eslintcache",
+  ".nyc_output",
+  ".npmrc",
+  ".pnpmrc",
+  ".stylelintcache",
+  ".yarnrc",
+  "desktop.ini",
+  "npm-shrinkwrap.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "thumbs.db",
+  "yarn.lock",
 ]);
 const MANIFEST_KEYS = new Set([
   "author",
@@ -742,36 +743,100 @@ function parseExternalJson(source, code) {
   }
 }
 
+function componentTokens(component) {
+  return component
+    .toLowerCase()
+    .split(/[._-]+/u)
+    .filter((token) => token.length > 0);
+}
+
+function hasPrivateKeyTokens(tokens) {
+  return (
+    tokens.includes("privatekey") ||
+    tokens.some(
+      (token, index) => token === "private" && tokens[index + 1] === "key",
+    )
+  );
+}
+
+function hasFamilyToken(component, family) {
+  const tokens = componentTokens(component);
+  return (
+    hasPrivateKeyTokens(tokens) || tokens.some((token) => family.has(token))
+  );
+}
+
+function isCompiledRuntimeFilename(filename) {
+  return /(?:\.(?:[cm]?js|d\.[cm]?ts))(?:\.map)?$/u.test(filename);
+}
+
+function compiledRuntimeStem(filename) {
+  return filename.replace(/(?:\.(?:[cm]?js|d\.[cm]?ts))(?:\.map)?$/u, "");
+}
+
+function exactSensitiveMaterial(component) {
+  const tokens = componentTokens(component);
+  return (
+    hasPrivateKeyTokens(tokens) ||
+    (tokens.length === 1 && SENSITIVE_MATERIAL_TOKENS.has(tokens[0]))
+  );
+}
+
+function dotenvFamily(filename) {
+  return /^\.env(?:rc)?(?:$|[._~-])/u.test(filename);
+}
+
+function localArtifactFilename(filename) {
+  if (
+    LOCAL_ARTIFACT_FILENAMES.has(filename) ||
+    filename.endsWith("~") ||
+    /\.(?:bak|backup|old|orig|save|sw[opx]|temp|tmp)$/u.test(filename) ||
+    /\.tsbuildinfo$/u.test(filename) ||
+    /^(?:\.#|#.*#$)/u.test(filename)
+  ) {
+    return true;
+  }
+  const tokens = componentTokens(filename);
+  return (
+    tokens.some(
+      (token) =>
+        LOCAL_STATE_TOKENS.has(token) || LOCAL_DIAGNOSTIC_TOKENS.has(token),
+    ) || /^(?:npm-debug|pnpm-debug|yarn-(?:debug|error))\.log/u.test(filename)
+  );
+}
+
 function sensitivePackedPath(path) {
   const segments = path.toLowerCase().split("/");
   const filename = segments.at(-1);
   assert(typeof filename === "string", "PACKAGE_DRY_RUN_FILE_PATH");
-  if (
-    segments
-      .slice(0, -1)
-      .some((component) => LOCAL_STATE_COMPONENTS.has(component))
-  ) {
-    return true;
-  }
-  if (
-    filename === ".env" ||
-    filename.startsWith(".env.") ||
-    filename === ".npmrc" ||
-    filename.endsWith(".log") ||
-    /\.(?:sqlite3?|db3?|database)(?:-(?:wal|shm))?$/u.test(filename) ||
-    /\.(?:bak|swp|temp|tmp)$/u.test(filename)
-  ) {
-    return true;
+  const compiledRuntime = isCompiledRuntimeFilename(filename);
+  const packageMetadata = filename === "package.json";
+
+  for (const [index, component] of segments.slice(0, -1).entries()) {
+    const allowedAuthNamespace =
+      path.startsWith("dist/") &&
+      index === 1 &&
+      component === "auth" &&
+      (compiledRuntime || packageMetadata);
+    if (
+      !allowedAuthNamespace &&
+      (hasFamilyToken(component, SENSITIVE_MATERIAL_TOKENS) ||
+        hasFamilyToken(component, LOCAL_STATE_TOKENS) ||
+        hasFamilyToken(component, LOCAL_DIAGNOSTIC_TOKENS))
+    ) {
+      return true;
+    }
   }
 
-  const extension = extname(filename);
-  if (PRIVATE_KEY_EXTENSIONS.has(extension)) return true;
-  if (!SENSITIVE_MATERIAL_EXTENSIONS.has(extension)) return false;
-  const stem = filename.slice(0, -extension.length);
-  const tokens = stem.split(/[._-]+/u);
+  if (dotenvFamily(filename)) return true;
+  if (PRIVATE_KEY_EXTENSIONS.has(extname(filename))) return true;
+  if (packageMetadata) return false;
+  if (compiledRuntime) {
+    return exactSensitiveMaterial(compiledRuntimeStem(filename));
+  }
   return (
-    tokens.some((token) => SENSITIVE_MATERIAL_TOKENS.has(token)) ||
-    /(?:^|[._-])private[._-]?key(?:$|[._-])/u.test(stem)
+    hasFamilyToken(filename, SENSITIVE_MATERIAL_TOKENS) ||
+    localArtifactFilename(filename)
   );
 }
 
@@ -780,7 +845,9 @@ function containsCredentialMaterial(contents) {
   return (
     /github_pat_[A-Za-z0-9_]{4,}/u.test(source) ||
     /gh[pousr]_[A-Za-z0-9_]{4,}/u.test(source) ||
-    /authorization\s*:\s*bearer\s+\S+/iu.test(source) ||
+    /["'`]?\bauthorization\b["'`]?(?:\s*[:=]\s*|\s+)["'`]?\s*bearer\s+[A-Za-z0-9._~+/-]{4,}={0,2}(?=\s*(?:["'`]|[,;}\]\r\n]|$))/iu.test(
+      source,
+    ) ||
     /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/u.test(source)
   );
 }
