@@ -1,3 +1,21 @@
+import type {
+  GitHubListItem,
+  GitHubStar,
+  Page,
+  RateLimitState,
+} from "../../src/app/ports/github-port.js";
+import {
+  asRepositoryDatabaseId,
+  asRepositoryId,
+  asUserListId,
+} from "../../src/domain/ids.js";
+import {
+  repositorySchema,
+  userListSchema,
+  type Repository,
+  type UserList,
+} from "../../src/domain/repository.js";
+
 export function rawRestRepository(
   overrides: Readonly<Record<string, unknown>> = {},
 ): Record<string, unknown> {
@@ -119,4 +137,101 @@ export function userListItemsData(
       resetAt: "2026-07-18T01:00:00Z",
     },
   };
+}
+
+export function syncRepository(
+  index: number,
+  overrides: Partial<Repository> = {},
+): Repository {
+  const repositoryId =
+    overrides.repositoryId ?? asRepositoryId(`R_sync_${String(index)}`);
+  const owner = overrides.owner ?? "sync-owner";
+  const name = overrides.name ?? `repo-${String(index)}`;
+  return Object.freeze(
+    repositorySchema.parse({
+      repositoryId,
+      repositoryDatabaseId:
+        overrides.repositoryDatabaseId ??
+        asRepositoryDatabaseId(String(10_000 + index)),
+      owner,
+      name,
+      fullName: overrides.fullName ?? `${owner}/${name}`,
+      description: overrides.description ?? `Repository ${String(index)}`,
+      url: overrides.url ?? `https://github.com/${owner}/${name}`,
+      stargazerCount: overrides.stargazerCount ?? 100 + index,
+      isFork: overrides.isFork ?? false,
+      isArchived: overrides.isArchived ?? false,
+      isDisabled: overrides.isDisabled ?? false,
+      isPrivate: overrides.isPrivate ?? false,
+      visibility: overrides.visibility ?? "public",
+      primaryLanguage: overrides.primaryLanguage ?? "TypeScript",
+      topics: overrides.topics ?? ["sync"],
+      licenseSpdxId: overrides.licenseSpdxId ?? "Apache-2.0",
+      pushedAt: overrides.pushedAt ?? "2026-07-17T00:00:00.000Z",
+      updatedAt: overrides.updatedAt ?? "2026-07-18T00:00:00.000Z",
+    }),
+  );
+}
+
+export function syncStar(
+  index: number,
+  overrides: Partial<GitHubStar> = {},
+): GitHubStar {
+  return Object.freeze({
+    repository: overrides.repository ?? syncRepository(index),
+    starredAt: overrides.starredAt ?? "2026-07-18T01:00:00.000Z",
+  });
+}
+
+export function syncUserList(
+  index: number,
+  overrides: Partial<UserList> = {},
+): UserList {
+  const listId = overrides.listId ?? asUserListId(`UL_sync_${String(index)}`);
+  return Object.freeze(
+    userListSchema.parse({
+      listId,
+      name: overrides.name ?? `List ${String(index)}`,
+      slug: overrides.slug ?? `list-${String(index)}`,
+      description: overrides.description ?? null,
+      isPrivate: overrides.isPrivate ?? false,
+      createdAt: overrides.createdAt ?? "2026-07-01T00:00:00.000Z",
+      updatedAt: overrides.updatedAt ?? "2026-07-18T00:00:00.000Z",
+      lastAddedAt: overrides.lastAddedAt ?? null,
+    }),
+  );
+}
+
+export function syncRepositoryItem(repository: Repository): GitHubListItem {
+  return Object.freeze({ kind: "repository", repository });
+}
+
+export function syncUnsupportedItem(
+  typename = "FutureItem",
+  itemId: string | null = null,
+): GitHubListItem {
+  return Object.freeze({ kind: "unsupported", typename, itemId });
+}
+
+export function syncPage<T>(
+  items: readonly T[],
+  nextCursor: string | null = null,
+  options: Readonly<{
+    rateLimit?: RateLimitState | null;
+    warnings?: readonly string[];
+  }> = {},
+): Page<T> {
+  const rateLimit = options.rateLimit === undefined ? null : options.rateLimit;
+  return Object.freeze({
+    items: Object.freeze([...items]),
+    nextCursor,
+    rateLimit:
+      rateLimit === null
+        ? null
+        : Object.freeze({
+            remaining: rateLimit.remaining,
+            resetAt: rateLimit.resetAt,
+          }),
+    warnings: Object.freeze([...(options.warnings ?? [])]),
+  });
 }
