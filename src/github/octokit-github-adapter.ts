@@ -3,11 +3,12 @@ import { types as utilTypes } from "node:util";
 import type {
   CapabilityState,
   GitHubCapabilities,
-  GitHubEvidenceReadPort,
   GitHubListItem,
+  GitHubPort,
   GitHubReadme,
+  GitHubSearchInput,
+  GitHubSearchPage,
   GitHubStar,
-  GitHubSyncReadPort,
   GitHubUserList,
   Page,
   RateLimitState,
@@ -59,6 +60,19 @@ const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/u;
 const README_BASE64 =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
 const README_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
+const SEARCH_INPUT_KEYS = new Set([
+  "query",
+  "sort",
+  "order",
+  "page",
+  "perPage",
+]);
+const SEARCH_SORTS = new Set([
+  "stars",
+  "forks",
+  "help-wanted-issues",
+  "updated",
+]);
 
 type SafeRecord = ReadonlyMap<string, unknown>;
 
@@ -872,6 +886,122 @@ function readmeFromResponse(
   });
 }
 
+function invalidSearchInput(): AppError {
+  return new AppError("VALIDATION_ERROR", "GitHub Search input is invalid", {
+    retryable: false,
+    details: {
+      operation: "searchRepositories",
+      reason: "invalid_search_input",
+    },
+  });
+}
+
+function searchInput(value: GitHubSearchInput): GitHubSearchInput {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    Array.isArray(value)
+  ) {
+    throw invalidSearchInput();
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Reflect.getPrototypeOf(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw invalidSearchInput();
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== SEARCH_INPUT_KEYS.size ||
+    keys.some((key) => typeof key !== "string" || !SEARCH_INPUT_KEYS.has(key))
+  ) {
+    throw invalidSearchInput();
+  }
+  const read = (key: keyof GitHubSearchInput): unknown => {
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      descriptor.enumerable !== true
+    ) {
+      throw invalidSearchInput();
+    }
+    return descriptor.value as unknown;
+  };
+  const query = read("query");
+  const sort = read("sort");
+  const order = read("order");
+  const page = read("page");
+  const perPage = read("perPage");
+  if (
+    typeof query !== "string" ||
+    query.length === 0 ||
+    query.length > 256 ||
+    query !== query.trim() ||
+    !wellFormedUnicode(query) ||
+    !controlFree(query) ||
+    (sort !== null && (typeof sort !== "string" || !SEARCH_SORTS.has(sort))) ||
+    (order !== "asc" && order !== "desc") ||
+    typeof page !== "number" ||
+    !Number.isSafeInteger(page) ||
+    page < 1 ||
+    typeof perPage !== "number" ||
+    !Number.isSafeInteger(perPage) ||
+    perPage < 1 ||
+    perPage > 100 ||
+    page - 1 > Math.floor(999 / perPage)
+  ) {
+    throw invalidSearchInput();
+  }
+  return Object.freeze({
+    query,
+    sort: sort as GitHubSearchInput["sort"],
+    order,
+    page,
+    perPage,
+  });
+}
+
+function searchPageFromResponse(
+  response: unknown,
+  input: GitHubSearchInput,
+): GitHubSearchPage {
+  const operation = "searchRepositories";
+  const envelope = restEnvelope(response, operation);
+  const data = safeRecord(envelope.data, operation);
+  exactKeys(data, ["total_count", "incomplete_results", "items"], operation);
+  const totalCount = nonnegativeInteger(
+    required(data, "total_count", operation),
+    operation,
+  );
+  const incompleteResults = required(data, "incomplete_results", operation);
+  if (typeof incompleteResults !== "boolean") {
+    throw malformedRemote(operation);
+  }
+  const items = Object.freeze(
+    denseArray(
+      required(data, "items", operation),
+      input.perPage,
+      operation,
+    ).map((item) => normalizeRestRepository(item, operation)),
+  );
+  if (items.length > totalCount) throw malformedRemote(operation);
+  const cappedTotal = Math.min(totalCount, 1_000);
+  const nextPage =
+    input.page * input.perPage < cappedTotal ? input.page + 1 : null;
+  return Object.freeze({
+    items,
+    totalCount,
+    incompleteResults,
+    nextPage,
+    rateLimit: restRateLimit(envelope.headers, operation),
+  });
+}
+
 function starPageFromResponse(
   response: unknown,
   operation: string,
@@ -1243,9 +1373,7 @@ async function probeRead(
   }
 }
 
-export class OctokitGitHubAdapter
-  implements GitHubSyncReadPort, GitHubEvidenceReadPort
-{
+export class OctokitGitHubAdapter implements GitHubPort {
   readonly #transport: GitHubTransport;
 
   constructor(transport: GitHubTransport) {
@@ -1367,5 +1495,33 @@ export class OctokitGitHubAdapter
       }
       throw error;
     }
+  }
+
+  async searchRepositories(
+    input: GitHubSearchInput,
+    signal?: AbortSignal,
+  ): Promise<GitHubSearchPage> {
+    const validated = searchInput(input);
+    const parameters =
+      validated.sort === null
+        ? Object.freeze({
+            q: validated.query,
+            order: validated.order,
+            page: validated.page,
+            per_page: validated.perPage,
+          })
+        : Object.freeze({
+            q: validated.query,
+            sort: validated.sort,
+            order: validated.order,
+            page: validated.page,
+            per_page: validated.perPage,
+          });
+    const response = await this.#transport.rest(
+      "searchRepositories",
+      parameters,
+      signal,
+    );
+    return searchPageFromResponse(response, validated);
   }
 }

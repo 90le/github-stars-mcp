@@ -69,7 +69,7 @@ function customTransport(input: {
 }
 
 describe("GitHub identity and capability contracts", () => {
-  it("keeps the progressive adapter free of discovery and mutation stubs", () => {
+  it("exposes the final read methods without mutation stubs", () => {
     expectTypeOf<GitHubStatusReadPort>().toHaveProperty("getViewer");
     expectTypeOf<GitHubStatusReadPort>().toHaveProperty("probeCapabilities");
     expectTypeOf<GitHubStarReadPort>().toHaveProperty(
@@ -88,6 +88,7 @@ describe("GitHub identity and capability contracts", () => {
         "listUserListItems",
         "listUserLists",
         "probeCapabilities",
+        "searchRepositories",
       ].sort(),
     );
   });

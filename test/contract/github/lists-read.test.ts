@@ -61,7 +61,7 @@ async function rejectedError(promise: Promise<unknown>): Promise<AppError> {
 }
 
 describe("GitHub User List read contracts", () => {
-  it("keeps the progressive adapter free of discovery and mutation stubs", () => {
+  it("exposes the final read methods without mutation stubs", () => {
     expectTypeOf<OctokitGitHubAdapter>().toMatchTypeOf<GitHubSyncReadPort>();
     expect(
       Object.getOwnPropertyNames(OctokitGitHubAdapter.prototype).sort(),
@@ -74,6 +74,7 @@ describe("GitHub User List read contracts", () => {
         "listUserListItems",
         "listUserLists",
         "probeCapabilities",
+        "searchRepositories",
       ].sort(),
     );
   });
