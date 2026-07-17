@@ -84,6 +84,8 @@ describe("GitHub identity and capability contracts", () => {
         "constructor",
         "getViewer",
         "listStarredRepositories",
+        "listUserListItems",
+        "listUserLists",
         "probeCapabilities",
       ].sort(),
     );

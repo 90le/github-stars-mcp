@@ -2,12 +2,15 @@ import { types as utilTypes } from "node:util";
 import type {
   CapabilityState,
   GitHubCapabilities,
+  GitHubListItem,
   GitHubStar,
-  GitHubStarReadPort,
+  GitHubSyncReadPort,
+  GitHubUserList,
   Page,
   RateLimitState,
 } from "../app/ports/github-port.js";
 import { AppError, type AppErrorCode } from "../domain/errors.js";
+import type { UserListId } from "../domain/ids.js";
 import { repositorySchema, userListSchema } from "../domain/repository.js";
 import type {
   AccountBinding,
@@ -21,7 +24,12 @@ import {
   type GraphqlReadOperation,
   type GraphqlTransportError,
 } from "./allowed-operations.js";
-import { parseRestNextCursor, parseRestPageCursor } from "./pagination.js";
+import {
+  parseGraphqlInputCursor,
+  parseGraphqlNextCursor,
+  parseRestNextCursor,
+  parseRestPageCursor,
+} from "./pagination.js";
 
 const MAX_PAGE_ITEMS = 100;
 const MAX_GRAPHQL_ERRORS = 100;
@@ -40,6 +48,7 @@ const MAX_LICENSE = 100;
 const MAX_LIST_NAME = 255;
 const MAX_LIST_SLUG = 255;
 const MAX_LIST_DESCRIPTION = 8_192;
+const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/u;
 
 type SafeRecord = ReadonlyMap<string, unknown>;
 
@@ -403,6 +412,158 @@ function normalizeRestRepository(
   );
 }
 
+function graphqlTopics(value: unknown, operation: string): readonly string[] {
+  const connection = safeRecord(value, operation);
+  const nodes = denseArray(
+    required(connection, "nodes", operation),
+    MAX_PAGE_ITEMS,
+    operation,
+  );
+  return Object.freeze(
+    nodes.map((candidate) => {
+      const node = safeRecord(candidate, operation);
+      const topic = safeRecord(required(node, "topic", operation), operation);
+      return boundedText(
+        required(topic, "name", operation),
+        MAX_TOPIC,
+        operation,
+      );
+    }),
+  );
+}
+
+function graphqlLanguage(value: unknown, operation: string): string | null {
+  if (value === null) return null;
+  const language = safeRecord(value, operation);
+  return boundedText(
+    required(language, "name", operation),
+    MAX_LANGUAGE,
+    operation,
+  );
+}
+
+function graphqlLicense(value: unknown, operation: string): string | null {
+  if (value === null) return null;
+  const license = safeRecord(value, operation);
+  const spdxId = required(license, "spdxId", operation);
+  return spdxId === null ? null : boundedText(spdxId, MAX_LICENSE, operation);
+}
+
+function normalizeGraphqlRepository(
+  value: unknown,
+  operation: string,
+): Repository {
+  const repository = safeRecord(value, operation);
+  if (required(repository, "__typename", operation) !== "Repository") {
+    throw malformedRemote(operation);
+  }
+  const ownerRecord = safeRecord(
+    required(repository, "owner", operation),
+    operation,
+  );
+  const owner = boundedText(
+    required(ownerRecord, "login", operation),
+    MAX_LOGIN,
+    operation,
+  );
+  const name = boundedText(
+    required(repository, "name", operation),
+    MAX_REPOSITORY_NAME,
+    operation,
+  );
+  const fullName = boundedText(
+    required(repository, "nameWithOwner", operation),
+    MAX_FULL_NAME,
+    operation,
+  );
+  if (fullName !== `${owner}/${name}`) throw malformedRemote(operation);
+
+  const remoteVisibility = required(repository, "visibility", operation);
+  const visibility =
+    remoteVisibility === "PUBLIC"
+      ? "public"
+      : remoteVisibility === "PRIVATE"
+        ? "private"
+        : remoteVisibility === "INTERNAL"
+          ? "internal"
+          : null;
+  if (visibility === null) throw malformedRemote(operation);
+
+  return frozenRepository(
+    {
+      repositoryId: boundedText(
+        required(repository, "id", operation),
+        MAX_ID,
+        operation,
+      ),
+      repositoryDatabaseId: String(
+        nonnegativeInteger(
+          required(repository, "databaseId", operation),
+          operation,
+        ),
+      ),
+      owner,
+      name,
+      fullName,
+      description: nullableText(
+        required(repository, "description", operation),
+        MAX_DESCRIPTION,
+        operation,
+      ),
+      url: fixedRepositoryUrl(
+        required(repository, "url", operation),
+        owner,
+        name,
+        operation,
+      ),
+      stargazerCount: nonnegativeInteger(
+        required(repository, "stargazerCount", operation),
+        operation,
+      ),
+      isFork: booleanValue(
+        required(repository, "isFork", operation),
+        operation,
+      ),
+      isArchived: booleanValue(
+        required(repository, "isArchived", operation),
+        operation,
+      ),
+      isDisabled: booleanValue(
+        required(repository, "isDisabled", operation),
+        operation,
+      ),
+      isPrivate: booleanValue(
+        required(repository, "isPrivate", operation),
+        operation,
+      ),
+      visibility,
+      primaryLanguage: graphqlLanguage(
+        required(repository, "primaryLanguage", operation),
+        operation,
+      ),
+      topics: graphqlTopics(
+        required(repository, "repositoryTopics", operation),
+        operation,
+      ),
+      licenseSpdxId: graphqlLicense(
+        required(repository, "licenseInfo", operation),
+        operation,
+      ),
+      pushedAt: nullableTimestamp(
+        required(repository, "pushedAt", operation),
+        "repository pushedAt",
+        operation,
+      ),
+      updatedAt: timestamp(
+        required(repository, "updatedAt", operation),
+        "repository updatedAt",
+        operation,
+      ),
+    },
+    operation,
+  );
+}
+
 function normalizeUserList(value: unknown, operation: string): UserList {
   const list = safeRecord(value, operation);
   try {
@@ -717,36 +878,150 @@ function graphqlData(
   });
 }
 
-function validatePageInfo(value: unknown, operation: string): void {
+function graphqlNextCursor(
+  value: unknown,
+  operation: "ViewerLists" | "UserListItems",
+): string | null {
   const pageInfo = safeRecord(value, operation);
-  const hasNextPage = required(pageInfo, "hasNextPage", operation);
-  if (typeof hasNextPage !== "boolean") throw malformedRemote(operation);
-  const endCursor = required(pageInfo, "endCursor", operation);
-  if (
-    endCursor !== null &&
-    (typeof endCursor !== "string" ||
-      endCursor.length === 0 ||
-      endCursor.length > 4_096 ||
-      !controlFree(endCursor) ||
-      !wellFormedUnicode(endCursor))
-  ) {
-    throw malformedRemote(operation);
-  }
-  if (hasNextPage && endCursor === null) throw malformedRemote(operation);
+  return parseGraphqlNextCursor(
+    required(pageInfo, "hasNextPage", operation),
+    required(pageInfo, "endCursor", operation),
+    operation,
+  );
 }
 
-function validateViewerLists(data: unknown): void {
+function viewerListsPage(
+  data: unknown,
+  rateLimit: RateLimitState | null,
+): Page<GitHubUserList> {
   const operation = GRAPHQL_READ_OPERATIONS.listLists;
   const root = safeRecord(data, operation);
   const viewer = safeRecord(required(root, "viewer", operation), operation);
   const lists = safeRecord(required(viewer, "lists", operation), operation);
-  const nodes = denseArray(
-    required(lists, "nodes", operation),
-    MAX_PAGE_ITEMS,
+  const items = Object.freeze(
+    denseArray(
+      required(lists, "nodes", operation),
+      MAX_PAGE_ITEMS,
+      operation,
+    ).map((node) => normalizeUserList(node, operation)),
+  );
+  return Object.freeze({
+    items,
+    nextCursor: graphqlNextCursor(
+      required(lists, "pageInfo", operation),
+      operation,
+    ),
+    rateLimit,
+    warnings: Object.freeze([]),
+  });
+}
+
+function validateViewerLists(data: unknown): void {
+  viewerListsPage(data, null);
+}
+
+function invalidListId(): AppError {
+  return new AppError("VALIDATION_ERROR", "GitHub User List ID is invalid", {
+    retryable: false,
+    details: {
+      operation: "listUserListItems",
+      reason: "invalid_list_id",
+    },
+  });
+}
+
+function validatedListId(value: unknown): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > MAX_ID ||
+    value !== value.trim() ||
+    !controlFree(value) ||
+    !wellFormedUnicode(value)
+  ) {
+    throw invalidListId();
+  }
+  return value;
+}
+
+function listNotFound(): AppError {
+  return new AppError("NOT_FOUND", "GitHub User List was not found", {
+    retryable: false,
+    details: {
+      operation: GRAPHQL_READ_OPERATIONS.listItems,
+      reason: "not_found",
+    },
+  });
+}
+
+function normalizeGraphqlListItem(
+  value: unknown,
+  operation: "UserListItems",
+): Readonly<{ item: GitHubListItem; warning: string | null }> {
+  const member = safeRecord(value, operation);
+  const typename = boundedText(
+    required(member, "__typename", operation),
+    MAX_ERROR_TYPE,
     operation,
   );
-  for (const node of nodes) normalizeUserList(node, operation);
-  validatePageInfo(required(lists, "pageInfo", operation), operation);
+  if (!GRAPHQL_NAME.test(typename)) throw malformedRemote(operation);
+
+  if (typename === "Repository") {
+    return Object.freeze({
+      item: Object.freeze({
+        kind: "repository",
+        repository: normalizeGraphqlRepository(value, operation),
+      }),
+      warning: null,
+    });
+  }
+
+  const rawId = member.has("id") ? member.get("id") : null;
+  const itemId = rawId === null ? null : boundedText(rawId, MAX_ID, operation);
+  return Object.freeze({
+    item: Object.freeze({
+      kind: "unsupported",
+      typename,
+      itemId,
+    }),
+    warning: `UserListItems returned unsupported union member ${typename}`,
+  });
+}
+
+function userListItemsPage(
+  data: unknown,
+  rateLimit: RateLimitState | null,
+): Page<GitHubListItem> {
+  const operation = GRAPHQL_READ_OPERATIONS.listItems;
+  const root = safeRecord(data, operation);
+  const rawNode = required(root, "node", operation);
+  if (rawNode === null) throw listNotFound();
+  const node = safeRecord(rawNode, operation);
+  if (
+    !node.has("items") ||
+    (node.has("__typename") && node.get("__typename") !== "UserList")
+  ) {
+    throw listNotFound();
+  }
+  const connection = safeRecord(required(node, "items", operation), operation);
+  const members = denseArray(
+    required(connection, "nodes", operation),
+    MAX_PAGE_ITEMS,
+    operation,
+  ).map((candidate) => normalizeGraphqlListItem(candidate, operation));
+  const items = Object.freeze(members.map(({ item }) => item));
+  const warnings = Object.freeze(
+    members.flatMap(({ warning }) => (warning === null ? [] : [warning])),
+  );
+  return Object.freeze({
+    items,
+    nextCursor: graphqlNextCursor(
+      required(connection, "pageInfo", operation),
+      operation,
+    ),
+    rateLimit,
+    warnings,
+  });
 }
 
 function isCancellation(
@@ -784,7 +1059,7 @@ async function probeRead(
   }
 }
 
-export class OctokitGitHubAdapter implements GitHubStarReadPort {
+export class OctokitGitHubAdapter implements GitHubSyncReadPort {
   readonly #transport: GitHubTransport;
 
   constructor(transport: GitHubTransport) {
@@ -850,5 +1125,38 @@ export class OctokitGitHubAdapter implements GitHubStarReadPort {
       signal,
     );
     return starPageFromResponse(response, "listStarredRepositories");
+  }
+
+  async listUserLists(
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<Page<GitHubUserList>> {
+    const validatedCursor = parseGraphqlInputCursor(cursor, "listUserLists");
+    const response = await this.#transport.graphql(
+      "listLists",
+      Object.freeze({ cursor: validatedCursor }),
+      signal,
+    );
+    const envelope = graphqlData(response, "listLists");
+    return viewerListsPage(envelope.data, envelope.rateLimit);
+  }
+
+  async listUserListItems(
+    listId: UserListId,
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<Page<GitHubListItem>> {
+    const validatedId = validatedListId(listId);
+    const validatedCursor = parseGraphqlInputCursor(
+      cursor,
+      "listUserListItems",
+    );
+    const response = await this.#transport.graphql(
+      "listItems",
+      Object.freeze({ listId: validatedId, cursor: validatedCursor }),
+      signal,
+    );
+    const envelope = graphqlData(response, "listItems");
+    return userListItemsPage(envelope.data, envelope.rateLimit);
   }
 }

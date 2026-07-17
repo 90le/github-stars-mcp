@@ -1,6 +1,7 @@
 import { AppError } from "../domain/errors.js";
 
 const MAX_LINK_HEADER_LENGTH = 16_384;
+const MAX_GRAPHQL_CURSOR_LENGTH = 4_096;
 const POSITIVE_DECIMAL = /^[1-9]\d*$/u;
 const LINK_SEGMENT = /^<([^<>"\s]+)>\s*;\s*rel="([^"]+)"$/u;
 const RELATION_TOKEN = /^[A-Za-z][A-Za-z0-9.-]*$/u;
@@ -164,4 +165,53 @@ export function parseRestNextCursor(link: unknown): string | null {
   }
 
   return nextTarget === null ? null : nextTargetCursor(nextTarget);
+}
+
+type GraphqlListMethod = "listUserLists" | "listUserListItems";
+type GraphqlListOperation = "ViewerLists" | "UserListItems";
+
+function validGraphqlCursor(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= MAX_GRAPHQL_CURSOR_LENGTH &&
+    controlFree(value) &&
+    wellFormedUnicode(value)
+  );
+}
+
+export function parseGraphqlInputCursor(
+  cursor: string | null,
+  operation: GraphqlListMethod,
+): string | null {
+  if (cursor === null) return null;
+  if (!validGraphqlCursor(cursor)) {
+    throw new AppError("VALIDATION_ERROR", "GraphQL cursor is invalid", {
+      retryable: false,
+      details: { operation, reason: "invalid_cursor" },
+    });
+  }
+  return cursor;
+}
+
+export function parseGraphqlNextCursor(
+  hasNextPage: unknown,
+  endCursor: unknown,
+  operation: GraphqlListOperation,
+): string | null {
+  if (
+    typeof hasNextPage !== "boolean" ||
+    (endCursor !== null && !validGraphqlCursor(endCursor)) ||
+    (hasNextPage && endCursor === null)
+  ) {
+    throw new AppError(
+      "GITHUB_UNAVAILABLE",
+      "GitHub returned malformed pagination data",
+      {
+        retryable: false,
+        details: { operation, reason: "malformed_remote_data" },
+      },
+    );
+  }
+  return hasNextPage ? endCursor : null;
 }
