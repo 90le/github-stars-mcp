@@ -18,6 +18,15 @@ test("includes every source file in coverage", () => {
   });
 });
 
+test("normalizes tracked text files to LF in every checkout", () => {
+  const attributes = readFileSync(
+    new URL("../../.gitattributes", import.meta.url),
+    "utf8",
+  );
+
+  expect(attributes).toMatch(/^\* text=auto eol=lf$/mu);
+});
+
 test("uses only the official npm registry in the shrinkwrap", () => {
   const shrinkwrap: unknown = JSON.parse(
     readFileSync(new URL("../../npm-shrinkwrap.json", import.meta.url), "utf8"),
