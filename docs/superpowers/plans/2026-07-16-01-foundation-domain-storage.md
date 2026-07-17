@@ -865,7 +865,11 @@ No key/codec getter, own property, transaction snapshot, error, or log is
 exposed. Repeated migration and close are idempotent. Writes parse detached
 copies; reads return new frozen detached values. Snapshot metadata versions
 and current pointers advance by lexical `(observedAt, versionHash)`, and a
-completed snapshot remains unchanged after later metadata observations.
+completed snapshot remains unchanged after later metadata observations. The
+memory oracle keeps every immutable `(repositoryId, versionHash)` payload and
+exact-compares historical hash collisions, plus bidirectional first-seen
+`repositoryId`/`repositoryDatabaseId` bindings. A failed batch publishes none
+of its snapshot rows, versions, identity bindings, or current pointers.
 
 Snapshot coverage transitions are exact: `collecting -> complete`,
 `unavailable -> unavailable`, and `omitted -> omitted`. No other publication
@@ -985,12 +989,15 @@ another restart.
 callback is active; only its transaction facade may access state. Calls to
 root `migrate`, `close`, or another `withTransaction` are likewise rejected.
 It supplies a revocable transaction facade.
-It rolls back every Map/index/lease/attempt mutation on throw, native Promise,
-proxy, or any callable-data/accessor/inherited thenable detected by walking
-descriptors without reading or invoking `then`. Each prototype level is
-checked for Proxy identity before reflection; the returned data graph is
-checked before a final poison-state check, so a caught reentry during
-inspection cannot commit. The facade is revoked before
+The callback may return `undefined`, another non-callable canonical primitive,
+or bounded canonical JSON data made only from descriptor-data
+plain/null-prototype objects and dense standard arrays. The same
+descriptor-safe canonical validator rejects functions, custom prototypes and
+class instances, Map/Set/WeakMap/WeakSet, Promise, Proxy, accessors, symbols,
+sparse arrays, exotic objects, and cycles without invoking getters, traps,
+iterators, or `toJSON`. Validation runs before a final poison-state check, so
+a caught reentry during validation cannot commit. Any rejection rolls back
+every Map/index/lease/attempt mutation. The facade is revoked before
 commit/rollback returns, so a captured
 `tx` cannot mutate later. It exposes no raw SQL, generic query, `execute`, or
 async transaction.
@@ -998,9 +1005,10 @@ async transaction.
 - [ ] **Step 4: Verify exact structural compliance**
 Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.test.ts test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect all tests pass, including:
 
-- commit/throw rollback; native Promise; own/inherited data or accessor
-  `then` with zero getter calls; Proxy result; nested transaction; root-store
-  reentry; and leaked facade calls after both commit and rollback;
+- commit/throw rollback; canonical primitive/plain/null-prototype/array
+  returns; rejected Promise/Proxy/function/class/container/accessor/symbol/
+  sparse/cyclic results with zero getter/trap calls; nested transaction;
+  root-store reentry; and leaked facade calls after commit and rollback;
 - detached/deep-frozen reads after caller mutation, hostile
   accessor/proxy/symbol/sparse/custom-prototype input, and inert
   `__proto__` language values;
@@ -1746,8 +1754,8 @@ secure state path -> open/verify SQLite -> migrate under BEGIN IMMEDIATE
 ```
 
 It delegates every port method, makes `close` idempotent, and implements
-`withTransaction` through an immediate transaction plus the same
-thenable-detection and revocable-facade semantics as the memory store. Nested
+`withTransaction` through an immediate transaction plus the same canonical
+return-value validation and revocable-facade semantics as the memory store. Nested
 transactions and root-store reentry (including migrate/close) are rejected
 while the callback is active. Callback writes roll back before an async result
 can escape; no transaction crosses `await`.

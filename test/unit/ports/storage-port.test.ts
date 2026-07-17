@@ -16,6 +16,10 @@ import {
   asUserListId,
 } from "../../../src/domain/ids.js";
 import { parseChangePlan } from "../../../src/domain/plan.js";
+import {
+  repositorySchema,
+  type Repository,
+} from "../../../src/domain/repository.js";
 import { parseChangeRun, parseRunOperation } from "../../../src/domain/run.js";
 import {
   parseSnapshotBatch,
@@ -31,7 +35,10 @@ import {
   snapshotBatchFixture,
   snapshotDraftFixture,
 } from "../../fixtures/domain.js";
-import { createMemoryStorage } from "../../fixtures/memory-storage.js";
+import {
+  createMemoryStorage,
+  registerRepositoryVersionForTest,
+} from "../../fixtures/memory-storage.js";
 
 const SYNC_GUARD = {
   name: "sync:U_1",
@@ -321,17 +328,103 @@ describe("synchronous revocable transactions", () => {
     expect(nestedStore.getPlan(changePlanFixture.id)).toBeNull();
   });
 
-  test("accepts ordinary class and null-prototype synchronous results", () => {
-    class TransactionResult {
-      readonly status = "committed";
-    }
+  test("rejects noncanonical result graphs without invoking user code", () => {
+    let getterCalls = 0;
+    let proxyTrapCalls = 0;
+    const hiddenProxy = new Proxy(
+      {},
+      {
+        get() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getOwnPropertyDescriptor() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getPrototypeOf() {
+          proxyTrapCalls += 1;
+          return Object.prototype;
+        },
+        ownKeys() {
+          proxyTrapCalls += 1;
+          return [];
+        },
+      },
+    );
+    const customPrototype = { nested: hiddenProxy };
+    Object.defineProperty(customPrototype, "accessor", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return hiddenProxy;
+      },
+    });
+    const weakKey = {};
+    class PrivateResult {
+      readonly #secret = "hidden";
 
+      reveal(): string {
+        return this.#secret;
+      }
+    }
+    const accessorResult = {};
+    Object.defineProperty(accessorResult, "hidden", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return "hidden";
+      },
+    });
+    const symbolResult = { visible: true };
+    Object.defineProperty(symbolResult, Symbol("hidden"), {
+      enumerable: true,
+      value: hiddenProxy,
+    });
+    const sparseResult = new Array<unknown>(1);
+    const cyclic: { self?: unknown } = {};
+    cyclic.self = cyclic;
+    const dangerousResults = [
+      new Map<unknown, unknown>([["nested", hiddenProxy]]),
+      new Set<unknown>([Promise.resolve("nested")]),
+      Object.create(customPrototype) as object,
+      new WeakMap<object, unknown>([[weakKey, hiddenProxy]]),
+      new WeakSet<object>([weakKey]),
+      Promise.resolve("hidden"),
+      new PrivateResult(),
+      () => "hidden",
+      accessorResult,
+      symbolResult,
+      sparseResult,
+      cyclic,
+    ] as const;
+
+    for (const result of dangerousResults) {
+      const store = openStore();
+      expect(() =>
+        store.withTransaction((tx) => {
+          tx.savePlan(changePlanFixture);
+          return result;
+        }),
+      ).toThrow(/synchronous|proxy|return/iu);
+      expect(store.getPlan(changePlanFixture.id)).toBeNull();
+    }
+    expect(getterCalls).toBe(0);
+    expect(proxyTrapCalls).toBe(0);
+  });
+
+  test("accepts primitives and bounded canonical synchronous data", () => {
     const results = [
-      new TransactionResult(),
+      undefined,
+      null,
+      true,
+      42,
+      "committed",
       Object.assign(Object.create(null) as Record<string, unknown>, {
         status: "committed",
       }),
       { nested: { status: "committed" } },
+      [{ status: "committed" }],
     ] as const;
     for (const result of results) {
       const store = openStore();
@@ -763,6 +856,195 @@ describe("atomic snapshots, exact verification, and bounded queries", () => {
         )?.stargazerCount,
       ).toBe(ordered[0].stargazerCount);
     }
+  });
+
+  test("detects exact-content collisions against historical metadata versions", () => {
+    const versions = new Map<string, Repository>();
+    const first = repositorySchema.parse({
+      ...repositoryInputFixture,
+      stargazerCount: 101,
+    });
+    const newerCurrent = repositorySchema.parse({
+      ...repositoryInputFixture,
+      stargazerCount: 202,
+    });
+    const colliding = repositorySchema.parse({
+      ...repositoryInputFixture,
+      stargazerCount: 303,
+    });
+    const historicalHash = "a".repeat(64);
+
+    expect(
+      registerRepositoryVersionForTest(versions, first, historicalHash),
+    ).toEqual(first);
+    registerRepositoryVersionForTest(versions, newerCurrent, "b".repeat(64));
+    expect(() =>
+      registerRepositoryVersionForTest(versions, colliding, historicalHash),
+    ).toThrow(/collision/iu);
+    expect(versions).toHaveLength(2);
+    expect(
+      registerRepositoryVersionForTest(versions, first, historicalHash),
+    ).toEqual(first);
+    expect(versions).toHaveLength(2);
+  });
+
+  test("enforces immutable bidirectional repository identity atomically", () => {
+    const store = openStore();
+    acquireSync(store);
+    completeSnapshot(store, { id: "snap_identity_base" });
+    const currentBefore = store.getRepositoryMetadata(asRepositoryId("R_1"));
+    const draft = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_identity_next",
+    });
+    store.createSnapshot({ draft, lease: SYNC_GUARD });
+
+    const changedDatabaseId = parseSnapshotBatch({
+      repositories: [
+        {
+          repository: {
+            ...repositoryInputFixture,
+            repositoryDatabaseId: "999",
+            stargazerCount: 999,
+          },
+          observedAt: "2026-07-17T00:00:00.000Z",
+        },
+      ],
+      stars: snapshotBatchFixture.stars,
+      lists: [],
+      memberships: [],
+    });
+    expect(() =>
+      store.appendSnapshotBatch({
+        id: draft.id,
+        batch: changedDatabaseId,
+        lease: SYNC_GUARD,
+      }),
+    ).toThrow(/database|identity|immutable/iu);
+
+    const reusedDatabaseId = parseSnapshotBatch({
+      repositories: [
+        {
+          repository: {
+            ...repositoryInputFixture,
+            repositoryId: "R_2",
+            name: "Other",
+            fullName: "OpenAI/Other",
+            url: "https://github.com/OpenAI/Other",
+          },
+          observedAt: "2026-07-17T00:00:00.000Z",
+        },
+      ],
+      stars: [
+        {
+          repositoryId: "R_2",
+          starredAt: "2026-07-16T12:00:00.000Z",
+        },
+      ],
+      lists: [],
+      memberships: [],
+    });
+    expect(() =>
+      store.appendSnapshotBatch({
+        id: draft.id,
+        batch: reusedDatabaseId,
+        lease: SYNC_GUARD,
+      }),
+    ).toThrow(/database|identity|immutable/iu);
+    expect(store.getRepositoryMetadata(asRepositoryId("R_1"))).toEqual(
+      currentBefore,
+    );
+    expect(store.getRepositoryMetadata(asRepositoryId("R_2"))).toBeNull();
+
+    const valid = parseSnapshotBatch({
+      repositories: [
+        {
+          repository: {
+            ...repositoryInputFixture,
+            stargazerCount: 333,
+          },
+          observedAt: "2026-07-17T00:00:00.000Z",
+        },
+        {
+          repository: {
+            ...repositoryInputFixture,
+            repositoryId: "R_2",
+            repositoryDatabaseId: "43",
+            name: "Other",
+            fullName: "OpenAI/Other",
+            url: "https://github.com/OpenAI/Other",
+          },
+          observedAt: "2026-07-17T00:00:00.000Z",
+        },
+      ],
+      stars: [
+        snapshotBatchFixture.stars[0],
+        {
+          repositoryId: "R_2",
+          starredAt: "2026-07-16T12:00:00.000Z",
+        },
+      ],
+      lists: [],
+      memberships: [],
+    });
+    store.appendSnapshotBatch({
+      id: draft.id,
+      batch: valid,
+      lease: SYNC_GUARD,
+    });
+    store.beginSnapshotVerification({
+      id: draft.id,
+      listCoverage: "complete",
+      lease: SYNC_GUARD,
+    });
+    store.appendSnapshotVerificationBatch({
+      id: draft.id,
+      batch: verificationBatch(valid),
+      lease: SYNC_GUARD,
+    });
+    store.finishSnapshotVerification({ id: draft.id, lease: SYNC_GUARD });
+    store.completeSnapshot({
+      id: draft.id,
+      completedAt: "2026-07-17T00:01:00.000Z",
+      listCoverage: "complete",
+      counts: { repositories: 2, stars: 2, lists: 0, memberships: 0 },
+      warningCount: 0,
+      sourceRateLimit: null,
+      lease: SYNC_GUARD,
+    });
+    expect(
+      store.getRepositoryMetadata(asRepositoryId("R_1"))?.repository
+        .stargazerCount,
+    ).toBe(333);
+    expect(
+      store.getRepositoryMetadata(asRepositoryId("R_2"))?.repository
+        .repositoryDatabaseId,
+    ).toBe("43");
+    expect(
+      store.getSnapshotRepository(
+        asSnapshotId("snap_identity_base"),
+        asRepositoryId("R_1"),
+      )?.stargazerCount,
+    ).toBe(10);
+
+    const sameVersionLater = parseSnapshotBatch({
+      repositories: [
+        {
+          repository: valid.repositories[0]!.repository,
+          observedAt: "2026-07-18T00:00:00.000Z",
+        },
+      ],
+      stars: [valid.stars[0]!],
+      lists: [],
+      memberships: [],
+    });
+    completeSnapshot(store, {
+      id: "snap_identity_same_version_later",
+      batch: sameVersionLater,
+    });
+    expect(store.getRepositoryMetadata(asRepositoryId("R_1"))?.observedAt).toBe(
+      "2026-07-18T00:00:00.000Z",
+    );
   });
 
   test("authenticates List and both membership pagination directions", () => {

@@ -52,6 +52,7 @@ import {
   asSnapshotId,
   asUserListId,
   type PlanId,
+  type RepositoryDatabaseId,
   type RepositoryId,
   type RunId,
   type SnapshotId,
@@ -67,9 +68,11 @@ import {
 import {
   observedRepositoryMetadataSchema,
   repositoryFilterViewSchema,
+  repositorySchema,
   repositoryViewSchema,
   type AccountBinding,
   type ObservedRepositoryMetadata,
+  type Repository,
   type RepositoryFilterView,
   type RepositoryView,
   type StarRecord,
@@ -129,6 +132,9 @@ interface MemoryState {
   leases: Map<string, Lease>;
   snapshots: Map<string, SnapshotRecord>;
   repositoryMetadata: Map<string, ObservedRepositoryMetadata>;
+  repositoryVersions: Map<string, Repository>;
+  repositoryDatabaseIds: Map<string, RepositoryDatabaseId>;
+  repositoryIdsByDatabaseId: Map<string, RepositoryId>;
   plans: Map<string, ChangePlan>;
   runs: Map<string, RunRecord>;
   runByPlan: Map<string, string>;
@@ -321,6 +327,9 @@ function emptyState(): MemoryState {
     leases: new Map(),
     snapshots: new Map(),
     repositoryMetadata: new Map(),
+    repositoryVersions: new Map(),
+    repositoryDatabaseIds: new Map(),
+    repositoryIdsByDatabaseId: new Map(),
     plans: new Map(),
     runs: new Map(),
     runByPlan: new Map(),
@@ -458,6 +467,78 @@ function repositoryVersionHash(
   observation: ObservedRepositoryMetadata,
 ): string {
   return sha256Hex(canonicalJson(observation.repository));
+}
+
+function repositoryVersionKey(
+  repositoryId: RepositoryId,
+  versionHash: string,
+): string {
+  return canonicalJson([repositoryId, versionHash]);
+}
+
+function registerRepositoryVersion(
+  versions: Map<string, Repository>,
+  input: Repository,
+  versionHash: string,
+): Repository {
+  if (!/^[0-9a-f]{64}$/u.test(versionHash)) {
+    return failure(
+      "VALIDATION_ERROR",
+      "repository metadata version hash is invalid",
+    );
+  }
+  const repository = frozenClone(repositorySchema.parse(input));
+  const key = repositoryVersionKey(repository.repositoryId, versionHash);
+  const existing = versions.get(key);
+  if (
+    existing !== undefined &&
+    canonicalJson(existing) !== canonicalJson(repository)
+  ) {
+    return failure(
+      "PRECONDITION_FAILED",
+      "repository metadata version collision has different exact content",
+    );
+  }
+  if (existing !== undefined) return existing;
+  versions.set(key, repository);
+  return repository;
+}
+
+export function registerRepositoryVersionForTest(
+  versions: Map<string, Repository>,
+  repository: Repository,
+  versionHash: string,
+): Repository {
+  return registerRepositoryVersion(versions, repository, versionHash);
+}
+
+function registerRepositoryIdentity(
+  databaseIds: Map<string, RepositoryDatabaseId>,
+  repositoryIds: Map<string, RepositoryId>,
+  repository: Repository,
+): void {
+  const knownDatabaseId = databaseIds.get(repository.repositoryId);
+  if (
+    knownDatabaseId !== undefined &&
+    knownDatabaseId !== repository.repositoryDatabaseId
+  ) {
+    failure(
+      "PRECONDITION_FAILED",
+      "repository node ID has an immutable database identity",
+    );
+  }
+  const knownRepositoryId = repositoryIds.get(repository.repositoryDatabaseId);
+  if (
+    knownRepositoryId !== undefined &&
+    knownRepositoryId !== repository.repositoryId
+  ) {
+    failure(
+      "PRECONDITION_FAILED",
+      "repository database ID is already bound to another node ID",
+    );
+  }
+  databaseIds.set(repository.repositoryId, repository.repositoryDatabaseId);
+  repositoryIds.set(repository.repositoryDatabaseId, repository.repositoryId);
 }
 
 function metadataIsNewer(
@@ -921,6 +1002,10 @@ export function createMemoryStorage(
         const seenStars = new Set<string>();
         const seenLists = new Set<string>();
         const seenMemberships = new Set<string>();
+        const stagedVersions = new Map(target.repositoryVersions);
+        const stagedDatabaseIds = new Map(target.repositoryDatabaseIds);
+        const stagedRepositoryIds = new Map(target.repositoryIdsByDatabaseId);
+        const stagedObservations: ObservedRepositoryMetadata[] = [];
         for (const observation of batch.repositories) {
           const idValue = observation.repository.repositoryId;
           if (
@@ -933,19 +1018,22 @@ export function createMemoryStorage(
             );
           }
           seenRepositories.add(idValue);
-          const current = target.repositoryMetadata.get(idValue);
-          if (
-            current !== undefined &&
-            repositoryVersionHash(current) ===
-              repositoryVersionHash(observation) &&
-            canonicalJson(current.repository) !==
-              canonicalJson(observation.repository)
-          ) {
-            return failure(
-              "PRECONDITION_FAILED",
-              "repository metadata version collides",
-            );
-          }
+          registerRepositoryIdentity(
+            stagedDatabaseIds,
+            stagedRepositoryIds,
+            observation.repository,
+          );
+          const repository = registerRepositoryVersion(
+            stagedVersions,
+            observation.repository,
+            repositoryVersionHash(observation),
+          );
+          stagedObservations.push(
+            metadataClone({
+              repository,
+              observedAt: observation.observedAt,
+            }),
+          );
         }
         for (const star of batch.stars) {
           if (
@@ -972,8 +1060,10 @@ export function createMemoryStorage(
           }
           seenMemberships.add(key);
         }
-        for (const observation of batch.repositories) {
-          const cloned = metadataClone(observation);
+        target.repositoryVersions = stagedVersions;
+        target.repositoryDatabaseIds = stagedDatabaseIds;
+        target.repositoryIdsByDatabaseId = stagedRepositoryIds;
+        for (const cloned of stagedObservations) {
           const idValue = cloned.repository.repositoryId;
           record.repositories.set(idValue, cloned);
           const current = target.repositoryMetadata.get(idValue);
@@ -2339,58 +2429,14 @@ export function createMemoryStorage(
     return callCore(name, state, args);
   }
 
-  function rejectsDangerousTransactionResult(value: unknown): boolean {
-    if (
-      (typeof value !== "object" || value === null) &&
-      typeof value !== "function"
-    ) {
-      return false;
-    }
-    const pending: object[] = [value];
-    const inspected = new Set<object>();
+  function rejectsNoncanonicalTransactionResult(value: unknown): boolean {
+    if (value === undefined) return false;
     try {
-      while (pending.length > 0) {
-        const node = pending.pop() as object;
-        if (inspected.has(node)) continue;
-        inspected.add(node);
-        const prototypes = new Set<object>();
-        let current: object | null = node;
-        while (current !== null) {
-          if (prototypes.has(current) || utilTypes.isProxy(current))
-            return true;
-          prototypes.add(current);
-          const descriptors = Object.getOwnPropertyDescriptors(current);
-          const thenDescriptor = descriptors.then;
-          if (
-            thenDescriptor !== undefined &&
-            (!Object.hasOwn(thenDescriptor, "value") ||
-              typeof thenDescriptor.value === "function")
-          ) {
-            return true;
-          }
-          if (current === node) {
-            for (const key of Reflect.ownKeys(descriptors)) {
-              const descriptor = Reflect.get(
-                descriptors,
-                key,
-              ) as PropertyDescriptor;
-              if (
-                Object.hasOwn(descriptor, "value") &&
-                ((typeof descriptor.value === "object" &&
-                  descriptor.value !== null) ||
-                  typeof descriptor.value === "function")
-              ) {
-                pending.push(descriptor.value as object);
-              }
-            }
-          }
-          current = Reflect.getPrototypeOf(current);
-        }
-      }
+      canonicalJson(value);
+      return false;
     } catch {
       return true;
     }
-    return false;
   }
 
   function withTransaction<T>(fn: (tx: StorageTransaction) => T): T {
@@ -2445,7 +2491,7 @@ export function createMemoryStorage(
     });
     try {
       const result = fn(revocable.proxy as StorageTransaction);
-      const dangerousResult = rejectsDangerousTransactionResult(result);
+      const dangerousResult = rejectsNoncanonicalTransactionResult(result);
       if (transactionPoisoned) {
         return failure(
           "PRECONDITION_FAILED",
@@ -2455,7 +2501,7 @@ export function createMemoryStorage(
       if (dangerousResult) {
         return failure(
           "PRECONDITION_FAILED",
-          "transaction return graph must be synchronous and proxy-free",
+          "transaction return value must be bounded canonical synchronous data",
         );
       }
       state = working;
