@@ -1196,6 +1196,66 @@ describe("synchronous revocable transactions", () => {
       isolated.queryRepositories(query).nextCursor,
     );
   });
+
+  test("captures Uint8Array construction and copies exact SharedArrayBuffer view bytes", () => {
+    const Uint8ArrayForTest = Uint8Array;
+    const expectedKey = new Uint8ArrayForTest(32);
+    for (let index = 0; index < expectedKey.length; index += 1) {
+      expectedKey[index] = index + 1;
+    }
+    const sharedBuffer = new SharedArrayBuffer(48);
+    const wholeBuffer = new Uint8ArrayForTest(sharedBuffer);
+    wholeBuffer.fill(0xa5);
+    const sourceView = new Uint8ArrayForTest(sharedBuffer, 8, 32);
+    sourceView.set(expectedKey);
+    const baseline = createMemoryStorage({ cursorKey: expectedKey });
+    baseline.migrate();
+    let constructorCalls = 0;
+    const retainedViews: Uint8Array[] = [];
+    const restoreUint8Array = replaceOwnPropertyForTest(
+      globalThis,
+      "Uint8Array",
+      function LeakingUint8Array(input: number | Uint8Array): Uint8Array {
+        constructorCalls += 1;
+        const retained =
+          typeof input === "number"
+            ? new Uint8ArrayForTest(input)
+            : new Uint8ArrayForTest(input);
+        retainedViews[retainedViews.length] = retained;
+        return retained;
+      },
+    );
+    let isolated: StoragePort;
+
+    try {
+      isolated = createMemoryStorage({ cursorKey: sourceView });
+      sourceView.fill(0x99);
+      isolated.migrate();
+    } finally {
+      restoreUint8Array();
+    }
+
+    expect(constructorCalls).toBe(0);
+    expect(retainedViews).toEqual([]);
+    expect([...sourceView]).toEqual(new Array(32).fill(0x99));
+    expect([...wholeBuffer.slice(0, 8)]).toEqual(new Array(8).fill(0xa5));
+    expect([...wholeBuffer.slice(40)]).toEqual(new Array(8).fill(0xa5));
+
+    for (const store of [baseline, isolated]) {
+      acquireSync(store);
+      completeSnapshot(store, { batch: twoItemBatch() });
+    }
+    const query = {
+      snapshotId: snapshotDraftFixture.id,
+      filter: null,
+      sort: [],
+      pageSize: 1,
+      cursor: null,
+    } as const;
+    expect(isolated.queryRepositories(query).nextCursor).toBe(
+      baseline.queryRepositories(query).nextCursor,
+    );
+  });
 });
 
 describe("atomic snapshots, exact verification, and bounded queries", () => {

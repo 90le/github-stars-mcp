@@ -1,6 +1,13 @@
 import { Buffer } from "node:buffer";
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import {
+  createHash,
+  createHmac,
+  Hash,
+  Hmac,
+  timingSafeEqual,
+} from "node:crypto";
 import { types as utilTypes } from "node:util";
+import { canonicalJson } from "./canonical-json.js";
 import { AppError } from "./errors.js";
 import {
   asRepositoryId,
@@ -185,21 +192,154 @@ const MAX_CURSOR_BYTES = 4 * 1_024;
 const HASH = /^[a-f0-9]{64}$/u;
 const MAC = /^[a-f0-9]{64}$/u;
 const BASE64URL = /^[A-Za-z0-9_-]+$/u;
-const validatedRepositoryPayloads = new WeakSet<object>();
-const validatedListMembershipPayloads = new WeakSet<object>();
-const typedArrayPrototype = Object.getPrototypeOf(
+/* eslint-disable @typescript-eslint/unbound-method -- Mutable realm and crypto intrinsics are captured once and receiver-sensitive methods are called only through captured Reflect.apply. */
+const objectGetPrototypeOfAtLoad = Object.getPrototypeOf;
+const objectGetOwnPropertyDescriptorAtLoad = Object.getOwnPropertyDescriptor;
+const typedArrayPrototype = objectGetPrototypeOfAtLoad(
   Uint8Array.prototype,
 ) as object;
 const typedArrayByteLength = (
-  Object.getOwnPropertyDescriptor(typedArrayPrototype, "byteLength") as {
+  objectGetOwnPropertyDescriptorAtLoad(typedArrayPrototype, "byteLength") as {
     readonly get: (this: void) => unknown;
   }
 ).get;
 const intrinsicUint8ArraySet = (
-  Object.getOwnPropertyDescriptor(typedArrayPrototype, "set") as {
+  objectGetOwnPropertyDescriptorAtLoad(typedArrayPrototype, "set") as {
     readonly value: (this: void, source: Uint8Array) => void;
   }
 ).value;
+const bufferEqualsAtLoad = (
+  objectGetOwnPropertyDescriptorAtLoad(Buffer.prototype, "equals") as {
+    readonly value: (this: Buffer, otherBuffer: Uint8Array) => boolean;
+  }
+).value;
+const bufferToStringAtLoad = (
+  objectGetOwnPropertyDescriptorAtLoad(Buffer.prototype, "toString") as {
+    readonly value: (this: Buffer, encoding?: BufferEncoding) => string;
+  }
+).value;
+const freezeCursorIntrinsics = Object.freeze;
+const CURSOR_INTRINSICS = freezeCursorIntrinsics({
+  arrayIsArray: Array.isArray,
+  arrayPrototype: Array.prototype,
+  bufferByteLength: Buffer.byteLength,
+  bufferEquals: bufferEqualsAtLoad,
+  bufferFrom: Buffer.from,
+  bufferToString: bufferToStringAtLoad,
+  createHash,
+  createHmac,
+  hashDigest: Hash.prototype.digest,
+  hashUpdate: Hash.prototype.update,
+  hmacDigest: Hmac.prototype.digest,
+  hmacUpdate: Hmac.prototype.update,
+  jsonParse: JSON.parse,
+  numberIsFinite: Number.isFinite,
+  numberIsSafeInteger: Number.isSafeInteger,
+  objectCreate: Object.create,
+  objectFreeze: freezeCursorIntrinsics,
+  objectGetOwnPropertyDescriptors: Object.getOwnPropertyDescriptors,
+  objectHasOwn: Object.hasOwn,
+  objectPrototype: Object.prototype,
+  reflectApply: Reflect.apply,
+  reflectDefineProperty: Reflect.defineProperty,
+  reflectGetPrototypeOf: Reflect.getPrototypeOf,
+  reflectOwnKeys: Reflect.ownKeys,
+  regexpTest: RegExp.prototype.test,
+  stringFromValue: String,
+  timingSafeEqual,
+  typedArrayByteLength,
+  uint8ArrayConstructor: Uint8Array,
+  uint8ArraySet: intrinsicUint8ArraySet,
+  utilIsProxy: utilTypes.isProxy,
+  utilIsUint8Array: utilTypes.isUint8Array,
+  weakSetAdd: WeakSet.prototype.add,
+  weakSetConstructor: WeakSet,
+  weakSetHas: WeakSet.prototype.has,
+});
+/* eslint-enable @typescript-eslint/unbound-method */
+
+const validatedRepositoryPayloads =
+  new CURSOR_INTRINSICS.weakSetConstructor<object>();
+const validatedListMembershipPayloads =
+  new CURSOR_INTRINSICS.weakSetConstructor<object>();
+
+function regexpMatches(pattern: RegExp, value: string): boolean {
+  return CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.regexpTest, pattern, [
+    value,
+  ]);
+}
+
+function weakSetAdd<T extends object>(target: WeakSet<T>, value: T): void {
+  CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.weakSetAdd, target, [value]);
+}
+
+function weakSetHas<T extends object>(target: WeakSet<T>, value: T): boolean {
+  return CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.weakSetHas, target, [
+    value,
+  ]);
+}
+
+function createInternalArray<T>(): T[] {
+  return [];
+}
+
+function appendInternalArray<T>(target: T[], value: T): void {
+  if (
+    !CURSOR_INTRINSICS.reflectDefineProperty(
+      target,
+      CURSOR_INTRINSICS.stringFromValue(target.length),
+      {
+        configurable: true,
+        enumerable: true,
+        value,
+        writable: true,
+      },
+    )
+  ) {
+    cursorError("cursor internal array append failed");
+  }
+}
+
+function arrayCopy<T>(input: readonly T[]): T[] {
+  const result = createInternalArray<T>();
+  for (let index = 0; index < input.length; index += 1) {
+    appendInternalArray(result, input[index] as T);
+  }
+  return result;
+}
+
+function frozenArrayCopy<T>(input: readonly T[]): readonly T[] {
+  return CURSOR_INTRINSICS.objectFreeze(arrayCopy(input));
+}
+
+function arrayFilter<T>(
+  input: readonly T[],
+  predicate: (value: T, index: number) => boolean,
+): T[] {
+  const result = createInternalArray<T>();
+  for (let index = 0; index < input.length; index += 1) {
+    const value = input[index] as T;
+    if (predicate(value, index)) appendInternalArray(result, value);
+  }
+  return result;
+}
+
+function arraySome<T>(
+  input: readonly T[],
+  predicate: (value: T, index: number) => boolean,
+): boolean {
+  for (let index = 0; index < input.length; index += 1) {
+    if (predicate(input[index] as T, index)) return true;
+  }
+  return false;
+}
+
+function arrayIncludes<T>(input: readonly T[], expected: T): boolean {
+  for (let index = 0; index < input.length; index += 1) {
+    if (input[index] === expected) return true;
+  }
+  return false;
+}
 
 function cursorError(message: string): never {
   throw new AppError("VALIDATION_ERROR", message);
@@ -213,28 +353,31 @@ function snapshotPlainObject(
     if (
       typeof value !== "object" ||
       value === null ||
-      utilTypes.isProxy(value) ||
-      Array.isArray(value)
+      CURSOR_INTRINSICS.utilIsProxy(value) ||
+      CURSOR_INTRINSICS.arrayIsArray(value)
     ) {
       return cursorError(`${label} must be a plain data object`);
     }
-    const prototype = Reflect.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
+    const prototype = CURSOR_INTRINSICS.reflectGetPrototypeOf(value);
+    if (prototype !== CURSOR_INTRINSICS.objectPrototype && prototype !== null) {
       return cursorError(`${label} must be a plain data object`);
     }
-    const descriptors = Object.getOwnPropertyDescriptors(value);
-    const result: Record<string, unknown> = Object.create(null) as Record<
+    const descriptors =
+      CURSOR_INTRINSICS.objectGetOwnPropertyDescriptors(value);
+    const result = CURSOR_INTRINSICS.objectCreate(null) as Record<
       string,
       unknown
     >;
-    for (const key of Reflect.ownKeys(descriptors)) {
+    const keys = CURSOR_INTRINSICS.reflectOwnKeys(descriptors);
+    for (let index = 0; index < keys.length; index += 1) {
+      const key = keys[index] as PropertyKey;
       if (typeof key !== "string") {
         return cursorError(`${label} cannot contain symbol properties`);
       }
       const descriptor = descriptors[key];
       if (
         descriptor === undefined ||
-        !Object.hasOwn(descriptor, "value") ||
+        !CURSOR_INTRINSICS.objectHasOwn(descriptor, "value") ||
         descriptor.enumerable !== true
       ) {
         return cursorError(`${label} properties must be plain data values`);
@@ -253,44 +396,45 @@ function snapshotDenseArray(value: unknown, label: string): readonly unknown[] {
     if (
       typeof value !== "object" ||
       value === null ||
-      utilTypes.isProxy(value) ||
-      !Array.isArray(value) ||
-      Object.getPrototypeOf(value) !== Array.prototype
+      CURSOR_INTRINSICS.utilIsProxy(value) ||
+      !CURSOR_INTRINSICS.arrayIsArray(value) ||
+      CURSOR_INTRINSICS.reflectGetPrototypeOf(value) !==
+        CURSOR_INTRINSICS.arrayPrototype
     ) {
       return cursorError(`${label} must be a dense plain array`);
     }
-    const descriptors = Object.getOwnPropertyDescriptors(
+    const descriptors = CURSOR_INTRINSICS.objectGetOwnPropertyDescriptors(
       value,
     ) as unknown as PropertyDescriptorMap;
     const lengthDescriptor = descriptors.length;
     if (
       lengthDescriptor === undefined ||
-      !Object.hasOwn(lengthDescriptor, "value") ||
+      !CURSOR_INTRINSICS.objectHasOwn(lengthDescriptor, "value") ||
       typeof lengthDescriptor.value !== "number" ||
-      !Number.isSafeInteger(lengthDescriptor.value) ||
+      !CURSOR_INTRINSICS.numberIsSafeInteger(lengthDescriptor.value) ||
       lengthDescriptor.value < 0
     ) {
       return cursorError(`${label} must be a dense plain array`);
     }
     const length = lengthDescriptor.value;
-    const keys = Reflect.ownKeys(descriptors);
+    const keys = CURSOR_INTRINSICS.reflectOwnKeys(descriptors);
     if (
-      keys.some((key) => typeof key !== "string") ||
+      arraySome(keys, (key) => typeof key !== "string") ||
       keys.length !== length + 1
     ) {
       return cursorError(`${label} must be a dense plain array`);
     }
-    const result: unknown[] = [];
+    const result = createInternalArray<unknown>();
     for (let index = 0; index < length; index += 1) {
-      const descriptor = descriptors[String(index)];
+      const descriptor = descriptors[CURSOR_INTRINSICS.stringFromValue(index)];
       if (
         descriptor === undefined ||
-        !Object.hasOwn(descriptor, "value") ||
+        !CURSOR_INTRINSICS.objectHasOwn(descriptor, "value") ||
         descriptor.enumerable !== true
       ) {
         return cursorError(`${label} must be a dense plain array`);
       }
-      result.push(descriptor.value);
+      appendInternalArray(result, descriptor.value);
     }
     return result;
   } catch (error) {
@@ -304,72 +448,26 @@ function exactKeys(
   expected: readonly string[],
   label: string,
 ): void {
-  const keys = Reflect.ownKeys(value);
-  if (
-    keys.length !== expected.length ||
-    keys.some((key) => typeof key !== "string" || !expected.includes(key))
-  ) {
+  const keys = CURSOR_INTRINSICS.reflectOwnKeys(value);
+  if (keys.length !== expected.length) {
     cursorError(`${label} has invalid properties`);
   }
-}
-
-function canonicalJson(
-  value: unknown,
-  ancestors = new Set<object>(),
-  depth = 0,
-): string {
-  if (depth > 64) {
-    return cursorError("canonical JSON nesting must not exceed 64 levels");
-  }
-  if (value === null) return "null";
-  if (typeof value === "string" || typeof value === "boolean") {
-    return JSON.stringify(value);
-  }
-  if (typeof value === "number") {
-    if (!Number.isFinite(value)) {
-      return cursorError("canonical JSON cannot contain non-finite numbers");
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    if (typeof key !== "string" || !arrayIncludes(expected, key)) {
+      cursorError(`${label} has invalid properties`);
     }
-    return JSON.stringify(value);
-  }
-  if (typeof value !== "object" || value === undefined) {
-    return cursorError("value is not canonical JSON");
-  }
-  if (ancestors.has(value)) {
-    return cursorError("canonical JSON cannot contain cycles");
-  }
-
-  ancestors.add(value);
-  try {
-    let isArray: boolean;
-    try {
-      isArray = Array.isArray(value);
-    } catch {
-      return cursorError("canonical JSON value could not be inspected");
-    }
-    if (isArray) {
-      const entries = snapshotDenseArray(value, "canonical JSON array").map(
-        (entry) => canonicalJson(entry, ancestors, depth + 1),
-      );
-      return `[${entries.join(",")}]`;
-    }
-    const record = snapshotPlainObject(value, "canonical JSON object");
-    const keys = Object.keys(record).sort();
-    const entries = keys.map(
-      (key) =>
-        `${JSON.stringify(key)}:${canonicalJson(
-          record[key],
-          ancestors,
-          depth + 1,
-        )}`,
-    );
-    return `{${entries.join(",")}}`;
-  } finally {
-    ancestors.delete(value);
   }
 }
 
 function hashCanonical(value: unknown): string {
-  return createHash("sha256").update(canonicalJson(value)).digest("hex");
+  const hash = CURSOR_INTRINSICS.createHash("sha256");
+  CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.hashUpdate, hash, [
+    canonicalJson(value),
+  ]);
+  return CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.hashDigest, hash, [
+    "hex",
+  ]);
 }
 
 export function hashFilter(filter: FilterExpression | null): string {
@@ -385,7 +483,7 @@ export function hashListSelection(selection: JsonValue): string {
 }
 
 function validHash(value: unknown, label: string): string {
-  if (typeof value !== "string" || !HASH.test(value)) {
+  if (typeof value !== "string" || !regexpMatches(HASH, value)) {
     return cursorError(`${label} must be a lowercase 64-hex hash`);
   }
   return value;
@@ -426,23 +524,24 @@ function stableListId(value: unknown): UserListId {
 
 function cursorValues(value: unknown, label: string): readonly CursorValue[] {
   const entries = snapshotDenseArray(value, label);
-  const result: CursorValue[] = [];
-  for (const entry of entries) {
+  const result = createInternalArray<CursorValue>();
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index];
     if (
       entry !== null &&
       typeof entry !== "string" &&
-      (typeof entry !== "number" || !Number.isFinite(entry))
+      (typeof entry !== "number" || !CURSOR_INTRINSICS.numberIsFinite(entry))
     ) {
       return cursorError(`${label} contains an invalid value`);
     }
-    result.push(entry);
+    appendInternalArray(result, entry);
   }
   return result;
 }
 
 function booleanMarkers(value: unknown): readonly boolean[] {
   const entries = snapshotDenseArray(value, "repository cursor null markers");
-  if (entries.some((entry) => typeof entry !== "boolean")) {
+  if (arraySome(entries, (entry) => typeof entry !== "boolean")) {
     return cursorError(
       "repository cursor null markers must be a dense Boolean array",
     );
@@ -506,14 +605,14 @@ function normalizeMembershipSelector(
   const record = snapshotPlainObject(input, label);
   if (record.kind === "list") {
     exactKeys(record, ["kind", "listId"], label);
-    return Object.freeze({
+    return CURSOR_INTRINSICS.objectFreeze({
       kind: "list",
       listId: stableListId(record.listId),
     });
   }
   if (record.kind === "repository") {
     exactKeys(record, ["kind", "repositoryId"], label);
-    return Object.freeze({
+    return CURSOR_INTRINSICS.objectFreeze({
       kind: "repository",
       repositoryId: stableRepositoryId(record.repositoryId),
     });
@@ -547,7 +646,7 @@ function normalizeListMembershipContext(
     snapshotId,
     selector,
   } as const;
-  return Object.freeze({
+  return CURSOR_INTRINSICS.objectFreeze({
     v: 1,
     snapshotId,
     selector,
@@ -560,32 +659,36 @@ function validateRepositoryValues(
   values: readonly CursorValue[],
   nulls: readonly boolean[],
 ): void {
-  const valueTerms = sort.filter((term) => term.field !== "repository_id");
+  const valueTerms = arrayFilter(
+    sort,
+    (term) => term.field !== "repository_id",
+  );
   if (
     values.length !== valueTerms.length ||
     nulls.length !== valueTerms.length ||
-    values.some((entry, index) => (entry === null) !== nulls[index])
+    arraySome(values, (entry, index) => (entry === null) !== nulls[index])
   ) {
     return cursorError(
       "repository cursor values do not match normalized sort and null markers",
     );
   }
 
-  valueTerms.forEach((term, index) => {
-    const value = values[index]!;
+  for (let index = 0; index < valueTerms.length; index += 1) {
+    const term = valueTerms[index] as NormalizedRepositorySort;
+    const value = values[index] as CursorValue;
     if (term.field === "stargazer_count") {
       if (
         typeof value !== "number" ||
-        !Number.isSafeInteger(value) ||
+        !CURSOR_INTRINSICS.numberIsSafeInteger(value) ||
         value < 0
       ) {
         cursorError(
           "repository cursor stargazer value must be a nonnegative safe integer",
         );
       }
-      return;
+      continue;
     }
-    if (term.field === "pushed_at" && value === null) return;
+    if (term.field === "pushed_at" && value === null) continue;
     if (typeof value !== "string") {
       cursorError(`repository cursor ${term.field} value is invalid`);
     }
@@ -611,7 +714,7 @@ function validateRepositoryValues(
         );
       }
     }
-  });
+  }
 }
 
 function repositoryPosition(
@@ -632,8 +735,8 @@ function repositoryPosition(
   const nulls = booleanMarkers(record.nulls);
   validateRepositoryValues(sort, values, nulls);
   return {
-    values: Object.freeze([...values]),
-    nulls: Object.freeze([...nulls]),
+    values: frozenArrayCopy(values),
+    nulls: frozenArrayCopy(nulls),
     repositoryId: stableRepositoryId(record.repositoryId),
   };
 }
@@ -645,9 +748,7 @@ function listPosition(input: unknown): {
   const record = snapshotPlainObject(input, "list cursor position");
   exactKeys(record, ["values", "listId"], "list cursor position");
   return {
-    values: Object.freeze([
-      ...cursorValues(record.values, "list cursor values"),
-    ]),
+    values: frozenArrayCopy(cursorValues(record.values, "list cursor values")),
     listId: stableListId(record.listId),
   };
 }
@@ -697,7 +798,7 @@ function listMembershipPosition(
       ["selector", "boundaryRepositoryId"],
       "List membership cursor position",
     );
-    return Object.freeze({
+    return CURSOR_INTRINSICS.objectFreeze({
       selector,
       boundaryRepositoryId: stableRepositoryId(record.boundaryRepositoryId),
     });
@@ -707,14 +808,18 @@ function listMembershipPosition(
     ["selector", "boundaryListId"],
     "List membership cursor position",
   );
-  return Object.freeze({
+  return CURSOR_INTRINSICS.objectFreeze({
     selector,
     boundaryListId: stableListId(record.boundaryListId),
   });
 }
 
 function intrinsicByteLength(value: Uint8Array): number {
-  return Reflect.apply(typedArrayByteLength, value, []) as number;
+  return CURSOR_INTRINSICS.reflectApply(
+    CURSOR_INTRINSICS.typedArrayByteLength,
+    value,
+    [],
+  ) as number;
 }
 
 function signingKeyCopy(signingKey: Uint8Array): Uint8Array {
@@ -722,21 +827,26 @@ function signingKeyCopy(signingKey: Uint8Array): Uint8Array {
     if (
       typeof signingKey !== "object" ||
       signingKey === null ||
-      utilTypes.isProxy(signingKey) ||
-      !utilTypes.isUint8Array(signingKey)
+      CURSOR_INTRINSICS.utilIsProxy(signingKey) ||
+      !CURSOR_INTRINSICS.utilIsUint8Array(signingKey)
     ) {
       return cursorError(
         "cursor signing key must be a Uint8Array of at least 32 bytes",
       );
     }
     const actualLength = intrinsicByteLength(signingKey);
-    if (!Number.isSafeInteger(actualLength) || actualLength < 32) {
+    if (
+      !CURSOR_INTRINSICS.numberIsSafeInteger(actualLength) ||
+      actualLength < 32
+    ) {
       return cursorError(
         "cursor signing key must be a Uint8Array of at least 32 bytes",
       );
     }
-    const copy = new Uint8Array(actualLength);
-    Reflect.apply(intrinsicUint8ArraySet, copy, [signingKey]);
+    const copy = new CURSOR_INTRINSICS.uint8ArrayConstructor(actualLength);
+    CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.uint8ArraySet, copy, [
+      signingKey,
+    ]);
     if (intrinsicByteLength(copy) !== actualLength || actualLength < 32) {
       return cursorError(
         "cursor signing key must be a Uint8Array of at least 32 bytes",
@@ -752,19 +862,27 @@ function signingKeyCopy(signingKey: Uint8Array): Uint8Array {
 }
 
 function authenticate(payloadText: string, mac: string, key: Uint8Array): void {
-  if (!MAC.test(mac)) {
+  if (!regexpMatches(MAC, mac)) {
     return cursorError("cursor authentication code is invalid");
   }
   let expected: Buffer;
   try {
-    expected = createHmac("sha256", key).update(payloadText).digest();
+    const hmac = CURSOR_INTRINSICS.createHmac("sha256", key);
+    CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.hmacUpdate, hmac, [
+      payloadText,
+    ]);
+    expected = CURSOR_INTRINSICS.reflectApply(
+      CURSOR_INTRINSICS.hmacDigest,
+      hmac,
+      [],
+    ) as Buffer;
   } catch {
     return cursorError("cursor authentication failed");
   }
-  const supplied = Buffer.from(mac, "hex");
+  const supplied = CURSOR_INTRINSICS.bufferFrom(mac, "hex");
   if (
-    supplied.length !== expected.length ||
-    !timingSafeEqual(supplied, expected)
+    intrinsicByteLength(supplied) !== intrinsicByteLength(expected) ||
+    !CURSOR_INTRINSICS.timingSafeEqual(supplied, expected)
   ) {
     return cursorError("cursor authentication failed");
   }
@@ -774,15 +892,26 @@ function encodedEnvelope(payload: unknown, key: Uint8Array): string {
   const payloadText = canonicalJson(payload);
   let mac: string;
   try {
-    mac = createHmac("sha256", key).update(payloadText).digest("hex");
+    const hmac = CURSOR_INTRINSICS.createHmac("sha256", key);
+    CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.hmacUpdate, hmac, [
+      payloadText,
+    ]);
+    mac = CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.hmacDigest, hmac, [
+      "hex",
+    ]);
   } catch {
     return cursorError("cursor authentication failed");
   }
   const text = canonicalJson({ mac, payload });
-  const cursor = Buffer.from(text, "utf8").toString("base64url");
+  const cursorBytes = CURSOR_INTRINSICS.bufferFrom(text, "utf8");
+  const cursor = CURSOR_INTRINSICS.reflectApply(
+    CURSOR_INTRINSICS.bufferToString,
+    cursorBytes,
+    ["base64url"],
+  );
   if (
-    Buffer.byteLength(text, "utf8") > MAX_CURSOR_BYTES ||
-    Buffer.byteLength(cursor, "utf8") > MAX_CURSOR_BYTES
+    CURSOR_INTRINSICS.bufferByteLength(text, "utf8") > MAX_CURSOR_BYTES ||
+    CURSOR_INTRINSICS.bufferByteLength(cursor, "utf8") > MAX_CURSOR_BYTES
   ) {
     return cursorError("cursor must not exceed 4 KiB");
   }
@@ -796,32 +925,45 @@ function decodedEnvelope(
   if (
     typeof cursor !== "string" ||
     cursor.length === 0 ||
-    Buffer.byteLength(cursor, "utf8") > MAX_CURSOR_BYTES ||
-    !BASE64URL.test(cursor)
+    CURSOR_INTRINSICS.bufferByteLength(cursor, "utf8") > MAX_CURSOR_BYTES ||
+    !regexpMatches(BASE64URL, cursor)
   ) {
     return cursorError("cursor must be at most 4 KiB of base64url text");
   }
 
   let bytes: Buffer;
   try {
-    bytes = Buffer.from(cursor, "base64url");
+    bytes = CURSOR_INTRINSICS.bufferFrom(cursor, "base64url");
   } catch {
     return cursorError("cursor base64url is invalid");
   }
   if (
-    bytes.toString("base64url") !== cursor ||
-    bytes.length > MAX_CURSOR_BYTES
+    CURSOR_INTRINSICS.reflectApply(CURSOR_INTRINSICS.bufferToString, bytes, [
+      "base64url",
+    ]) !== cursor ||
+    intrinsicByteLength(bytes) > MAX_CURSOR_BYTES
   ) {
     return cursorError("cursor base64url is not canonical");
   }
-  const text = bytes.toString("utf8");
-  if (!Buffer.from(text, "utf8").equals(bytes)) {
+  const text = CURSOR_INTRINSICS.reflectApply(
+    CURSOR_INTRINSICS.bufferToString,
+    bytes,
+    ["utf8"],
+  );
+  const canonicalBytes = CURSOR_INTRINSICS.bufferFrom(text, "utf8");
+  if (
+    !CURSOR_INTRINSICS.reflectApply(
+      CURSOR_INTRINSICS.bufferEquals,
+      canonicalBytes,
+      [bytes],
+    )
+  ) {
     return cursorError("cursor is not valid UTF-8");
   }
 
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text) as unknown;
+    parsed = CURSOR_INTRINSICS.jsonParse(text) as unknown;
   } catch {
     return cursorError("cursor JSON is invalid");
   }
@@ -887,17 +1029,17 @@ function decodeRepositoryPayload(
   }
   validateRepositoryValues(context.sort, values, nulls);
 
-  const result = Object.freeze({
+  const result = CURSOR_INTRINSICS.objectFreeze({
     v: 1,
     kind: "repositories",
     snapshotId,
     filterHash,
     sortHash,
-    values: Object.freeze([...values]),
-    nulls: Object.freeze([...nulls]),
+    values: frozenArrayCopy(values),
+    nulls: frozenArrayCopy(nulls),
     repositoryId,
   }) as ValidatedRepositoryCursorPayload;
-  validatedRepositoryPayloads.add(result);
+  weakSetAdd(validatedRepositoryPayloads, result);
   return result;
 }
 
@@ -934,12 +1076,12 @@ function decodeListPayload(
   if (selectionHash !== context.selectionHash) {
     return cursorError("list cursor selection does not match");
   }
-  return Object.freeze({
+  return CURSOR_INTRINSICS.objectFreeze({
     v: 1,
     kind: "lists",
     snapshotId,
     selectionHash,
-    values: Object.freeze([...values]),
+    values: frozenArrayCopy(values),
     listId,
   });
 }
@@ -955,13 +1097,12 @@ function decodeListMembershipPayload(
     "List membership cursor selector",
   );
   const common = ["v", "kind", "snapshotId", "selectionHash", "selector"];
-  exactKeys(
-    payload,
-    selector.kind === "list"
-      ? [...common, "boundaryRepositoryId"]
-      : [...common, "boundaryListId"],
-    "List membership cursor payload",
+  const expectedKeys = arrayCopy(common);
+  appendInternalArray(
+    expectedKeys,
+    selector.kind === "list" ? "boundaryRepositoryId" : "boundaryListId",
   );
+  exactKeys(payload, expectedKeys, "List membership cursor payload");
   if (payload.v !== 1 || payload.kind !== "list_memberships") {
     return cursorError("cursor resource kind does not match List memberships");
   }
@@ -984,7 +1125,7 @@ function decodeListMembershipPayload(
   }
   const result =
     selector.kind === "list"
-      ? Object.freeze({
+      ? CURSOR_INTRINSICS.objectFreeze({
           v: 1,
           kind: "list_memberships",
           snapshotId,
@@ -994,7 +1135,7 @@ function decodeListMembershipPayload(
             payload.boundaryRepositoryId,
           ),
         })
-      : Object.freeze({
+      : CURSOR_INTRINSICS.objectFreeze({
           v: 1,
           kind: "list_memberships",
           snapshotId,
@@ -1002,7 +1143,7 @@ function decodeListMembershipPayload(
           selector,
           boundaryListId: stableListId(payload.boundaryListId),
         });
-  validatedListMembershipPayloads.add(result);
+  weakSetAdd(validatedListMembershipPayloads, result);
   return result as ValidatedListMembershipCursorPayload;
 }
 
@@ -1012,7 +1153,7 @@ export function assertValidatedRepositoryCursorPayload(
   if (
     typeof value !== "object" ||
     value === null ||
-    !validatedRepositoryPayloads.has(value)
+    !weakSetHas(validatedRepositoryPayloads, value)
   ) {
     cursorError(
       "repository cursor payload must come from complete authenticated decoding",
@@ -1026,7 +1167,7 @@ export function assertValidatedListMembershipCursorPayload(
   if (
     typeof value !== "object" ||
     value === null ||
-    !validatedListMembershipPayloads.has(value)
+    !weakSetHas(validatedListMembershipPayloads, value)
   ) {
     cursorError(
       "List membership cursor payload must come from authenticated decoding",
@@ -1036,7 +1177,7 @@ export function assertValidatedListMembershipCursorPayload(
 
 export function createCursorCodec(signingKey: Uint8Array): CursorCodec {
   const key = signingKeyCopy(signingKey);
-  return Object.freeze({
+  return CURSOR_INTRINSICS.objectFreeze({
     encodeRepository(
       contextInput: RepositoryCursorContext,
       positionInput: RepositoryCursorPositionInput,

@@ -1,5 +1,12 @@
 import { Buffer } from "node:buffer";
-import { createHmac } from "node:crypto";
+import crypto, {
+  createHash,
+  createHmac,
+  Hash,
+  Hmac,
+  timingSafeEqual,
+} from "node:crypto";
+import { syncBuiltinESMExports } from "node:module";
 import Database from "better-sqlite3";
 import { describe, expect, test, vi } from "vitest";
 import {
@@ -37,6 +44,26 @@ import { repositoryViewFixture } from "../../fixtures/domain.js";
 const SNAPSHOT_ID = asSnapshotId("snap_1");
 const DEFAULT_SORT = [{ field: "stargazer_count", direction: "desc" }] as const;
 const CURSOR_CODEC = createCursorCodec(new Uint8Array(32).fill(3));
+const definePropertyForCursorTest = Object.defineProperty;
+const getOwnPropertyDescriptorForCursorTest = Object.getOwnPropertyDescriptor;
+
+function replaceOwnPropertyForCursorTest(
+  target: object,
+  property: PropertyKey,
+  value: unknown,
+): () => void {
+  const descriptor = getOwnPropertyDescriptorForCursorTest(target, property);
+  if (descriptor === undefined || !("value" in descriptor)) {
+    throw new Error(`Expected mutable data property ${String(property)}`);
+  }
+  definePropertyForCursorTest(target, property, {
+    ...descriptor,
+    value,
+  });
+  return () => {
+    definePropertyForCursorTest(target, property, descriptor);
+  };
+}
 
 function expectValidationError(action: () => unknown, message?: RegExp): void {
   try {
@@ -1439,6 +1466,167 @@ describe("review hardening regressions", () => {
       ),
     ).not.toThrow();
   });
+
+  /* eslint-disable @typescript-eslint/unbound-method -- This regression test deliberately captures, replaces, and identity-checks receiver-sensitive realm and crypto methods. */
+  test("captures the complete cursor signing path before hostile realm replacement", () => {
+    const key = new Uint8Array(32).fill(0x73);
+    const codec = createCursorCodec(key);
+    key.fill(0);
+    const context = {
+      v: 1,
+      kind: "list_memberships",
+      snapshotId: SNAPSHOT_ID,
+      selector: {
+        kind: "list",
+        listId: asUserListId("UL_INTRINSICS"),
+      },
+    } as const;
+    const position = {
+      selector: context.selector,
+      boundaryRepositoryId: asRepositoryId("R_INTRINSICS"),
+    } as const;
+    const baseline = codec.encodeListMembership(context, position);
+    const applyForTest = Reflect.apply;
+    const originalCrypto = {
+      createHash,
+      createHmac,
+      timingSafeEqual,
+    };
+    const bufferPrototypeForTest = Reflect.getPrototypeOf(Buffer.alloc(0));
+    if (bufferPrototypeForTest === null) {
+      throw new Error("Buffer prototype is required");
+    }
+    const weakSetPrototypeForTest = WeakSet.prototype;
+    const originals = {
+      regexpTest: RegExp.prototype.test,
+      uint8ArrayConstructor: globalThis.Uint8Array,
+      weakSetAdd: WeakSet.prototype.add,
+      weakSetConstructor: globalThis.WeakSet,
+      weakSetHas: WeakSet.prototype.has,
+    };
+    const restorers: Array<() => void> = [];
+    const identities: Array<{
+      target: object;
+      property: PropertyKey;
+      value: unknown;
+    }> = [];
+    let hookCalls = 0;
+    const leakedKeys: unknown[] = [];
+
+    function patch(
+      target: object,
+      property: PropertyKey,
+      replacement: unknown,
+    ): void {
+      const descriptor = getOwnPropertyDescriptorForCursorTest(
+        target,
+        property,
+      );
+      if (descriptor === undefined || !("value" in descriptor)) {
+        throw new Error("expected patchable cursor intrinsic");
+      }
+      identities[identities.length] = {
+        target,
+        property,
+        value: descriptor.value,
+      };
+      restorers[restorers.length] = replaceOwnPropertyForCursorTest(
+        target,
+        property,
+        replacement,
+      );
+    }
+
+    function poisoned(): never {
+      hookCalls += 1;
+      throw new Error("mutable cursor intrinsic must not run");
+    }
+
+    crypto.createHash = () => poisoned();
+    crypto.createHmac = (_algorithm, secret): never => {
+      leakedKeys[leakedKeys.length] = secret;
+      return poisoned();
+    };
+    crypto.timingSafeEqual = () => poisoned();
+    syncBuiltinESMExports();
+
+    let encoded: string | undefined;
+    let decoded: unknown;
+    let caught: unknown;
+    try {
+      patch(Hash.prototype, "update", poisoned);
+      patch(Hash.prototype, "digest", poisoned);
+      patch(Hmac.prototype, "update", poisoned);
+      patch(Hmac.prototype, "digest", poisoned);
+      patch(Buffer, "from", poisoned);
+      patch(Buffer, "byteLength", poisoned);
+      patch(bufferPrototypeForTest, "toString", poisoned);
+      patch(bufferPrototypeForTest, "equals", poisoned);
+      patch(JSON, "parse", poisoned);
+      patch(JSON, "stringify", poisoned);
+      patch(globalThis, "Uint8Array", poisoned);
+      patch(globalThis, "WeakSet", poisoned);
+      patch(weakSetPrototypeForTest, "add", poisoned);
+      patch(weakSetPrototypeForTest, "has", poisoned);
+      patch(
+        RegExp.prototype,
+        "test",
+        function guardedRegExpTest(this: RegExp, value: string): boolean {
+          if (
+            this.source === "^[a-f0-9]{64}$" ||
+            this.source === "^[A-Za-z0-9_-]+$"
+          ) {
+            hookCalls += 1;
+          }
+          return applyForTest(originals.regexpTest, this, [value]);
+        },
+      );
+
+      try {
+        encoded = codec.encodeListMembership(context, position);
+        decoded = codec.decodeListMembership(baseline, context);
+        assertValidatedListMembershipCursorPayload(decoded);
+      } catch (error) {
+        caught = error;
+      }
+    } finally {
+      for (let index = restorers.length - 1; index >= 0; index -= 1) {
+        restorers[index]?.();
+      }
+      crypto.createHash = originalCrypto.createHash;
+      crypto.createHmac = originalCrypto.createHmac;
+      crypto.timingSafeEqual = originalCrypto.timingSafeEqual;
+      syncBuiltinESMExports();
+    }
+
+    for (let index = 0; index < identities.length; index += 1) {
+      const identity = identities[index] as {
+        target: object;
+        property: PropertyKey;
+        value: unknown;
+      };
+      expect(
+        getOwnPropertyDescriptorForCursorTest(
+          identity.target,
+          identity.property,
+        )?.value,
+      ).toBe(identity.value);
+    }
+    expect(crypto.createHash).toBe(originalCrypto.createHash);
+    expect(crypto.createHmac).toBe(originalCrypto.createHmac);
+    expect(crypto.timingSafeEqual).toBe(originalCrypto.timingSafeEqual);
+    expect(globalThis.Uint8Array).toBe(originals.uint8ArrayConstructor);
+    expect(globalThis.WeakSet).toBe(originals.weakSetConstructor);
+    expect(caught).toBeUndefined();
+    expect(hookCalls).toBe(0);
+    expect(leakedKeys).toEqual([]);
+    expect(encoded).toBe(baseline);
+    expect(decoded).toMatchObject({
+      selector: context.selector,
+      boundaryRepositoryId: position.boundaryRepositoryId,
+    });
+  });
+  /* eslint-enable @typescript-eslint/unbound-method */
 
   test("rejects proxies, custom prototypes, cycles, and invalid canonical values", () => {
     const { proxy, revoke } = Proxy.revocable(

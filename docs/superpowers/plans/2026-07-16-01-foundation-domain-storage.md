@@ -856,11 +856,28 @@ snapshot and selector. Every List query and List-dependent repository filter
 rejects a snapshot whose coverage is not `complete`; other repository queries
 remain available.
 
+The cursor codec captures its mutable realm and Node crypto dependencies at
+module initialization: typed-array construction, copy, and byte length; util
+brand predicates; Buffer conversion, measurement, encoding, and equality;
+JSON parsing; RegExp matching; Object, Array, Reflect, Number, String, and
+WeakSet operations; `createHash`, `createHmac`, Hash/Hmac update and digest;
+and timing-safe comparison. It sends canonical encoding through the shared
+hardened serializer and invokes receiver-sensitive methods through the
+captured `Reflect.apply`. Post-load replacement of CommonJS crypto exports,
+crypto prototypes, globals, or prototype methods cannot change cursor bytes,
+bypass authentication, expose the HMAC key, or forge runtime brands. The
+codec freezes returned payloads and its public method table through the
+captured freeze function.
+
 `memory-storage.ts` starts unmigrated, initializes a private random 32-byte
 cursor key only in `migrate()`, and rejects all other operations before ready.
 A deterministic key may be injected only through the fixture factory input;
 it is copied immediately into a dedicated byte buffer, including when the
 source view is backed by `SharedArrayBuffer`, and temporary bytes are wiped.
+The fixture captures the `Uint8Array` constructor at module initialization.
+Its typed-array copy honors the source view's byte offset and byte length,
+retains no caller view, and leaves the caller's source bytes untouched during
+migration.
 No key/codec getter, own property, transaction snapshot, error, or log is
 exposed. Repeated migration and close are idempotent. Writes parse detached
 copies; reads return new frozen detached values. Snapshot metadata versions
@@ -1053,6 +1070,11 @@ Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.te
   Star/List/membership verification rejected, repository/List/two-direction
   membership cursor tamper/cross-context pages, runtime-brand lookalikes and
   locked selection-hash vectors, and aggregates independent of cursor;
+- post-load replacement of CommonJS crypto exports, Hash/Hmac methods,
+  Buffer/JSON/RegExp/WeakSet/Uint8Array hooks with unchanged authenticated
+  cursor round trips, zero hook calls, and no key leakage; exact
+  `SharedArrayBuffer` subview key copies under a replaced global constructor
+  without source wiping or view retention;
 - one-plan-one-run, binding/ID/sequence/before validation, idempotency without
   lifecycle reset, full CAS/finished-time/resume-lease matrix;
 - every legal and illegal operation/attempt/reconciliation combination,

@@ -159,6 +159,7 @@ const MEMORY_INTRINSICS = freezeMemoryIntrinsics({
   stringLocaleCompare: String.prototype.localeCompare,
   stringTrim: String.prototype.trim,
   structuredClone: globalThis.structuredClone,
+  uint8ArrayConstructor: Uint8Array,
   uint8ArrayFill: Uint8Array.prototype.fill,
   utilIsProxy: utilTypes.isProxy,
   utilIsUint8Array: utilTypes.isUint8Array,
@@ -1164,7 +1165,7 @@ export function createMemoryStorage(
       ) {
         return failure("VALIDATION_ERROR", "cursor key must be a Uint8Array");
       }
-      injectedKey = new Uint8Array(cursorKeyInput);
+      injectedKey = new MEMORY_INTRINSICS.uint8ArrayConstructor(cursorKeyInput);
     } catch {
       return failure("VALIDATION_ERROR", "cursor key must be a Uint8Array");
     }
