@@ -25,6 +25,7 @@ export type ResultOptions = Readonly<{
 }>;
 
 const INVALID_REQUEST_ID = "req_invalid";
+const REDACTED_REQUEST_ID = "req_redacted";
 const REDACTED = "[REDACTED]";
 const MAX_REQUEST_ID_LENGTH = 128;
 const MAX_SUMMARY_LENGTH = 1_024;
@@ -69,8 +70,8 @@ const FAILURE_OMITTED_KEYS = new Set([
   "rawerror",
   "raw_error",
 ]);
-const TOKEN_PATTERN = /\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/gu;
-const TOKEN_PATTERN_TEST = /\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/u;
+const TOKEN_PATTERN = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/gu;
+const TOKEN_PATTERN_TEST = /(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{4,}\b/u;
 
 function invalidInput(): never {
   throw new AppError(
@@ -164,15 +165,14 @@ function hasControlCharacter(value: string, allowLineFeed: boolean): boolean {
   return false;
 }
 
-function isValidRequestId(value: unknown): value is string {
+function isStructurallyValidRequestId(value: unknown): value is string {
   return (
     typeof value === "string" &&
     value.length >= 1 &&
     value.length <= MAX_REQUEST_ID_LENGTH &&
     value.trim() === value &&
     isWellFormedText(value) &&
-    !hasControlCharacter(value, false) &&
-    !TOKEN_PATTERN_TEST.test(value)
+    !hasControlCharacter(value, false)
   );
 }
 
@@ -315,6 +315,36 @@ function collectRegisteredSecrets(value: JsonValue): readonly string[] {
   return [...secrets];
 }
 
+function containsRegisteredSecret(
+  value: string,
+  secrets: readonly string[],
+): boolean {
+  for (let index = 0; index < secrets.length; index += 1) {
+    const secret = secrets[index];
+    if (secret !== undefined && secret.length > 0 && value.includes(secret)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isSensitiveRequestId(
+  value: string,
+  secrets: readonly string[],
+): boolean {
+  return (
+    TOKEN_PATTERN_TEST.test(value) || containsRegisteredSecret(value, secrets)
+  );
+}
+
+function safeSuccessRequestId(
+  value: unknown,
+  secrets: readonly string[],
+): string {
+  if (!isStructurallyValidRequestId(value)) return invalidInput();
+  return isSensitiveRequestId(value, secrets) ? REDACTED_REQUEST_ID : value;
+}
+
 function redactTokenPatterns(value: string): string {
   return value.replace(TOKEN_PATTERN, REDACTED);
 }
@@ -412,8 +442,69 @@ function sanitizedFailureMessage(value: string): string {
   );
 }
 
-function safeFailureRequestId(value: unknown): string {
-  return isValidRequestId(value) ? value : INVALID_REQUEST_ID;
+function snapshotDescriptorStrings(
+  value: unknown,
+): readonly string[] | undefined {
+  if (utilTypes.isProxy(value) || !Array.isArray(value)) return undefined;
+
+  const descriptors: Record<string, PropertyDescriptor> =
+    Object.getOwnPropertyDescriptors(value);
+  const lengthDescriptor = descriptors.length;
+  if (
+    lengthDescriptor === undefined ||
+    !("value" in lengthDescriptor) ||
+    typeof lengthDescriptor.value !== "number" ||
+    !Number.isInteger(lengthDescriptor.value) ||
+    lengthDescriptor.value < 0 ||
+    lengthDescriptor.value > MAX_REGISTERED_SECRETS
+  ) {
+    return undefined;
+  }
+
+  const length = lengthDescriptor.value;
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") return undefined;
+    if (key === "length") continue;
+    if (!/^(?:0|[1-9]\d*)$/u.test(key)) return undefined;
+    const index = Number(key);
+    if (!Number.isSafeInteger(index) || index >= length) return undefined;
+  }
+
+  const snapshot: string[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (
+      descriptor === undefined ||
+      !("value" in descriptor) ||
+      typeof descriptor.value !== "string"
+    ) {
+      return undefined;
+    }
+    snapshot.push(descriptor.value);
+  }
+  return Object.freeze(snapshot);
+}
+
+function safeFailureSecretRegistry(
+  error: unknown,
+): readonly string[] | undefined {
+  if (utilTypes.isProxy(error)) return undefined;
+  if (!(error instanceof AppError)) return Object.freeze([]);
+
+  const descriptor = Object.getOwnPropertyDescriptor(error, "secrets");
+  if (descriptor === undefined || !("value" in descriptor)) return undefined;
+  return snapshotDescriptorStrings(descriptor.value);
+}
+
+function safeFailureRequestId(
+  value: unknown,
+  secrets: readonly string[] | undefined,
+): string {
+  if (!isStructurallyValidRequestId(value)) return INVALID_REQUEST_ID;
+  if (secrets === undefined || isSensitiveRequestId(value, secrets)) {
+    return REDACTED_REQUEST_ID;
+  }
+  return value;
 }
 
 function createFailureResult(
@@ -464,13 +555,15 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
     return invalidInput();
   }
 
-  const requestId = clonedOptions.requestId;
-  if (!isValidRequestId(requestId)) return invalidInput();
   const summary = validateSummary(clonedOptions.summary);
   const warnings = validateWarnings(clonedOptions.warnings);
   const rateLimit = validateRateLimit(clonedOptions.rateLimit);
   const nextCursor = validateCursor(clonedOptions.nextCursor);
   const registeredSecrets = collectRegisteredSecrets(clonedData);
+  const requestId = safeSuccessRequestId(
+    clonedOptions.requestId,
+    registeredSecrets,
+  );
 
   const sanitizedData = frozenJson(
     sanitizeSuccessValue(clonedData, registeredSecrets),
@@ -510,6 +603,7 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
 
 export function toolFailure(error: unknown, requestId: string): CallToolResult {
   try {
+    const registeredSecrets = safeFailureSecretRegistry(error);
     const serialized = utilTypes.isProxy(error)
       ? serializeError(undefined)
       : serializeError(error);
@@ -518,7 +612,7 @@ export function toolFailure(error: unknown, requestId: string): CallToolResult {
       sanitizedFailureMessage(serialized.message),
       serialized.retryable,
       sanitizedFailureDetails(serialized.details),
-      safeFailureRequestId(requestId),
+      safeFailureRequestId(requestId, registeredSecrets),
     );
   } catch {
     return TOTAL_FAILURE_RESULT;

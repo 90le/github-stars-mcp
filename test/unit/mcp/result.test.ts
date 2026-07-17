@@ -251,6 +251,49 @@ describe("MCP result envelopes", () => {
     expect(textOf(result)).toBe("safe [REDACTED] [REDACTED]");
   });
 
+  it("redacts token patterns without a leading word boundary from every success field", () => {
+    const token = `ghp_${"A".repeat(36)}`;
+    const adjacentToken = `prefix${token}`;
+
+    const result = toolSuccess(
+      { nested: { value: adjacentToken } },
+      {
+        requestId: "req_adjacent_token",
+        summary: adjacentToken,
+        warnings: [adjacentToken],
+        nextCursor: adjacentToken,
+      },
+    );
+
+    expect(result.structuredContent).toMatchObject({
+      data: { nested: { value: "prefix[REDACTED]" } },
+      warnings: ["prefix[REDACTED]"],
+      next_cursor: "prefix[REDACTED]",
+    });
+    expect(textOf(result)).toBe("prefix[REDACTED]");
+    expect(JSON.stringify(result)).not.toContain(token);
+  });
+
+  it.each([
+    [
+      "registered credential",
+      "registered-request-secret",
+      { token: "registered-request-secret" },
+    ],
+    ["token at the start", `ghp_${"B".repeat(36)}`, {}],
+    ["token after a word character", `prefixghp_${"C".repeat(36)}`, {}],
+  ])("uses a fixed success request ID for a %s", (_label, requestId, data) => {
+    const result = toolSuccess(data, {
+      requestId,
+      summary: "safe request",
+    });
+
+    expect(result.structuredContent).toMatchObject({
+      request_id: "req_redacted",
+    });
+    expect(JSON.stringify(result)).not.toContain(requestId);
+  });
+
   it("keeps text concise instead of serializing successful data", () => {
     const marker = "structured-only-marker";
     const result = toolSuccess(
@@ -650,27 +693,27 @@ describe("failure totality", () => {
     const revocable = Proxy.revocable({}, {});
     revocable.revoke();
 
-    const failures = [
-      undefined,
-      null,
-      true,
-      42,
-      1n,
-      "string",
-      Symbol("failure"),
-      () => "failure",
-      cyclic,
-      accessor,
-      proxy,
-      revocable.proxy,
+    const failures: readonly (readonly [unknown, string])[] = [
+      [undefined, "req_total"],
+      [null, "req_total"],
+      [true, "req_total"],
+      [42, "req_total"],
+      [1n, "req_total"],
+      ["string", "req_total"],
+      [Symbol("failure"), "req_total"],
+      [() => "failure", "req_total"],
+      [cyclic, "req_total"],
+      [accessor, "req_total"],
+      [proxy, "req_redacted"],
+      [revocable.proxy, "req_redacted"],
     ];
 
-    for (const failure of failures) {
+    for (const [failure, expectedRequestId] of failures) {
       expect(() => toolFailure(failure, "req_total")).not.toThrow();
       expect(failureEnvelope(toolFailure(failure, "req_total"))).toMatchObject({
         schema_version: "1",
         ok: false,
-        request_id: "req_total",
+        request_id: expectedRequestId,
         error: {
           code: "INTERNAL_ERROR",
           retryable: false,
@@ -752,6 +795,94 @@ describe("failure totality", () => {
     expect(textOf(result)).toBe(
       `GITHUB_UNAVAILABLE: ${envelope.error.message}`,
     );
+  });
+
+  it("redacts token patterns without a leading word boundary from failure message and details", () => {
+    const token = `ghp_${"D".repeat(36)}`;
+    const adjacentToken = `prefix${token}`;
+    const error = new AppError("GITHUB_UNAVAILABLE", adjacentToken, {
+      details: { nested: { value: adjacentToken } },
+    });
+
+    const result = toolFailure(error, "req_adjacent_failure");
+    const envelope = failureEnvelope(result);
+
+    expect(envelope.error.message).toBe("prefix[REDACTED]");
+    expect(envelope.error.details).toEqual({
+      nested: { value: "prefix[REDACTED]" },
+    });
+    expect(JSON.stringify(result)).not.toContain(token);
+  });
+
+  it.each([
+    ["token at the start", `ghp_${"E".repeat(36)}`],
+    ["token after a word character", `prefixghp_${"F".repeat(36)}`],
+  ])("uses a fixed failure request ID for a %s", (_label, requestId) => {
+    const result = toolFailure(null, requestId);
+
+    expect(failureEnvelope(result).request_id).toBe("req_redacted");
+    expect(JSON.stringify(result)).not.toContain(requestId);
+  });
+
+  it("uses a fixed failure request ID when it equals an AppError credential", () => {
+    const secret = "registered-failure-request-secret";
+    const error = new AppError("AUTH_REQUIRED", "authentication failed", {
+      secrets: [secret],
+    });
+
+    const result = toolFailure(error, secret);
+
+    expect(failureEnvelope(result).request_id).toBe("req_redacted");
+    expect(JSON.stringify(result)).not.toContain(secret);
+  });
+
+  it("does not invoke accessors when an AppError secret registry is unsafe", () => {
+    let getterCalls = 0;
+    const malformed = Object.create(AppError.prototype) as AppError;
+    Object.defineProperties(malformed, {
+      code: { value: "AUTH_REQUIRED" },
+      details: { value: {} },
+      message: { value: "authentication failed" },
+      retryable: { value: false },
+      secrets: {
+        get: () => {
+          getterCalls += 1;
+          return ["req_unsafe_registry"];
+        },
+      },
+    });
+
+    const result = toolFailure(malformed, "req_unsafe_registry");
+
+    expect(failureEnvelope(result).request_id).toBe("req_redacted");
+    expect(getterCalls).toBe(0);
+    expect(JSON.stringify(result)).not.toContain("req_unsafe_registry");
+  });
+
+  it("does not invoke proxy traps when a failure secret registry cannot be inspected", () => {
+    let proxyCalls = 0;
+    const secret = "req_proxied_registry";
+    const error = new Proxy(
+      new AppError("AUTH_REQUIRED", "authentication failed", {
+        secrets: [secret],
+      }),
+      {
+        getOwnPropertyDescriptor: () => {
+          proxyCalls += 1;
+          throw new Error("proxy trap invoked");
+        },
+        getPrototypeOf: () => {
+          proxyCalls += 1;
+          throw new Error("proxy trap invoked");
+        },
+      },
+    );
+
+    const result = toolFailure(error, secret);
+
+    expect(failureEnvelope(result).request_id).toBe("req_redacted");
+    expect(proxyCalls).toBe(0);
+    expect(JSON.stringify(result)).not.toContain(secret);
   });
 
   it("falls back to empty details when serialized details exceed the safe clone bound", () => {
