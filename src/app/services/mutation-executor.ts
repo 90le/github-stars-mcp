@@ -24,6 +24,7 @@ import type {
   RepositoryCoordinates,
   UserList,
 } from "../../domain/repository.js";
+import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
 import type { ExecutionOutcome } from "./mutation-pacer.js";
 
 export type ExecutionContext = {
@@ -81,6 +82,10 @@ export type PrepareMutationResult =
     }>;
 
 type JsonObject = Readonly<{ [key: string]: JsonValue }>;
+type ResolvedListMutationOperation = Extract<
+  ResolvedOperation,
+  { readonly listId: UserListId }
+>;
 
 type PreparedRegistration = {
   readonly context: ExecutionContext;
@@ -92,15 +97,14 @@ type DispatchCompletion = Readonly<{
   createdListId: UserListId | null;
 }>;
 
-const OPERATION_KINDS = new Set<ResolvedOperation["kind"]>([
-  "star",
-  "unstar",
-  "list_create",
-  "list_update",
-  "list_delete",
-  "list_membership_set",
-]);
 const MAX_OPERATION_ID = 128;
+const MAX_IDS = 5_000;
+const MAX_REFERENCE = 128;
+const MAX_MUTATION_NAME = 100;
+const MAX_MUTATION_DESCRIPTION = 1_024;
+const MAX_LIST_NAME = 255;
+const MAX_LIST_SLUG = 255;
+const MAX_LIST_DESCRIPTION = 8_192;
 
 function validationError(reason: string): AppError {
   return new AppError("VALIDATION_ERROR", "Prepared mutation is invalid", {
@@ -188,16 +192,16 @@ function safeJsonObject(value: JsonValue): JsonObject | null {
   }
 }
 
-function sameJson(left: JsonValue, right: JsonValue): boolean {
+function sameJson(
+  left: JsonValue | undefined,
+  right: JsonValue | undefined,
+): boolean {
+  if (left === undefined || right === undefined) return false;
   try {
     return canonicalJson(left) === canonicalJson(right);
   } catch {
     return false;
   }
-}
-
-function text(value: JsonValue | undefined): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function validOperationId(value: string): boolean {
@@ -275,144 +279,419 @@ function listIdsState(value: JsonValue): readonly UserListId[] | null {
   return sortedUniqueIds(listIds as readonly UserListId[]);
 }
 
-function stringArray(value: JsonValue | undefined): boolean {
+function exactObject(
+  value: JsonValue | undefined,
+  keys: readonly string[],
+): JsonObject | null {
+  const record = value === undefined ? null : jsonObject(value);
+  if (record === null) return null;
+  const actualKeys = Object.keys(record);
+  return actualKeys.length === keys.length &&
+    keys.every((key) => Object.hasOwn(record, key))
+    ? record
+    : null;
+}
+
+function boundedText(
+  value: JsonValue | undefined,
+  maximum: number,
+  allowEmpty = false,
+): value is string {
   return (
-    Array.isArray(value) &&
-    value.every(
-      (candidate) => typeof candidate === "string" && candidate.length > 0,
-    )
+    typeof value === "string" &&
+    value.length <= maximum &&
+    (allowEmpty || value.length > 0) &&
+    value === value.trim()
   );
 }
 
+function boundedRawText(
+  value: JsonValue | undefined,
+  maximum: number,
+): value is string {
+  return typeof value === "string" && value.length <= maximum;
+}
+
+function stableId(value: JsonValue | undefined): value is string {
+  return boundedText(value, MAX_REFERENCE);
+}
+
+function canonicalStringArray(
+  value: JsonValue | undefined,
+  itemIsValid: (candidate: JsonValue | undefined) => candidate is string,
+): value is readonly string[] {
+  if (!Array.isArray(value) || value.length > MAX_IDS) return false;
+  const input = value as readonly JsonValue[];
+  for (let index = 0; index < input.length; index += 1) {
+    const current = input[index];
+    if (!itemIsValid(current)) return false;
+    if (index > 0) {
+      const previous = input[index - 1];
+      if (typeof previous !== "string" || previous >= current) return false;
+    }
+  }
+  return true;
+}
+
+function operationIdArray(
+  value: JsonValue | undefined,
+): value is readonly string[] {
+  return canonicalStringArray(
+    value,
+    (candidate): candidate is string =>
+      typeof candidate === "string" && validOperationId(candidate),
+  );
+}
+
+function stableIdArray(
+  value: JsonValue | undefined,
+): value is readonly string[] {
+  return canonicalStringArray(value, stableId);
+}
+
+function canonicalTimestamp(value: JsonValue | undefined): value is string {
+  if (typeof value !== "string") return false;
+  try {
+    return canonicalUtcTimestamp(value) === value;
+  } catch {
+    return false;
+  }
+}
+
 function validCoordinates(value: JsonValue | undefined): boolean {
-  const record = value === undefined ? null : jsonObject(value);
+  const record = exactObject(value, ["owner", "name"]);
   return (
-    record !== null && text(record.owner) !== null && text(record.name) !== null
+    record !== null &&
+    boundedText(record.owner, MAX_MUTATION_NAME) &&
+    boundedText(record.name, MAX_MUTATION_NAME)
+  );
+}
+
+function validMetadata(
+  value: JsonValue | undefined,
+  limits: Readonly<{ name: number; description: number }> = {
+    name: MAX_LIST_NAME,
+    description: MAX_LIST_DESCRIPTION,
+  },
+): boolean {
+  const record = exactObject(value, ["name", "description", "isPrivate"]);
+  return (
+    record !== null &&
+    boundedText(record.name, limits.name) &&
+    (record.description === null ||
+      boundedRawText(record.description, limits.description)) &&
+    typeof record.isPrivate === "boolean"
   );
 }
 
 function validCompleteList(value: JsonValue | undefined): boolean {
-  const record = value === undefined ? null : jsonObject(value);
+  const record = exactObject(value, [
+    "listId",
+    "name",
+    "slug",
+    "description",
+    "isPrivate",
+    "createdAt",
+    "updatedAt",
+    "lastAddedAt",
+  ]);
   return (
     record !== null &&
-    text(record.listId) !== null &&
-    text(record.name) !== null &&
-    text(record.slug) !== null &&
-    (record.description === null || typeof record.description === "string") &&
+    stableId(record.listId) &&
+    boundedText(record.name, MAX_LIST_NAME) &&
+    boundedText(record.slug, MAX_LIST_SLUG) &&
+    (record.description === null ||
+      boundedRawText(record.description, MAX_LIST_DESCRIPTION)) &&
     typeof record.isPrivate === "boolean" &&
-    text(record.createdAt) !== null &&
-    text(record.updatedAt) !== null &&
-    (record.lastAddedAt === null || typeof record.lastAddedAt === "string")
+    canonicalTimestamp(record.createdAt) &&
+    canonicalTimestamp(record.updatedAt) &&
+    (record.lastAddedAt === null || canonicalTimestamp(record.lastAddedAt))
   );
 }
 
-function validMembershipTargets(value: JsonValue | undefined): boolean {
-  if (!Array.isArray(value)) return false;
-  return (value as readonly JsonValue[]).every((candidate) => {
-    const target = jsonObject(candidate);
-    if (target === null) return false;
-    return target.kind === "existing"
-      ? text(target.listId) !== null
-      : target.kind === "created" &&
-          typeof target.createOperationId === "string" &&
-          validOperationId(target.createOperationId);
-  });
+function exactPrecondition(
+  operation: ResolvedOperation,
+  kind: string,
+): JsonValue | null {
+  if (operation.preconditions.length !== 1) return null;
+  const precondition = exactObject(
+    operation.preconditions[0] as unknown as JsonValue,
+    ["kind", "expected"],
+  );
+  return precondition?.kind === kind ? (precondition.expected ?? null) : null;
 }
 
-function validMembershipAfterIds(value: JsonValue | undefined): boolean {
-  if (!Array.isArray(value)) return false;
-  return (value as readonly JsonValue[]).every((candidate) => {
-    if (typeof candidate === "string") return candidate.length > 0;
-    const reference = jsonObject(candidate);
+function validRepositoryFields(
+  operation: Extract<
+    ResolvedOperation,
+    { kind: "star" | "unstar" | "list_membership_set" }
+  >,
+): boolean {
+  return (
+    stableId(operation.repositoryId) &&
+    boundedText(operation.repositoryDatabaseId, MAX_REFERENCE) &&
+    /^(0|[1-9]\d*)$/u.test(operation.repositoryDatabaseId) &&
+    validCoordinates(operation.coordinates as unknown as JsonValue)
+  );
+}
+
+function validStarOperation(
+  operation: Extract<ResolvedOperation, { kind: "star" | "unstar" }>,
+): boolean {
+  if (!validRepositoryFields(operation) || operation.dependsOn.length !== 0) {
+    return false;
+  }
+  const expected = exactPrecondition(operation, "star_state");
+  if (operation.kind === "star") {
     return (
-      reference !== null &&
-      typeof reference.createOperationId === "string" &&
-      validOperationId(reference.createOperationId)
+      expected === false &&
+      exactObject(operation.before, ["starred"])?.starred === false &&
+      exactObject(operation.after, ["starred"])?.starred === true &&
+      exactObject(operation.inverse, ["kind"])?.kind === "unstar" &&
+      operation.risk === "normal"
     );
-  });
+  }
+
+  const before = exactObject(operation.before, [
+    "starred",
+    "starredAt",
+    "listIds",
+  ]);
+  const inverse = exactObject(operation.inverse, ["kind", "listIds"]);
+  return (
+    expected === true &&
+    before?.starred === true &&
+    canonicalTimestamp(before.starredAt) &&
+    stableIdArray(before.listIds) &&
+    exactObject(operation.after, ["starred"])?.starred === false &&
+    inverse?.kind === "star" &&
+    stableIdArray(inverse.listIds) &&
+    sameJson(before.listIds, inverse.listIds) &&
+    operation.risk === "non_reversible"
+  );
 }
 
-function operationShapeIsValid(record: JsonObject): boolean {
+function validCreateOperation(
+  operation: Extract<ResolvedOperation, { kind: "list_create" }>,
+): boolean {
+  const expected = exactObject(
+    exactPrecondition(operation, "list_id_baseline") ?? undefined,
+    ["listIds"],
+  );
+  const before = exactObject(operation.before, ["listIds"]);
+  return (
+    operation.dependsOn.length === 0 &&
+    boundedText(operation.clientRef, MAX_REFERENCE) &&
+    expected !== null &&
+    stableIdArray(expected.listIds) &&
+    before !== null &&
+    stableIdArray(before.listIds) &&
+    sameJson(expected, before) &&
+    validMetadata(operation.after, {
+      name: MAX_MUTATION_NAME,
+      description: MAX_MUTATION_DESCRIPTION,
+    }) &&
+    exactObject(operation.inverse, ["kind"])?.kind === "list_delete" &&
+    operation.risk === "normal"
+  );
+}
+
+function validUpdateOperation(
+  operation: ResolvedListMutationOperation,
+): boolean {
+  if (operation.kind !== "list_update") return false;
+  const expected = exactPrecondition(operation, "list_metadata");
+  const inverse = exactObject(operation.inverse, [
+    "kind",
+    "name",
+    "description",
+    "isPrivate",
+  ]);
+  if (inverse?.kind !== "list_update") return false;
+  const inverseName = inverse.name;
+  const inverseDescription = inverse.description;
+  const inverseIsPrivate = inverse.isPrivate;
   if (
-    typeof record.operationId !== "string" ||
-    !validOperationId(record.operationId) ||
-    typeof record.kind !== "string" ||
-    !OPERATION_KINDS.has(record.kind as ResolvedOperation["kind"])
+    inverseName === undefined ||
+    inverseDescription === undefined ||
+    inverseIsPrivate === undefined
+  ) {
+    return false;
+  }
+  const inverseMetadata: JsonObject = {
+    name: inverseName,
+    description: inverseDescription,
+    isPrivate: inverseIsPrivate,
+  };
+  return (
+    operation.dependsOn.length === 0 &&
+    stableId(operation.listId) &&
+    expected !== null &&
+    validMetadata(expected) &&
+    validMetadata(operation.before) &&
+    validMetadata(operation.after) &&
+    !sameJson(operation.before, operation.after) &&
+    sameJson(expected, operation.before) &&
+    validMetadata(inverseMetadata) &&
+    sameJson(operation.before, inverseMetadata) &&
+    operation.risk === "normal"
+  );
+}
+
+function validDeleteOperation(
+  operation: ResolvedListMutationOperation,
+): boolean {
+  if (operation.kind !== "list_delete") return false;
+  const expected = exactPrecondition(operation, "list_metadata");
+  const before = exactObject(operation.before, ["list", "repositoryIds"]);
+  const inverse = exactObject(operation.inverse, [
+    "kind",
+    "list",
+    "repositoryIds",
+  ]);
+  return (
+    operation.dependsOn.length === 0 &&
+    stableId(operation.listId) &&
+    expected !== null &&
+    validCompleteList(expected) &&
+    before !== null &&
+    validCompleteList(before.list) &&
+    exactObject(before.list, [
+      "listId",
+      "name",
+      "slug",
+      "description",
+      "isPrivate",
+      "createdAt",
+      "updatedAt",
+      "lastAddedAt",
+    ])?.listId === operation.listId &&
+    stableIdArray(before.repositoryIds) &&
+    sameJson(expected, before.list) &&
+    exactObject(operation.after, ["exists"])?.exists === false &&
+    inverse?.kind === "list_create" &&
+    validCompleteList(inverse.list) &&
+    stableIdArray(inverse.repositoryIds) &&
+    sameJson(before.list, inverse.list) &&
+    sameJson(before.repositoryIds, inverse.repositoryIds) &&
+    operation.risk === "destructive"
+  );
+}
+
+function membershipAfterIds(
+  value: JsonValue | undefined,
+): readonly JsonValue[] | null {
+  if (!Array.isArray(value) || value.length > MAX_IDS) return null;
+  const input = value as readonly JsonValue[];
+  for (const candidate of input) {
+    if (stableId(candidate)) continue;
+    const reference = exactObject(candidate, ["createOperationId"]);
+    if (
+      reference === null ||
+      typeof reference.createOperationId !== "string" ||
+      !validOperationId(reference.createOperationId)
+    ) {
+      return null;
+    }
+  }
+  return input;
+}
+
+function validMembershipOperation(
+  operation: Extract<ResolvedOperation, { kind: "list_membership_set" }>,
+): boolean {
+  const expected = exactObject(
+    exactPrecondition(operation, "list_memberships") ?? undefined,
+    ["listIds"],
+  );
+  const before = exactObject(operation.before, ["listIds"]);
+  const after = exactObject(operation.after, ["listIds"]);
+  const inverse = exactObject(operation.inverse, ["kind", "listIds"]);
+  if (
+    !validRepositoryFields(operation) ||
+    !stableIdArray(operation.expectedListIds) ||
+    expected === null ||
+    !stableIdArray(expected.listIds) ||
+    before === null ||
+    !stableIdArray(before.listIds) ||
+    after === null ||
+    membershipAfterIds(after.listIds) === null ||
+    inverse?.kind !== "list_membership_set" ||
+    !stableIdArray(inverse.listIds) ||
+    !sameJson(operation.expectedListIds, expected.listIds) ||
+    !sameJson(operation.expectedListIds, before.listIds) ||
+    !sameJson(operation.expectedListIds, inverse.listIds) ||
+    operation.risk !== "normal"
   ) {
     return false;
   }
 
-  if (record.kind === "star" || record.kind === "unstar") {
-    const before = jsonObject(record.before);
-    const after = jsonObject(record.after);
-    return (
-      text(record.repositoryId) !== null &&
-      typeof record.repositoryDatabaseId === "string" &&
-      /^(0|[1-9]\d*)$/u.test(record.repositoryDatabaseId) &&
-      validCoordinates(record.coordinates) &&
-      before !== null &&
-      typeof before.starred === "boolean" &&
-      after !== null &&
-      typeof after.starred === "boolean"
+  const expectedAfterIds: JsonValue[] = [];
+  const createdDependencies = new Set<string>();
+  for (const target of operation.targetLists) {
+    if (target.kind === "existing") {
+      const record = exactObject(target, ["kind", "listId"]);
+      if (record?.kind !== "existing" || !stableId(record.listId)) {
+        return false;
+      }
+      expectedAfterIds.push(record.listId);
+      continue;
+    }
+    const record = exactObject(target, ["kind", "createOperationId"]);
+    if (
+      record?.kind !== "created" ||
+      typeof record.createOperationId !== "string" ||
+      !validOperationId(record.createOperationId) ||
+      record.createOperationId === operation.operationId
+    ) {
+      return false;
+    }
+    createdDependencies.add(record.createOperationId);
+    expectedAfterIds.push(
+      frozenJson({ createOperationId: record.createOperationId }),
     );
   }
-
-  if (record.kind === "list_create") {
-    return (
-      text(record.clientRef) !== null &&
-      record.after !== undefined &&
-      metadataState(record.after) !== null
-    );
-  }
-
-  if (record.kind === "list_update") {
-    return (
-      text(record.listId) !== null &&
-      record.before !== undefined &&
-      metadataState(record.before) !== null &&
-      record.after !== undefined &&
-      metadataState(record.after) !== null
-    );
-  }
-
-  if (record.kind === "list_delete") {
-    const before = jsonObject(record.before);
-    const after = jsonObject(record.after);
-    return (
-      text(record.listId) !== null &&
-      before !== null &&
-      validCompleteList(before.list) &&
-      after !== null &&
-      after.exists === false
-    );
-  }
-
-  const before = jsonObject(record.before);
-  const after = jsonObject(record.after);
   return (
-    text(record.repositoryId) !== null &&
-    typeof record.repositoryDatabaseId === "string" &&
-    /^(0|[1-9]\d*)$/u.test(record.repositoryDatabaseId) &&
-    validCoordinates(record.coordinates) &&
-    stringArray(record.expectedListIds) &&
-    validMembershipTargets(record.targetLists) &&
-    before !== null &&
-    stringArray(before.listIds) &&
-    after !== null &&
-    validMembershipAfterIds(after.listIds)
+    sameJson(after.listIds, frozenJson(expectedAfterIds)) &&
+    [...createdDependencies].every((operationId) =>
+      operation.dependsOn.includes(operationId),
+    )
   );
 }
 
+function operationShapeIsValid(operation: ResolvedOperation): boolean {
+  if (
+    !validOperationId(operation.operationId) ||
+    !operationIdArray(operation.dependsOn) ||
+    operation.dependsOn.includes(operation.operationId)
+  ) {
+    return false;
+  }
+  switch (operation.kind) {
+    case "star":
+    case "unstar":
+      return validStarOperation(operation);
+    case "list_create":
+      return validCreateOperation(operation);
+    case "list_update":
+      return validUpdateOperation(operation);
+    case "list_delete":
+      return validDeleteOperation(operation);
+    case "list_membership_set":
+      return validMembershipOperation(operation);
+  }
+}
+
 function operationSnapshot(operation: ResolvedOperation): ResolvedOperation {
-  const parsed = parseResolvedOperation(operation);
-  const record = jsonObject(parsed as unknown as JsonValue);
-  if (record === null || !operationShapeIsValid(record)) {
+  try {
+    const parsed = parseResolvedOperation(operation);
+    if (!operationShapeIsValid(parsed)) {
+      throw validationError("invalid_operation");
+    }
+    return parsed;
+  } catch {
     throw validationError("invalid_operation");
   }
-  if (parsed.dependsOn.some((operationId) => !validOperationId(operationId))) {
-    throw validationError("invalid_operation");
-  }
-  return parsed;
 }
 
 function validContext(context: ExecutionContext): boolean {
@@ -939,6 +1218,15 @@ export class MutationExecutor {
           completion.createdListId,
           signal,
         );
+        const baselineListIds = exactObject(operation.before, [
+          "listIds",
+        ])?.listIds;
+        if (
+          !Array.isArray(baselineListIds) ||
+          baselineListIds.includes(completion.createdListId)
+        ) {
+          throw reconciliationRequired(operation, mutation.kind);
+        }
         const expected = metadataState(operation.after);
         const current = metadataState(state);
         const record = safeJsonObject(state);

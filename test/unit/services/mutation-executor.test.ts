@@ -231,63 +231,95 @@ function emptyExecutionContext(): ExecutionContext {
   };
 }
 
-function common(operationId: string) {
+function common(
+  operationId: string,
+  dependsOn: readonly string[] = Object.freeze([]),
+) {
   return {
     operationId,
-    dependsOn: Object.freeze([] as string[]),
-    preconditions: Object.freeze([]),
-    inverse: Object.freeze({}),
-    risk: "normal" as const,
+    dependsOn,
   };
 }
 
 function starOperation(kind: "star" | "unstar" = "star"): ResolvedOperation {
+  const originalListIds = Object.freeze([listId]);
   return Object.freeze({
     ...common(`op_${kind}`),
     kind,
     repositoryId,
     repositoryDatabaseId,
     coordinates,
+    preconditions: Object.freeze([
+      Object.freeze({
+        kind: "star_state",
+        expected: kind === "star" ? false : true,
+      }),
+    ]),
     before:
       kind === "star"
         ? Object.freeze({ starred: false })
-        : Object.freeze({ starred: true }),
+        : Object.freeze({
+            starred: true,
+            starredAt: "2026-07-16T00:00:00.000Z",
+            listIds: originalListIds,
+          }),
     after:
       kind === "star"
         ? Object.freeze({ starred: true })
         : Object.freeze({ starred: false }),
+    inverse:
+      kind === "star"
+        ? Object.freeze({ kind: "unstar" })
+        : Object.freeze({ kind: "star", listIds: originalListIds }),
+    risk: kind === "star" ? "normal" : "non_reversible",
   });
 }
 
 function createOperation(): ResolvedOperation {
+  const baselineListIds = Object.freeze([listId]);
   return Object.freeze({
     ...common("op_create"),
     kind: "list_create",
     clientRef: "created",
-    before: Object.freeze({ listIds: Object.freeze([listId]) }),
+    preconditions: Object.freeze([
+      Object.freeze({
+        kind: "list_id_baseline",
+        expected: Object.freeze({ listIds: baselineListIds }),
+      }),
+    ]),
+    before: Object.freeze({ listIds: baselineListIds }),
     after: Object.freeze({
       name: "Created",
       description: null,
       isPrivate: false,
     }),
+    inverse: Object.freeze({ kind: "list_delete" }),
+    risk: "normal",
   });
 }
 
 function updateOperation(): ResolvedOperation {
+  const before = Object.freeze({
+    name: "Original",
+    description: "Before",
+    isPrivate: false,
+  });
+  const after = Object.freeze({
+    name: "Renamed",
+    description: null,
+    isPrivate: true,
+  });
   return Object.freeze({
     ...common("op_update"),
     kind: "list_update",
     listId,
-    before: Object.freeze({
-      name: "Original",
-      description: "Before",
-      isPrivate: false,
-    }),
-    after: Object.freeze({
-      name: "Renamed",
-      description: null,
-      isPrivate: true,
-    }),
+    preconditions: Object.freeze([
+      Object.freeze({ kind: "list_metadata", expected: before }),
+    ]),
+    before,
+    after,
+    inverse: Object.freeze({ kind: "list_update", ...before }),
+    risk: "normal",
   });
 }
 
@@ -305,15 +337,25 @@ function completeList(list: UserList) {
 }
 
 function deleteOperation(list: UserList): ResolvedOperation {
+  const listState = completeList(list);
+  const repositoryIds = Object.freeze([repositoryId]);
   return Object.freeze({
     ...common("op_delete"),
     kind: "list_delete",
     listId: list.listId,
+    preconditions: Object.freeze([
+      Object.freeze({ kind: "list_metadata", expected: listState }),
+    ]),
     before: Object.freeze({
-      list: completeList(list),
-      repositoryIds: Object.freeze([repositoryId]),
+      list: listState,
+      repositoryIds,
     }),
     after: Object.freeze({ exists: false }),
+    inverse: Object.freeze({
+      kind: "list_create",
+      list: listState,
+      repositoryIds,
+    }),
     risk: "destructive",
   });
 }
@@ -326,15 +368,35 @@ function membershipOperation(
     Object.freeze({ kind: "existing" as const, listId }),
   ]),
 ): ResolvedOperation {
+  const expectedListIds = Object.freeze([listId]);
+  const dependsOn = Object.freeze(
+    targetLists
+      .filter(
+        (
+          target,
+        ): target is Extract<
+          (typeof targetLists)[number],
+          { kind: "created" }
+        > => target.kind === "created",
+      )
+      .map((target) => target.createOperationId)
+      .sort(),
+  );
   return Object.freeze({
-    ...common("op_membership"),
+    ...common("op_membership", dependsOn),
     kind: "list_membership_set",
     repositoryId,
     repositoryDatabaseId,
     coordinates,
-    expectedListIds: Object.freeze([listId]),
+    expectedListIds,
     targetLists,
-    before: Object.freeze({ listIds: Object.freeze([listId]) }),
+    preconditions: Object.freeze([
+      Object.freeze({
+        kind: "list_memberships",
+        expected: Object.freeze({ listIds: expectedListIds }),
+      }),
+    ]),
+    before: Object.freeze({ listIds: expectedListIds }),
     after: Object.freeze({
       listIds: Object.freeze(
         targetLists.map((target) =>
@@ -346,6 +408,11 @@ function membershipOperation(
         ),
       ),
     }),
+    inverse: Object.freeze({
+      kind: "list_membership_set",
+      listIds: expectedListIds,
+    }),
+    risk: "normal",
   });
 }
 
@@ -365,6 +432,178 @@ async function prepared(
     throw new Error("Expected a prepared mutation");
   }
   return result.prepared;
+}
+
+type MutableRecord = Record<string, unknown>;
+
+function mutableOperation(operation: ResolvedOperation): MutableRecord {
+  return JSON.parse(JSON.stringify(operation)) as MutableRecord;
+}
+
+function mutableRecord(value: unknown): MutableRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Expected a mutable record fixture");
+  }
+  return value as MutableRecord;
+}
+
+function operationValidationFixtures(): readonly ResolvedOperation[] {
+  const github = new StatefulGitHub();
+  return Object.freeze([
+    starOperation(),
+    starOperation("unstar"),
+    createOperation(),
+    updateOperation(),
+    deleteOperation(github.lists.get(listId)!),
+    membershipOperation(),
+  ]);
+}
+
+function removeRequiredNestedState(candidate: MutableRecord): void {
+  const before = mutableRecord(candidate.before);
+  switch (candidate.kind) {
+    case "star":
+      delete before.starred;
+      return;
+    case "unstar":
+      delete before.starredAt;
+      return;
+    case "list_create":
+    case "list_membership_set":
+      delete before.listIds;
+      return;
+    case "list_update":
+      delete before.description;
+      return;
+    case "list_delete":
+      delete before.repositoryIds;
+      return;
+    default:
+      throw new Error("Unexpected operation fixture");
+  }
+}
+
+function contradictSignedState(candidate: MutableRecord): void {
+  switch (candidate.kind) {
+    case "star":
+      mutableRecord(candidate.inverse).kind = "star";
+      return;
+    case "unstar":
+      mutableRecord(candidate.inverse).kind = "unstar";
+      return;
+    case "list_create": {
+      const preconditions = candidate.preconditions as readonly unknown[];
+      const expected = mutableRecord(mutableRecord(preconditions[0]).expected);
+      expected.listIds = [];
+      return;
+    }
+    case "list_update":
+      mutableRecord(candidate.inverse).name = "Contradictory";
+      return;
+    case "list_delete":
+      mutableRecord(candidate.inverse).repositoryIds = [];
+      return;
+    case "list_membership_set":
+      candidate.expectedListIds = [];
+      return;
+    default:
+      throw new Error("Unexpected operation fixture");
+  }
+}
+
+type HostileValidationCase = Readonly<{
+  kind: ResolvedOperation["kind"];
+  scenario: string;
+  candidate: MutableRecord;
+  hookCounter: { calls: number };
+}>;
+
+function hostileValidationCases(): readonly HostileValidationCase[] {
+  const cases: HostileValidationCase[] = [];
+  for (const operation of operationValidationFixtures()) {
+    const nestedAuthority = mutableOperation(operation);
+    mutableRecord(nestedAuthority.before).route =
+      "DELETE authority-secret endpoint";
+    cases.push({
+      kind: operation.kind,
+      scenario: "nested authority",
+      candidate: nestedAuthority,
+      hookCounter: { calls: 0 },
+    });
+
+    const missingState = mutableOperation(operation);
+    removeRequiredNestedState(missingState);
+    cases.push({
+      kind: operation.kind,
+      scenario: "missing required state",
+      candidate: missingState,
+      hookCounter: { calls: 0 },
+    });
+
+    const contradiction = mutableOperation(operation);
+    contradictSignedState(contradiction);
+    cases.push({
+      kind: operation.kind,
+      scenario: "contradictory signed state",
+      candidate: contradiction,
+      hookCounter: { calls: 0 },
+    });
+
+    const accessorCounter = { calls: 0 };
+    const nestedAccessor = mutableOperation(operation);
+    Object.defineProperty(mutableRecord(nestedAccessor.before), "document", {
+      enumerable: true,
+      get() {
+        accessorCounter.calls += 1;
+        throw new Error("accessor-secret");
+      },
+    });
+    cases.push({
+      kind: operation.kind,
+      scenario: "nested accessor",
+      candidate: nestedAccessor,
+      hookCounter: accessorCounter,
+    });
+
+    const proxyCounter = { calls: 0 };
+    const nestedProxy = mutableOperation(operation);
+    nestedProxy.before = new Proxy(mutableRecord(nestedProxy.before), {
+      get() {
+        proxyCounter.calls += 1;
+        throw new Error("proxy-secret");
+      },
+      getOwnPropertyDescriptor() {
+        proxyCounter.calls += 1;
+        throw new Error("proxy-secret");
+      },
+      ownKeys() {
+        proxyCounter.calls += 1;
+        throw new Error("proxy-secret");
+      },
+    });
+    cases.push({
+      kind: operation.kind,
+      scenario: "nested proxy",
+      candidate: nestedProxy,
+      hookCounter: proxyCounter,
+    });
+
+    const coercionCounter = { calls: 0 };
+    const nestedCoercion = mutableOperation(operation);
+    mutableRecord(nestedCoercion.before).endpoint = {
+      [Symbol.toPrimitive]() {
+        coercionCounter.calls += 1;
+        throw new Error("coercion-secret");
+      },
+    };
+    cases.push({
+      kind: operation.kind,
+      scenario: "nested coercion",
+      candidate: nestedCoercion,
+      hookCounter: coercionCounter,
+    });
+  }
+  return Object.freeze(cases);
 }
 
 describe("MutationExecutor live preconditions", () => {
@@ -514,6 +753,41 @@ describe("MutationExecutor live preconditions", () => {
     expect(proxyGitHub.reads).toEqual([]);
   });
 
+  it.each(hostileValidationCases())(
+    "rejects $kind $scenario before hooks, context, or GitHub",
+    async ({ candidate, hookCounter }) => {
+      const github = new StatefulGitHub();
+      const context = emptyExecutionContext();
+      context.createdListIdsByOperationId.set(
+        "op_seed",
+        asUserListId("UL_seed"),
+      );
+      let caught: unknown;
+      try {
+        await executor(github).prepare(
+          candidate as unknown as ResolvedOperation,
+          context,
+        );
+      } catch (error) {
+        caught = error;
+      }
+
+      expect(caught).toMatchObject({
+        code: "VALIDATION_ERROR",
+        retryable: false,
+      });
+      expect(JSON.stringify(caught)).not.toMatch(
+        /authority-secret|accessor-secret|proxy-secret|coercion-secret/u,
+      );
+      expect(hookCounter.calls).toBe(0);
+      expect(github.reads).toEqual([]);
+      expect(github.mutations).toEqual([]);
+      expect(context.createdListIdsByOperationId).toEqual(
+        new Map([["op_seed", asUserListId("UL_seed")]]),
+      );
+    },
+  );
+
   it.each([
     ["node ID", asRepositoryId("R_other"), repositoryDatabaseId],
     ["database ID", repositoryId, asRepositoryDatabaseId("999")],
@@ -595,6 +869,52 @@ describe("MutationExecutor live preconditions", () => {
     });
     expect(github.reads).toEqual([`getUserList:${listId}`]);
     expect(github.mutations).toEqual([]);
+  });
+
+  it("accepts bounded GitHub List descriptions without trimming signed state", async () => {
+    const description = " Before ";
+    const before = Object.freeze({
+      name: "Original",
+      description,
+      isPrivate: false,
+    });
+    const after = Object.freeze({
+      name: "Original",
+      description,
+      isPrivate: true,
+    });
+    const operation = Object.freeze({
+      ...common("op_update_description"),
+      kind: "list_update" as const,
+      listId,
+      preconditions: Object.freeze([
+        Object.freeze({ kind: "list_metadata", expected: before }),
+      ]),
+      before,
+      after,
+      inverse: Object.freeze({ kind: "list_update", ...before }),
+      risk: "normal" as const,
+    });
+    const github = new StatefulGitHub();
+    github.lists.set(
+      listId,
+      Object.freeze({
+        ...github.lists.get(listId)!,
+        description,
+      }),
+    );
+    const service = executor(github);
+    const context = emptyExecutionContext();
+
+    await expect(
+      service.dispatchPrepared(
+        await prepared(service, operation, context),
+        context,
+      ),
+    ).resolves.toMatchObject({
+      kind: "succeeded",
+      after: { name: "Original", description, isPrivate: true },
+    });
   });
 
   it("rejects a changed complete membership set before mutation", async () => {
@@ -859,6 +1179,38 @@ describe("MutationExecutor prepared dispatch", () => {
       retryable: false,
     });
     expect(github.mutations).toHaveLength(1);
+  });
+
+  it("requires a created List ID outside the signed baseline before recording context", async () => {
+    const github = new StatefulGitHub();
+    github.createdList = Object.freeze({
+      ...github.createdList,
+      listId,
+    });
+    const service = executor(github);
+    const context = emptyExecutionContext();
+    context.createdListIdsByOperationId.set("op_seed", asUserListId("UL_seed"));
+    const beforeContext = new Map(context.createdListIdsByOperationId);
+
+    await expect(
+      service.dispatchPrepared(
+        await prepared(service, createOperation(), context),
+        context,
+      ),
+    ).rejects.toMatchObject({
+      code: "RECONCILIATION_REQUIRED",
+      retryable: false,
+      details: {
+        operationId: "op_create",
+        mutationName: "createUserList",
+      },
+    });
+
+    expect(github.mutations.map((call) => call.kind)).toEqual([
+      "createUserList",
+    ]);
+    expect(github.reads).toEqual([`getUserList:${listId}`]);
+    expect(context.createdListIdsByOperationId).toEqual(beforeContext);
   });
 
   it("copies and freezes a successful mutation receipt", async () => {
