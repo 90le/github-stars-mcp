@@ -205,6 +205,27 @@ describe("Search query grammar", () => {
   });
 
   it.each([
+    ["language", "mcp -language:javascript"],
+    ["organization", "mcp -org:openai"],
+    ["topic at the start", "-topic:agents mcp"],
+    ["user", "mcp -user:octocat"],
+    ["stars", "mcp -stars:100"],
+    ["pushed", "mcp -pushed:>=2026-01-01"],
+    ["archived", "mcp -archived:true"],
+    ["fork", "mcp -fork:true"],
+    ["sort", "mcp -sort:stars"],
+  ])("rejects negated %s qualifier injection", (_label, query) => {
+    expect(() => buildSearchQuery(query, {})).toThrowError(AppError);
+  });
+
+  it.each(["state-of-the-art mcp", "mcp -javascript", "release-2026 -1"])(
+    "accepts ordinary hyphenated or minus text: %s",
+    (query) => {
+      expect(buildSearchQuery(query, {})).toBe(query);
+    },
+  );
+
+  it.each([
     ["empty query", "", {}],
     ["trimmed query", " mcp", {}],
     ["control query", "mcp\u0000", {}],

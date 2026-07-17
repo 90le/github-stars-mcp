@@ -97,7 +97,7 @@ const DECIMAL = /^(?:0|[1-9]\d*)$/u;
 const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/u;
 const TOPIC = /^[a-z0-9](?:[a-z0-9-]{0,48}[a-z0-9])?$/u;
 const PLAIN_LANGUAGE = /^[A-Za-z0-9][A-Za-z0-9.+#-]{0,99}$/u;
-const QUALIFIER_INJECTION = /(?:^|\s)[A-Za-z][A-Za-z0-9-]*:/u;
+const QUALIFIER_INJECTION = /(?:^|\s)-?[A-Za-z][A-Za-z0-9-]*:/u;
 const EMPTY_EVIDENCE = Object.freeze([]) as readonly EvidenceRecord[];
 
 type JsonObject = Readonly<Record<string, JsonValue>>;
