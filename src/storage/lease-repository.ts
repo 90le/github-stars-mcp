@@ -8,6 +8,7 @@ import { canonicalJsonClone } from "../domain/canonical-json.js";
 import { AppError } from "../domain/errors.js";
 import type { JsonValue } from "../domain/json.js";
 import { canonicalUtcTimestamp } from "../domain/timestamp.js";
+import { runInImmediateTransaction } from "./sqlite-transaction.js";
 
 interface LeaseRow {
   readonly name: string;
@@ -77,7 +78,7 @@ export class LeaseRepository {
   }
 
   #write<T>(operation: () => T): T {
-    return this.#database.transaction(operation).immediate();
+    return runInImmediateTransaction(this.#database, operation);
   }
 
   #row(name: string): LeaseRow | undefined {

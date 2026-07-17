@@ -67,7 +67,10 @@ function insertRepository(
   database.exec("COMMIT");
 }
 
-function insertPlanRunGraph(database: Database.Database): void {
+function insertPlanRunGraph(
+  database: Database.Database,
+  includeOperation = true,
+): void {
   insertAccountAndSnapshot(database);
   database
     .prepare(
@@ -98,17 +101,19 @@ function insertPlanRunGraph(database: Database.Database): void {
        )`,
     )
     .run(time);
-  database
-    .prepare(
-      `INSERT INTO run_operations(
-         run_id,plan_id,operation_id,sequence,status,reconciliation,attempts,
-         before_json,after_json,external_request_id,error_json,started_at,finished_at
-       ) VALUES (
-         'run_1','plan_1','op_1',0,'pending','not_required',0,
-         '{}','null',NULL,NULL,NULL,NULL
-       )`,
-    )
-    .run();
+  if (includeOperation) {
+    database
+      .prepare(
+        `INSERT INTO run_operations(
+           run_id,plan_id,operation_id,sequence,status,reconciliation,attempts,
+           before_json,after_json,external_request_id,error_json,started_at,finished_at
+         ) VALUES (
+           'run_1','plan_1','op_1',0,'pending','not_required',0,
+           '{}','null',NULL,NULL,NULL,NULL
+         )`,
+      )
+      .run();
+  }
 }
 
 describe("raw SQL relationship and JSON constraints", () => {
@@ -402,6 +407,59 @@ describe("raw SQL relationship and JSON constraints", () => {
 });
 
 describe("run attempt and reconciliation triggers", () => {
+  test("accepts only an initial pending operation projection", () => {
+    const database = migrated();
+    insertPlanRunGraph(database, false);
+    const insert = database.prepare(
+      `INSERT INTO run_operations(
+         run_id,plan_id,operation_id,sequence,status,reconciliation,attempts,
+         before_json,after_json,external_request_id,error_json,started_at,finished_at
+       ) VALUES (
+         'run_1','plan_1','op_1',0,@status,@reconciliation,@attempts,
+         '{}','null',NULL,NULL,@startedAt,NULL
+       )`,
+    );
+    expect(() =>
+      insert.run({
+        status: "running",
+        reconciliation: "pending",
+        attempts: 1,
+        startedAt: time,
+      }),
+    ).toThrow(/must be inserted pending/u);
+    expect(
+      database
+        .prepare(
+          `SELECT COUNT(*) FROM run_operations
+           WHERE run_id='run_1' AND operation_id='op_1'`,
+        )
+        .pluck()
+        .get(),
+    ).toBe(0);
+    expect(() =>
+      insert.run({
+        status: "pending",
+        reconciliation: "not_required",
+        attempts: 0,
+        startedAt: null,
+      }),
+    ).not.toThrow();
+    expect(
+      database
+        .prepare(
+          `SELECT status,reconciliation,attempts
+           FROM run_operations
+           WHERE run_id='run_1' AND operation_id='op_1'`,
+        )
+        .get(),
+    ).toEqual({
+      status: "pending",
+      reconciliation: "not_required",
+      attempts: 0,
+    });
+    database.close();
+  });
+
   test("requires an attempt to match the current running projection", () => {
     const database = migrated();
     insertPlanRunGraph(database);

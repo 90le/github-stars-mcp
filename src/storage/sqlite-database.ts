@@ -6,6 +6,10 @@ import {
   SQLITE_MIGRATIONS,
   type SqliteMigration,
 } from "./migrations.js";
+import {
+  runInImmediateTransaction,
+  runInNewImmediateTransaction,
+} from "./sqlite-transaction.js";
 
 function storageError(message: string, cause?: unknown): AppError {
   return new AppError("STORAGE_ERROR", message, {
@@ -125,6 +129,8 @@ export function openSqliteDatabase(path: string): Database.Database {
 export {
   migrateSqliteDatabase,
   migrationChecksum,
+  runInImmediateTransaction,
+  runInNewImmediateTransaction,
   SQLITE_MIGRATIONS,
   type SqliteMigration,
 };

@@ -73,6 +73,7 @@ import {
   type SqlFragment,
 } from "./filter-sql.js";
 import { LeaseRepository } from "./lease-repository.js";
+import { runInImmediateTransaction } from "./sqlite-transaction.js";
 
 interface SnapshotRow {
   readonly snapshot_id: string;
@@ -339,7 +340,7 @@ export class SnapshotRepository {
   }
 
   #write<T>(operation: () => T): T {
-    return this.#database.transaction(operation).immediate();
+    return runInImmediateTransaction(this.#database, operation);
   }
 
   #snapshotRow(id: SnapshotId | string): SnapshotRow | undefined {

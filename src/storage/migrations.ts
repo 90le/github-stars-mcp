@@ -7,6 +7,7 @@ import {
   initialMigration,
   SCHEMA_MIGRATIONS_SQL,
 } from "./migrations/001-initial.js";
+import { runInNewImmediateTransaction } from "./sqlite-transaction.js";
 
 export interface SqliteMigration {
   readonly version: number;
@@ -369,95 +370,85 @@ export function migrateSqliteDatabase(
     appliedAtInput,
     "migration appliedAt",
   );
-  if (database.inTransaction) {
-    throw migrationError("cannot migrate inside an existing transaction");
-  }
   const migrationSnapshot = snapshotMigrationDefinitions(migrations);
   for (let index = 0; index < migrationSnapshot.length; index += 1) {
     assertNoTransactionControl(migrationSnapshot[index]!.sql);
   }
 
   try {
-    database.exec("BEGIN IMMEDIATE");
-    database.exec(SCHEMA_MIGRATIONS_SQL);
+    runInNewImmediateTransaction(database, () => {
+      database.exec(SCHEMA_MIGRATIONS_SQL);
 
-    const rows = database
-      .prepare(
-        `SELECT version, name, checksum
-         FROM schema_migrations
-         ORDER BY version`,
-      )
-      .all() as MigrationRow[];
+      const rows = database
+        .prepare(
+          `SELECT version, name, checksum
+           FROM schema_migrations
+           ORDER BY version`,
+        )
+        .all() as MigrationRow[];
 
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index]!;
-      const expectedVersion = index + 1;
-      if (row.version !== expectedVersion) {
-        throw migrationError("schema migration ledger contains a gap");
+      for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index]!;
+        const expectedVersion = index + 1;
+        if (row.version !== expectedVersion) {
+          throw migrationError("schema migration ledger contains a gap");
+        }
+        const expected = migrationSnapshot[index];
+        if (expected === undefined) {
+          throw migrationError("database schema is newer than this binary");
+        }
+        if (
+          expected.version !== row.version ||
+          expected.name !== row.name ||
+          checksumMigrationSnapshot(expected) !== row.checksum
+        ) {
+          throw migrationError("schema migration checksum or name drift");
+        }
       }
-      const expected = migrationSnapshot[index];
-      if (expected === undefined) {
-        throw migrationError("database schema is newer than this binary");
-      }
-      if (
-        expected.version !== row.version ||
-        expected.name !== row.name ||
-        checksumMigrationSnapshot(expected) !== row.checksum
+
+      for (
+        let index = rows.length;
+        index < migrationSnapshot.length;
+        index += 1
       ) {
-        throw migrationError("schema migration checksum or name drift");
+        const migration = migrationSnapshot[index]!;
+        if (
+          migration.version !== index + 1 ||
+          migration.name.length === 0 ||
+          migration.name !== migration.name.trim()
+        ) {
+          throw migrationError("binary migration list is not contiguous");
+        }
+        database.exec(migration.sql);
+        if (!database.inTransaction) {
+          throw migrationError(
+            "migration SQL escaped the required outer transaction",
+          );
+        }
+        database
+          .prepare(
+            `INSERT INTO schema_migrations(version,name,checksum,applied_at)
+             VALUES (@version,@name,@checksum,@appliedAt)`,
+          )
+          .run({
+            version: migration.version,
+            name: migration.name,
+            checksum: checksumMigrationSnapshot(migration),
+            appliedAt,
+          });
       }
-    }
 
-    for (
-      let index = rows.length;
-      index < migrationSnapshot.length;
-      index += 1
-    ) {
-      const migration = migrationSnapshot[index]!;
-      if (
-        migration.version !== index + 1 ||
-        migration.name.length === 0 ||
-        migration.name !== migration.name.trim()
-      ) {
-        throw migrationError("binary migration list is not contiguous");
-      }
-      database.exec(migration.sql);
       if (!database.inTransaction) {
         throw migrationError(
           "migration SQL escaped the required outer transaction",
         );
       }
-      database
-        .prepare(
-          `INSERT INTO schema_migrations(version,name,checksum,applied_at)
-           VALUES (@version,@name,@checksum,@appliedAt)`,
-        )
-        .run({
-          version: migration.version,
-          name: migration.name,
-          checksum: checksumMigrationSnapshot(migration),
-          appliedAt,
-        });
-    }
-
-    if (!database.inTransaction) {
-      throw migrationError(
-        "migration SQL escaped the required outer transaction",
-      );
-    }
-    const violations = database.pragma("foreign_key_check");
-    if (!Array.isArray(violations) || violations.length > 0) {
-      throw migrationError("foreign key validation failed after migration");
-    }
-    database.exec("COMMIT");
-  } catch (error) {
-    if (database.inTransaction) {
-      try {
-        database.exec("ROLLBACK");
-      } catch {
-        // Preserve the primary failure.
+      const violations = database.pragma("foreign_key_check");
+      if (!Array.isArray(violations) || violations.length > 0) {
+        throw migrationError("foreign key validation failed after migration");
       }
-    }
+    });
+  } catch (error) {
     if (error instanceof AppError) throw error;
     throw migrationError("SQLite migration failed", error);
   }

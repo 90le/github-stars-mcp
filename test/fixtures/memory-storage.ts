@@ -63,6 +63,7 @@ import {
   parseChangePlan,
   transitionPlanState,
   type ChangePlan,
+  type PlanExecutableContent,
   type PlanState,
 } from "../../src/domain/plan.js";
 import {
@@ -626,6 +627,33 @@ function sameBinding(left: AccountBinding, right: AccountBinding): boolean {
   return bindingKey(left) === bindingKey(right);
 }
 
+function planRequiresCompleteListCoverage(
+  executable: PlanExecutableContent,
+): boolean {
+  if (executable.protectedListIds.length > 0) return true;
+  for (let index = 0; index < executable.operations.length; index += 1) {
+    const operation = executable.operations[index]!;
+    if (
+      operation.kind === "list_create" ||
+      operation.kind === "list_update" ||
+      operation.kind === "list_delete" ||
+      operation.kind === "list_membership_set"
+    ) {
+      return true;
+    }
+    for (
+      let preconditionIndex = 0;
+      preconditionIndex < operation.preconditions.length;
+      preconditionIndex += 1
+    ) {
+      if (operation.preconditions[preconditionIndex]?.kind !== "star_state") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function parseBinding(input: JsonValue): AccountBinding {
   const root = safeObject(
     input,
@@ -737,6 +765,10 @@ function binaryCompare(left: string, right: string): number {
     MEMORY_INTRINSICS.bufferFrom(left, "utf8"),
     MEMORY_INTRINSICS.bufferFrom(right, "utf8"),
   );
+}
+
+function lexicalCompare(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function metadataClone(
@@ -1030,6 +1062,12 @@ function recoveryError(kind: "pending" | "running"): SerializedDomainError {
 }
 
 function recoverRun(state: MemoryState, record: RunRecord, now: string): void {
+  if (now < record.run.startedAt) {
+    return failure(
+      "PRECONDITION_FAILED",
+      "run recovery time precedes run start",
+    );
+  }
   const runId = record.run.id;
   const operations = mapGet(state.operations, runId);
   if (operations !== undefined) {
@@ -1054,37 +1092,60 @@ function recoverRun(state: MemoryState, record: RunRecord, now: string): void {
           }),
         );
       } else if (operation.status === "running") {
+        if (operation.startedAt === null || now < operation.startedAt) {
+          return failure(
+            "PRECONDITION_FAILED",
+            "operation recovery time precedes its start",
+          );
+        }
         const error = recoveryError("running");
-        const recovered = parseRunOperation({
-          ...operation,
-          status: "unresolved",
-          reconciliation: "unknown",
-          after: null,
-          externalRequestId: null,
-          error,
-          finishedAt: now,
-        });
-        mapSet(operations, id, recovered);
         const attempts = mapGet(state.attempts, operationKey(runId, id));
         const attempt =
           attempts === undefined
             ? undefined
             : mapGet(attempts, operation.attempts);
-        if (attempts !== undefined && attempt?.status === "running") {
-          mapSet(
-            attempts,
-            operation.attempts,
-            parseRunOperationAttempt({
-              ...attempt,
-              status: "unresolved",
-              reconciliation: "unknown",
-              after: null,
-              externalRequestId: null,
-              error,
-              finishedAt: now,
-            }),
+        if (
+          attempts === undefined ||
+          attempt?.status !== "running" ||
+          attempt.reconciliation !== "pending"
+        ) {
+          return failure(
+            "PRECONDITION_FAILED",
+            "running operation has no current attempt",
           );
         }
+        if (now < attempt.startedAt) {
+          return failure(
+            "PRECONDITION_FAILED",
+            "running operation has no recoverable current attempt",
+          );
+        }
+        mapSet(
+          attempts,
+          operation.attempts,
+          parseRunOperationAttempt({
+            ...attempt,
+            status: "unresolved",
+            reconciliation: "unknown",
+            after: null,
+            externalRequestId: null,
+            error,
+            finishedAt: now,
+          }),
+        );
+        mapSet(
+          operations,
+          id,
+          parseRunOperation({
+            ...operation,
+            status: "unresolved",
+            reconciliation: "unknown",
+            after: null,
+            externalRequestId: null,
+            error,
+            finishedAt: now,
+          }),
+        );
       }
     }
   }
@@ -1822,16 +1883,38 @@ export function createMemoryStorage(
             "a new plan must be in ready state",
           );
         }
+        const source = mapGet(target.snapshots, plan.executable.snapshotId);
+        if (source === undefined) {
+          return failure("NOT_FOUND", "plan source snapshot was not found");
+        }
+        if (source.snapshot.status !== "complete") {
+          return failure(
+            "PRECONDITION_FAILED",
+            "plan source snapshot is not complete",
+          );
+        }
+        if (!sameBinding(source.snapshot.binding, plan.executable.binding)) {
+          return failure(
+            "PRECONDITION_FAILED",
+            "plan binding does not match source snapshot",
+          );
+        }
+        if (
+          planRequiresCompleteListCoverage(plan.executable) &&
+          source.snapshot.listCoverage !== "complete"
+        ) {
+          return failure(
+            "CAPABILITY_UNAVAILABLE",
+            "plan requires complete List coverage",
+          );
+        }
         const current = mapGet(target.plans, plan.id);
         if (current !== undefined) {
           if (
             canonicalJson({ ...current, state: "ready" }) !==
             canonicalJson(plan)
           ) {
-            return failure(
-              "PRECONDITION_FAILED",
-              "plan immutable content does not match",
-            );
+            return failure("PRECONDITION_FAILED", "plan_id is immutable");
           }
           return undefined;
         }
@@ -1995,8 +2078,9 @@ export function createMemoryStorage(
         assertLeaseCore(target, guard);
         const isResume = record.run.state === "partial" && next === "running";
         if (
-          record.leaseName !== guard.name ||
-          (!isResume && record.leaseOwnerId !== guard.ownerId)
+          !isResume &&
+          (record.leaseName !== guard.name ||
+            record.leaseOwnerId !== guard.ownerId)
         ) {
           return failure(
             "PRECONDITION_FAILED",
@@ -2952,41 +3036,57 @@ export function createMemoryStorage(
       (...args: unknown[]) => unknown
     >();
     const target = MEMORY_INTRINSICS.objectCreate(null) as object;
-    const revocable = MEMORY_INTRINSICS.proxyRevocable(target, {
-      get(_target, property) {
-        if (!token.active) {
-          return failure(
-            "PRECONDITION_FAILED",
-            "transaction facade is revoked",
-          );
-        }
-        if (
-          typeof property !== "string" ||
-          !arrayIncludes(TRANSACTION_METHODS, property as TransactionMethodName)
-        ) {
-          return undefined;
-        }
-        const cached = mapGet(methodCache, property);
-        if (cached !== undefined) return cached;
-        const method = (...args: unknown[]): unknown => {
+    MEMORY_INTRINSICS.objectFreeze(target);
+    const handler = MEMORY_INTRINSICS.objectCreate(
+      null,
+    ) as ProxyHandler<object>;
+    MEMORY_INTRINSICS.objectDefineProperties(handler, {
+      get: {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: (_target: object, property: string | symbol) => {
           if (!token.active) {
             return failure(
               "PRECONDITION_FAILED",
               "transaction facade is revoked",
             );
           }
-          return callCore(property as TransactionMethodName, working, args);
-        };
-        mapSet(methodCache, property, method);
-        return method;
+          if (
+            typeof property !== "string" ||
+            !arrayIncludes(
+              TRANSACTION_METHODS,
+              property as TransactionMethodName,
+            )
+          ) {
+            return undefined;
+          }
+          const cached = mapGet(methodCache, property);
+          if (cached !== undefined) return cached;
+          const method = (...args: unknown[]): unknown => {
+            if (!token.active) {
+              return failure(
+                "PRECONDITION_FAILED",
+                "transaction facade is revoked",
+              );
+            }
+            return callCore(property as TransactionMethodName, working, args);
+          };
+          mapSet(methodCache, property, method);
+          return method;
+        },
       },
-      has(_target, property) {
-        return (
+      has: {
+        configurable: false,
+        enumerable: false,
+        writable: false,
+        value: (_target: object, property: string | symbol) =>
           typeof property === "string" &&
-          arrayIncludes(TRANSACTION_METHODS, property as TransactionMethodName)
-        );
+          arrayIncludes(TRANSACTION_METHODS, property as TransactionMethodName),
       },
     });
+    MEMORY_INTRINSICS.objectFreeze(handler);
+    const revocable = MEMORY_INTRINSICS.proxyRevocable(target, handler);
     const facade = revocable.proxy as StorageTransaction;
     const revoke = revocable.revoke;
     try {
@@ -3034,6 +3134,12 @@ export function createMemoryStorage(
     );
     for (let index = 0; index < candidates.length; index += 1) {
       const record = candidates[index] as SnapshotRecord;
+      if (now < record.snapshot.startedAt) {
+        return failure(
+          "PRECONDITION_FAILED",
+          "snapshot recovery time precedes snapshot start",
+        );
+      }
       record.snapshot = parseSnapshot({
         ...record.snapshot,
         status: "failed",
@@ -3072,7 +3178,7 @@ export function createMemoryStorage(
       recoverRun(target, record, now);
       appendInternalArray(recovered, record.run.id);
     }
-    return MEMORY_INTRINSICS.objectFreeze(arraySort(recovered, binaryCompare));
+    return MEMORY_INTRINSICS.objectFreeze(arraySort(recovered, lexicalCompare));
   }
 
   const root = MEMORY_INTRINSICS.objectCreate(null) as Record<string, unknown>;
@@ -3153,7 +3259,9 @@ export function createMemoryStorage(
               left.run.startedAt,
               [right.run.startedAt],
             );
-            return time === 0 ? binaryCompare(left.run.id, right.run.id) : time;
+            return time === 0
+              ? lexicalCompare(left.run.id, right.run.id)
+              : time;
           },
         );
         const items = arrayMap(arraySlice(runs, 0, limit), ({ run }) => {

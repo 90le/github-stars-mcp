@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
+import type Database from "better-sqlite3";
 import { describe, expect, test } from "vitest";
 import { AppError } from "../../../src/domain/errors.js";
 import {
@@ -115,6 +116,92 @@ describe("RuntimeSecretRepository", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("wipes selected bytes when the transaction fails after key validation", () => {
+    const primary = new Error("simulated commit failure");
+    const selected = Buffer.alloc(32, 7);
+    let generated: Buffer | undefined;
+    const database = {
+      inTransaction: false,
+      prepare(sql: string) {
+        return sql.includes("INSERT INTO runtime_secrets")
+          ? {
+              run(input: unknown) {
+                generated = (input as { readonly value: Buffer }).value;
+              },
+            }
+          : {
+              get() {
+                return {
+                  value: selected,
+                  storage_type: "blob",
+                  byte_length: 32,
+                };
+              },
+            };
+      },
+      transaction(callback: () => unknown) {
+        return {
+          immediate() {
+            callback();
+            throw primary;
+          },
+        };
+      },
+    } as unknown as Database.Database;
+
+    let thrown: unknown;
+    try {
+      new RuntimeSecretRepository(database).getOrCreateCursorSigningKey(
+        "2026-07-16T00:00:01.000Z",
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AppError);
+    expect((thrown as AppError).cause).toBe(primary);
+    expect(generated).toBeDefined();
+    expect(Array.from(generated ?? [])).toEqual(new Array(32).fill(0));
+    expect(Array.from(selected)).toEqual(new Array(32).fill(0));
+  });
+
+  test("does not replace a primary failure when best-effort wiping cannot fill detached bytes", () => {
+    const primary = new Error("simulated database failure");
+    let generated: Buffer | undefined;
+    const database = {
+      inTransaction: false,
+      prepare() {
+        return {
+          run(input: unknown) {
+            generated = (input as { readonly value: Buffer }).value;
+            structuredClone(generated.buffer, {
+              transfer: [generated.buffer as ArrayBuffer],
+            });
+            throw primary;
+          },
+        };
+      },
+      transaction(callback: () => unknown) {
+        return {
+          immediate() {
+            callback();
+          },
+        };
+      },
+    } as unknown as Database.Database;
+
+    let thrown: unknown;
+    try {
+      new RuntimeSecretRepository(database).getOrCreateCursorSigningKey(
+        "2026-07-16T00:00:01.000Z",
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(AppError);
+    expect((thrown as AppError).cause).toBe(primary);
+    expect(generated?.byteLength).toBe(0);
   });
 
   test(

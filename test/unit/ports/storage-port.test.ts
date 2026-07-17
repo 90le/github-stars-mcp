@@ -42,6 +42,10 @@ import {
   createMemoryStorage,
   registerRepositoryVersionForTest,
 } from "../../fixtures/memory-storage.js";
+import {
+  defineStoragePortContract,
+  seedCompleteSnapshot,
+} from "../../contracts/storage-port.contract.js";
 
 const SYNC_GUARD = {
   name: "sync:U_1",
@@ -60,6 +64,22 @@ function openStore(): StoragePort {
   store.migrate();
   return store;
 }
+
+function openPlanStore(): StoragePort {
+  const store = openStore();
+  seedCompleteSnapshot(store);
+  return store;
+}
+
+defineStoragePortContract("memory", () => {
+  const store = openStore();
+  return {
+    store,
+    cleanup() {
+      store.close();
+    },
+  };
+});
 
 const definePropertyForTest = Object.defineProperty;
 const deletePropertyForTest = Reflect.deleteProperty;
@@ -212,6 +232,11 @@ function twoItemBatch(): SnapshotBatch {
 }
 
 function prepareRun(store: StoragePort): void {
+  if (
+    store.getCompleteSnapshot(changePlanFixture.executable.snapshotId) === null
+  ) {
+    seedCompleteSnapshot(store);
+  }
   store.acquireLease({
     name: APPLY_GUARD.name,
     ownerId: APPLY_GUARD.ownerId,
@@ -258,7 +283,7 @@ function unknownError() {
 
 describe("synchronous revocable transactions", () => {
   test("commits synchronously and revokes leaked facades", () => {
-    const store = openStore();
+    const store = openPlanStore();
     let leaked: StorageTransaction | undefined;
     expect(
       store.withTransaction((tx) => {
@@ -283,7 +308,7 @@ describe("synchronous revocable transactions", () => {
       }),
     ];
     for (const result of transactionResults) {
-      const store = openStore();
+      const store = openPlanStore();
       expect(() =>
         store.withTransaction((tx) => {
           tx.savePlan(changePlanFixture);
@@ -293,7 +318,7 @@ describe("synchronous revocable transactions", () => {
       expect(store.getPlan(changePlanFixture.id)).toBeNull();
     }
 
-    const store = openStore();
+    const store = openPlanStore();
     let getterCalls = 0;
     const accessorThen = {};
     Object.defineProperty(accessorThen, "then", {
@@ -324,7 +349,7 @@ describe("synchronous revocable transactions", () => {
   });
 
   test("rejects dangerous return graphs before prototype traps can commit", () => {
-    const trapStore = openStore();
+    const trapStore = openPlanStore();
     let reentryCaught = 0;
     let getTrapCalls = 0;
     const proxyPrototype = new Proxy(Object.create(null) as object, {
@@ -358,7 +383,7 @@ describe("synchronous revocable transactions", () => {
     expect(getTrapCalls).toBe(0);
     expect(trapStore.getPlan(changePlanFixture.id)).toBeNull();
 
-    const nestedStore = openStore();
+    const nestedStore = openPlanStore();
     expect(() =>
       nestedStore.withTransaction((tx) => {
         tx.savePlan(changePlanFixture);
@@ -440,7 +465,7 @@ describe("synchronous revocable transactions", () => {
     ] as const;
 
     for (const result of dangerousResults) {
-      const store = openStore();
+      const store = openPlanStore();
       expect(() =>
         store.withTransaction((tx) => {
           tx.savePlan(changePlanFixture);
@@ -498,7 +523,7 @@ describe("synchronous revocable transactions", () => {
     ] as const;
 
     for (const result of recognizableResults) {
-      const store = openStore();
+      const store = openPlanStore();
       expect(() =>
         store.withTransaction((tx) => {
           tx.savePlan(changePlanFixture);
@@ -513,8 +538,8 @@ describe("synchronous revocable transactions", () => {
   test("captures exotic brand predicates before callbacks can replace them", () => {
     const originalIsProxy = utilTypes.isProxy;
     const originalIsMap = utilTypes.isMap;
-    const proxyStore = openStore();
-    const mapStore = openStore();
+    const proxyStore = openPlanStore();
+    const mapStore = openPlanStore();
     let proxyTrapCalls = 0;
     const disguisedProxy = new Proxy(
       {},
@@ -615,7 +640,7 @@ describe("synchronous revocable transactions", () => {
     }
     const disguised = new HiddenResult();
     Object.setPrototypeOf(disguised, null);
-    const store = openStore();
+    const store = openPlanStore();
 
     const returned = store.withTransaction((tx) => {
       tx.savePlan(changePlanFixture);
@@ -634,7 +659,7 @@ describe("synchronous revocable transactions", () => {
   test("returns primitives by value and canonical objects as frozen detached clones", () => {
     const primitives = [undefined, null, true, 42, "committed"] as const;
     for (const primitive of primitives) {
-      const store = openStore();
+      const store = openPlanStore();
       expect(
         store.withTransaction((tx) => {
           tx.savePlan(changePlanFixture);
@@ -650,7 +675,7 @@ describe("synchronous revocable transactions", () => {
         status: "committed",
       },
     );
-    const nullPrototypeStore = openStore();
+    const nullPrototypeStore = openPlanStore();
     const clonedNullPrototype = nullPrototypeStore.withTransaction((tx) => {
       tx.savePlan(changePlanFixture);
       return nullPrototype;
@@ -661,7 +686,7 @@ describe("synchronous revocable transactions", () => {
     expect(Object.isFrozen(clonedNullPrototype)).toBe(true);
 
     const arraySource = [{ status: "committed" }];
-    const arrayStore = openStore();
+    const arrayStore = openPlanStore();
     const clonedArray = arrayStore.withTransaction((tx) => {
       tx.savePlan(changePlanFixture);
       return arraySource;
@@ -676,7 +701,7 @@ describe("synchronous revocable transactions", () => {
       nested: { status: "committed" },
       rows: [{ value: 1 }],
     };
-    const store = openStore();
+    const store = openPlanStore();
     const returned = store.withTransaction((tx) => {
       tx.savePlan(changePlanFixture);
       return source;
@@ -708,7 +733,7 @@ describe("synchronous revocable transactions", () => {
       nested: { status: "committed" },
       rows: [{ value: 1 }],
     };
-    const store = openStore();
+    const store = openPlanStore();
     let returned: typeof source | undefined;
     let caught: unknown;
     let restoreJsonParse: (() => void) | undefined;
@@ -813,7 +838,7 @@ describe("synchronous revocable transactions", () => {
       );
     }
 
-    const store = openStore();
+    const store = openPlanStore();
     let returned:
       | {
           canonical: string;
@@ -958,7 +983,7 @@ describe("synchronous revocable transactions", () => {
   /* eslint-enable @typescript-eslint/unbound-method */
 
   test("poisons caught root reentry and nested transactions", () => {
-    const store = openStore();
+    const store = openPlanStore();
     expect(() =>
       store.withTransaction((tx) => {
         tx.savePlan(changePlanFixture);
@@ -988,7 +1013,7 @@ describe("synchronous revocable transactions", () => {
 
   test("captures structuredClone before callers can alias transaction state", () => {
     const originalStructuredClone = globalThis.structuredClone;
-    const store = openStore();
+    const store = openPlanStore();
     const restoreStructuredClone = replaceOwnPropertyForTest(
       globalThis,
       "structuredClone",
@@ -1011,7 +1036,7 @@ describe("synchronous revocable transactions", () => {
   });
 
   test("captures transaction constructors before callers can replace them", () => {
-    const store = openStore();
+    const store = openPlanStore();
     const restorers = [
       replaceOwnPropertyForTest(
         globalThis,
@@ -1083,6 +1108,7 @@ describe("synchronous revocable transactions", () => {
         cursorKey: new Uint8Array(32).fill(7),
       });
       store.migrate();
+      seedCompleteSnapshot(store);
       let callbackCount = 0;
       expect(() =>
         store.withTransaction(() => {
@@ -1114,7 +1140,7 @@ describe("synchronous revocable transactions", () => {
     const originalMapSet = Map.prototype.set;
     const originalMapClear = Map.prototype.clear;
     const applyForTest = Reflect.apply;
-    const store = openStore();
+    const store = openPlanStore();
     let leakedPlanMap: Map<unknown, unknown> | undefined;
     let restoreMapSet: (() => void) | undefined;
     const rememberLeakedPlanMap = (value: Map<unknown, unknown>): void => {
@@ -2316,7 +2342,7 @@ describe("plans, runs, attempts, reconciliation, and audit bounds", () => {
   });
 
   test("validates all requested CAS edges before reading and requires fresh finish times", () => {
-    const store = openStore();
+    const store = openPlanStore();
     store.acquireLease({
       name: APPLY_GUARD.name,
       ownerId: APPLY_GUARD.ownerId,
@@ -2575,6 +2601,7 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
 
   test("rolls back targeted run recovery and classifies pending rows before dispatch", () => {
     const store = openStore();
+    seedCompleteSnapshot(store);
     const leaseName = "apply:atomic";
     store.acquireLease({
       name: leaseName,
@@ -2678,6 +2705,7 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
 
   test("bounds incomplete summaries while reporting full totals and status counts", () => {
     const store = openStore();
+    seedCompleteSnapshot(store);
     store.acquireLease({
       name: APPLY_GUARD.name,
       ownerId: APPLY_GUARD.ownerId,
@@ -2718,6 +2746,48 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
       unresolved: 0,
     });
     expect(Object.isFrozen(result)).toBe(true);
+  });
+
+  test("orders Task 8 run summaries and recovery by JS UTF-16 code units", () => {
+    const store = openStore();
+    seedCompleteSnapshot(store);
+    store.acquireLease({
+      name: APPLY_GUARD.name,
+      ownerId: APPLY_GUARD.ownerId,
+      now: "2026-07-16T02:00:00.000Z",
+      expiresAt: "2026-07-16T02:10:00.000Z",
+    });
+    const runIds = ["run_𐀀", "run_\uE000"] as const;
+    for (let index = 0; index < runIds.length; index += 1) {
+      const plan = parseChangePlan({
+        ...changePlanFixture,
+        id: `plan_unicode_${String(index)}`,
+      });
+      const run = parseChangeRun({
+        ...changeRunFixture,
+        id: runIds[index],
+        planId: plan.id,
+      });
+      store.savePlan(plan);
+      store.compareAndSetPlanState({
+        planId: plan.id,
+        expected: ["ready"],
+        next: "applying",
+      });
+      store.createRun({ run, lease: APPLY_GUARD });
+    }
+
+    expect(
+      store
+        .getIncompleteRunSummaries({
+          binding: accountBindingFixture,
+          limit: 10,
+        })
+        .items.map(({ runId }) => runId),
+    ).toEqual(runIds);
+    expect(store.recoverInterruptedRuns("2026-07-16T02:11:00.000Z")).toEqual(
+      runIds,
+    );
   });
 });
 
@@ -3008,6 +3078,7 @@ describe("recovery isolation from mutable realm hooks", () => {
   test("captures structuredClone so targeted run recovery rolls back before a later candidate failure", () => {
     const originalStructuredClone = globalThis.structuredClone;
     const store = openStore();
+    seedCompleteSnapshot(store);
     const leaseName = "apply:clone-atomic";
     store.acquireLease({
       name: leaseName,

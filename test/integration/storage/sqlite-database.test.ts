@@ -3,9 +3,12 @@ import { spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { AppError } from "../../../src/domain/errors.js";
 import {
   migrateSqliteDatabase,
   openSqliteDatabase,
+  runInImmediateTransaction,
+  runInNewImmediateTransaction,
   sqliteVersionAtLeast,
 } from "../../../src/storage/sqlite-database.js";
 
@@ -66,6 +69,57 @@ afterEach(() => {
 });
 
 describe("SQLite connection hardening", () => {
+  test("uses a SAVEPOINT so a caught inner failure cannot leak into an outer commit", () => {
+    const database = openSqliteDatabase(":memory:");
+    database.exec(
+      "CREATE TABLE transaction_probe(value TEXT PRIMARY KEY) STRICT",
+    );
+
+    runInNewImmediateTransaction(database, () => {
+      database
+        .prepare("INSERT INTO transaction_probe(value) VALUES (?)")
+        .run("outer");
+      expect(() =>
+        runInImmediateTransaction(database, () => {
+          database
+            .prepare("INSERT INTO transaction_probe(value) VALUES (?)")
+            .run("inner");
+          throw new Error("rollback inner");
+        }),
+      ).toThrow(/rollback inner/u);
+      database
+        .prepare("INSERT INTO transaction_probe(value) VALUES (?)")
+        .run("outer-after-catch");
+    });
+
+    expect(
+      database
+        .prepare("SELECT value FROM transaction_probe ORDER BY value")
+        .pluck()
+        .all(),
+    ).toEqual(["outer", "outer-after-catch"]);
+    database.close();
+  });
+
+  test("requires a new immediate transaction to start at the top level", () => {
+    const database = openSqliteDatabase(":memory:");
+    expect(
+      runInNewImmediateTransaction(database, () => database.inTransaction),
+    ).toBe(true);
+
+    database.exec("BEGIN IMMEDIATE");
+    let caught: unknown;
+    try {
+      runInNewImmediateTransaction(database, () => undefined);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AppError);
+    expect((caught as AppError).code).toBe("PRECONDITION_FAILED");
+    database.exec("ROLLBACK");
+    database.close();
+  });
+
   test("compares SQLite versions numerically rather than lexically", () => {
     expect(sqliteVersionAtLeast("3.38.0", [3, 38, 0])).toBe(true);
     expect(sqliteVersionAtLeast("3.100.0", [3, 38, 0])).toBe(true);
