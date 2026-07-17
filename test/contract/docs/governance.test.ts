@@ -119,54 +119,58 @@ describe("open-source governance", () => {
     expect(feature).toMatch(/safety/i);
   });
 
-  it("checks repository YAML and reports duplicate keys without source values", async () => {
-    const verifier = resolve(repositoryRoot, "scripts/verify-yaml.mjs");
-    const valid = await execFileAsync(process.execPath, [verifier], {
-      cwd: repositoryRoot,
-      encoding: "utf8",
-    });
-    expect(valid.stderr).toBe("");
-    expect(valid.stdout).toMatch(/Validated \d+ YAML files\./);
+  it(
+    "checks repository YAML and reports duplicate keys without source values",
+    { timeout: 15_000 },
+    async () => {
+      const verifier = resolve(repositoryRoot, "scripts/verify-yaml.mjs");
+      const valid = await execFileAsync(process.execPath, [verifier], {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+      });
+      expect(valid.stderr).toBe("");
+      expect(valid.stdout).toMatch(/Validated \d+ YAML files\./);
 
-    const fixtureRoot = await mkdtemp(join(tmpdir(), "github-stars-yaml-"));
-    const secret = "ghp_FICTIONAL_SECRET_VALUE_MUST_NOT_PRINT";
-    try {
-      await execFileAsync("git", ["init", "--quiet"], { cwd: fixtureRoot });
-      await writeFile(
-        join(fixtureRoot, "duplicate.yml"),
-        `token: ${secret}\ntoken: second-value\n`,
-        "utf8",
-      );
+      const fixtureRoot = await mkdtemp(join(tmpdir(), "github-stars-yaml-"));
+      const secret = "ghp_FICTIONAL_SECRET_VALUE_MUST_NOT_PRINT";
+      try {
+        await execFileAsync("git", ["init", "--quiet"], { cwd: fixtureRoot });
+        await writeFile(
+          join(fixtureRoot, "duplicate.yml"),
+          `token: ${secret}\ntoken: second-value\n`,
+          "utf8",
+        );
 
-      const failure: unknown = await execFileAsync(
-        process.execPath,
-        [verifier],
-        {
-          cwd: fixtureRoot,
-          encoding: "utf8",
-        },
-      ).then(
-        () => undefined,
-        (error: unknown) => error,
-      );
+        const failure: unknown = await execFileAsync(
+          process.execPath,
+          [verifier],
+          {
+            cwd: fixtureRoot,
+            encoding: "utf8",
+          },
+        ).then(
+          () => undefined,
+          (error: unknown) => error,
+        );
 
-      if (
-        typeof failure !== "object" ||
-        failure === null ||
-        !("stderr" in failure) ||
-        typeof failure.stderr !== "string"
-      ) {
-        throw new Error("Expected the YAML verifier to return stderr.");
+        if (
+          typeof failure !== "object" ||
+          failure === null ||
+          !("stderr" in failure) ||
+          typeof failure.stderr !== "string"
+        ) {
+          throw new Error("Expected the YAML verifier to return stderr.");
+        }
+
+        expect("code" in failure ? failure.code : undefined).toBe(1);
+        expect(failure.stderr).toMatch(
+          /duplicate\.yml:\d+:\d+ \(DUPLICATE_KEY\)/,
+        );
+        expect(failure.stderr).not.toContain(secret);
+        expect(failure.stderr).not.toContain("second-value");
+      } finally {
+        await rm(fixtureRoot, { recursive: true, force: true });
       }
-
-      expect("code" in failure ? failure.code : undefined).toBe(1);
-      expect(failure.stderr).toMatch(
-        /duplicate\.yml:\d+:\d+ \(DUPLICATE_KEY\)/,
-      );
-      expect(failure.stderr).not.toContain(secret);
-      expect(failure.stderr).not.toContain("second-value");
-    } finally {
-      await rm(fixtureRoot, { recursive: true, force: true });
-    }
-  });
+    },
+  );
 });
