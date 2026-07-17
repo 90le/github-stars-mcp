@@ -294,6 +294,11 @@ depth at 20, replaces secret substrings and values under case-insensitive
 `[REDACTED]`, never invokes getters, and stringifies unsupported values.
 Secret-array inspection examines every numeric index descriptor regardless of
 enumerability and fails closed for holes, accessors, or malformed entries.
+`AppError` snapshots a valid registry through that same descriptor-only path;
+it never spreads, iterates, or indexes the caller's array. Invalid registries
+remain invalid through an internal frozen sentinel so both `serializeError`
+and direct JSON serialization fully redact without invoking getters or custom
+iterators.
 Redacted arrays are dense `JsonValue[]` values: sparse, non-enumerable, or
 accessor indices become a JSON-safe marker without invoking accessors.
 `serializeError` omits stack/cause and maps unknown errors to `INTERNAL_ERROR`.
