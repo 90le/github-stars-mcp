@@ -525,8 +525,6 @@ CREATE INDEX snapshots_recovery_lease
   ON snapshots(status,lease_name,lease_owner_id,started_at,snapshot_id);
 CREATE INDEX snapshot_repositories_version
   ON snapshot_repositories(repository_id,version_hash);
-CREATE INDEX snapshot_stars_page
-  ON snapshot_stars(snapshot_id,repository_id);
 CREATE INDEX user_lists_order
   ON user_lists(snapshot_id,name COLLATE BINARY,list_id);
 CREATE INDEX staging_memberships_reverse
@@ -543,10 +541,6 @@ CREATE INDEX run_operations_plan
   ON run_operations(plan_id,operation_id,run_id);
 CREATE INDEX runs_recovery_lease
   ON runs(state,lease_name,lease_owner_id,started_at,run_id);
-CREATE INDEX run_attempts_sequence
-  ON run_operation_attempts(run_id,operation_id,attempt);
-CREATE INDEX reconciliations_sequence
-  ON run_operation_reconciliations(run_id,operation_id,event_sequence);
 CREATE INDEX reconciliations_attempt
   ON run_operation_reconciliations(run_id,operation_id,attempt,event_sequence);
 

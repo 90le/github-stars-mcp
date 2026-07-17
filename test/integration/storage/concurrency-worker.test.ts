@@ -7,32 +7,52 @@ import {
   migrateSqliteDatabase,
   openSqliteDatabase,
 } from "../../../src/storage/sqlite-database.js";
+import { prepareStateDirectory } from "../../../src/storage/state-directory.js";
 
 const mode = process.env.GITHUB_STARS_CONCURRENCY_MODE;
 const workerId = process.env.GITHUB_STARS_CONCURRENCY_WORKER_ID;
 const databasePath = process.env.GITHUB_STARS_CONCURRENCY_DATABASE;
 const coordinationDirectory = process.env.GITHUB_STARS_CONCURRENCY_COORDINATION;
+const stateRoot = process.env.GITHUB_STARS_CONCURRENCY_STATE_ROOT;
 const enabled =
-  (mode === "migration" || mode === "secret") &&
+  (mode === "migration" || mode === "secret" || mode === "state") &&
   (workerId === "1" || workerId === "2") &&
-  typeof databasePath === "string" &&
-  typeof coordinationDirectory === "string";
+  typeof coordinationDirectory === "string" &&
+  (mode === "state"
+    ? typeof stateRoot === "string"
+    : typeof databasePath === "string");
 
 test.skipIf(!enabled)(
   "coordinates one real external SQLite worker",
   async () => {
-    const readyPath = join(coordinationDirectory!, `ready-${workerId!}`);
-    writeFileSync(readyPath, "ready", { encoding: "utf8", flag: "wx" });
-    const deadline = Date.now() + 15_000;
-    while (
-      (!existsSync(join(coordinationDirectory!, "ready-1")) ||
-        !existsSync(join(coordinationDirectory!, "ready-2"))) &&
-      Date.now() < deadline
-    ) {
-      await delay(10);
+    const synchronize = async (label: string): Promise<void> => {
+      writeFileSync(
+        join(coordinationDirectory!, `${label}-${workerId!}`),
+        "ready",
+        { encoding: "utf8", flag: "wx" },
+      );
+      const deadline = Date.now() + 15_000;
+      while (
+        (!existsSync(join(coordinationDirectory!, `${label}-1`)) ||
+          !existsSync(join(coordinationDirectory!, `${label}-2`))) &&
+        Date.now() < deadline
+      ) {
+        await delay(10);
+      }
+      expect(existsSync(join(coordinationDirectory!, `${label}-1`))).toBe(true);
+      expect(existsSync(join(coordinationDirectory!, `${label}-2`))).toBe(true);
+    };
+
+    await synchronize("ready");
+
+    if (mode === "state") {
+      for (let index = 0; index < 8; index += 1) {
+        await synchronize(`state-ready-${String(index)}`);
+        prepareStateDirectory(join(stateRoot!, `round-${String(index)}`));
+        await synchronize(`state-done-${String(index)}`);
+      }
+      return;
     }
-    expect(existsSync(join(coordinationDirectory!, "ready-1"))).toBe(true);
-    expect(existsSync(join(coordinationDirectory!, "ready-2"))).toBe(true);
 
     const database = openSqliteDatabase(databasePath!);
     if (mode === "migration") {

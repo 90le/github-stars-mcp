@@ -6,8 +6,9 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  type Stats,
 } from "node:fs";
-import { getuid } from "node:process";
+import processModule from "node:process";
 import { dirname, isAbsolute, join, parse, resolve, win32 } from "node:path";
 import { AppError } from "../domain/errors.js";
 
@@ -48,18 +49,32 @@ function assertLocalAbsolute(path: string, platform: NodeJS.Platform): void {
   }
 }
 
+function inspectNode(
+  path: string,
+  expected: "directory" | "file",
+  required: boolean,
+): Stats | undefined {
+  let stats: Stats | undefined;
+  try {
+    stats = lstatSync(path, { throwIfNoEntry: false });
+  } catch (error) {
+    invalidPath(`cannot inspect state ${expected}`, error);
+  }
+  if (stats === undefined && required) {
+    invalidPath(`cannot inspect state ${expected}`);
+  }
+  return stats;
+}
+
 function assertNode(
   path: string,
   expected: "directory" | "file",
   platform: NodeJS.Platform,
   harden: boolean,
-): void {
-  let stats;
-  try {
-    stats = lstatSync(path);
-  } catch (error) {
-    invalidPath(`cannot inspect state ${expected}`, error);
-  }
+  required = true,
+): boolean {
+  const stats = inspectNode(path, expected, required);
+  if (stats === undefined) return false;
   if (stats.isSymbolicLink()) {
     invalidPath(`state ${expected} cannot be a symbolic link or junction`);
   }
@@ -71,7 +86,10 @@ function assertNode(
   }
 
   if (platform !== "win32" && harden) {
-    const uid = typeof getuid === "function" ? getuid() : undefined;
+    const uid =
+      typeof processModule.getuid === "function"
+        ? processModule.getuid()
+        : undefined;
     if (uid !== undefined && stats.uid !== uid) {
       invalidPath(`state ${expected} must be owned by the current user`);
     }
@@ -81,6 +99,7 @@ function assertNode(
       chmodSync(path, hardened);
     }
   }
+  return true;
 }
 
 function walkExistingDirectories(
@@ -90,39 +109,60 @@ function walkExistingDirectories(
   const pathApi = platform === "win32" ? win32 : { parse, join };
   const root = pathApi.parse(target).root;
   const relative = target.slice(root.length);
+  const segments =
+    platform === "win32"
+      ? relative.split(/[\\/]/u).filter(Boolean)
+      : relative.split("/").filter(Boolean);
   let current = root;
-  for (const segment of relative.split(/[\\/]/u).filter(Boolean)) {
+  for (const segment of segments) {
     current = pathApi.join(current, segment);
-    if (existsSync(current)) {
-      assertNode(current, "directory", platform, false);
-    }
+    assertNode(current, "directory", platform, false, false);
   }
+}
+
+function isAlreadyExists(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "EEXIST"
+  );
 }
 
 function ensureRegularDatabase(
   databasePath: string,
   platform: NodeJS.Platform,
 ): void {
-  if (!existsSync(databasePath)) {
-    let descriptor: number | undefined;
-    try {
-      descriptor = openSync(
-        databasePath,
-        constants.O_CREAT | constants.O_EXCL | constants.O_RDWR,
-        0o600,
-      );
-    } catch (error) {
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(
+      databasePath,
+      constants.O_CREAT | constants.O_EXCL | constants.O_RDWR,
+      0o600,
+    );
+  } catch (error) {
+    if (!isAlreadyExists(error)) {
       invalidPath("cannot create state database file", error);
-    } finally {
-      if (descriptor !== undefined) closeSync(descriptor);
     }
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
   assertNode(databasePath, "file", platform, true);
 }
 
+function validateDatabaseFamily(
+  databasePath: string,
+  platform: NodeJS.Platform,
+  requireDatabase: boolean,
+): void {
+  assertNode(databasePath, "file", platform, true, requireDatabase);
+  assertNode(`${databasePath}-wal`, "file", platform, true, false);
+  assertNode(`${databasePath}-shm`, "file", platform, true, false);
+}
+
 export function prepareStateDirectory(
   dataDirInput: string,
-  platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform = processModule.platform,
 ): PreparedStateDirectory {
   assertLocalAbsolute(dataDirInput, platform);
   const dataDir =
@@ -144,10 +184,11 @@ export function prepareStateDirectory(
     platform === "win32"
       ? win32.join(dataDir, STATE_DATABASE_BASENAME)
       : join(dataDir, STATE_DATABASE_BASENAME);
+  validateDatabaseFamily(databasePath, platform, false);
   ensureRegularDatabase(databasePath, platform);
   walkExistingDirectories(dataDir, platform);
   assertNode(dataDir, "directory", platform, true);
-  assertNode(databasePath, "file", platform, true);
+  validateDatabaseFamily(databasePath, platform, true);
 
   const platformLimitations = Object.freeze(
     platform === "win32"
@@ -163,7 +204,7 @@ export function prepareStateDirectory(
 
 export function validateStateFilesAfterOpen(
   prepared: PreparedStateDirectory,
-  platform: NodeJS.Platform = process.platform,
+  platform: NodeJS.Platform = processModule.platform,
 ): void {
   assertLocalAbsolute(prepared.dataDir, platform);
   const expectedDatabasePath =
@@ -177,24 +218,8 @@ export function validateStateFilesAfterOpen(
   }
   walkExistingDirectories(prepared.dataDir, platform);
   assertNode(prepared.dataDir, "directory", platform, true);
-  for (const path of [
-    prepared.databasePath,
-    `${prepared.databasePath}-wal`,
-    `${prepared.databasePath}-shm`,
-  ]) {
-    if (existsSync(path)) {
-      assertNode(path, "file", platform, true);
-    }
-  }
+  validateDatabaseFamily(prepared.databasePath, platform, true);
   walkExistingDirectories(prepared.dataDir, platform);
   assertNode(prepared.dataDir, "directory", platform, true);
-  for (const path of [
-    prepared.databasePath,
-    `${prepared.databasePath}-wal`,
-    `${prepared.databasePath}-shm`,
-  ]) {
-    if (existsSync(path)) {
-      assertNode(path, "file", platform, true);
-    }
-  }
+  validateDatabaseFamily(prepared.databasePath, platform, true);
 }

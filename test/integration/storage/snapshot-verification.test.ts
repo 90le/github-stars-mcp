@@ -232,6 +232,76 @@ describe("snapshot exact-set verification", () => {
   });
 
   test.each([
+    [
+      "added Star",
+      (verification: SnapshotVerificationBatch): SnapshotVerificationBatch => ({
+        ...verification,
+        stars: [
+          ...verification.stars,
+          {
+            repositoryId: asRepositoryId("R_added"),
+            starredAt: "2026-07-15T14:00:00.000Z",
+          },
+        ],
+      }),
+    ],
+    [
+      "removed Star",
+      (verification: SnapshotVerificationBatch): SnapshotVerificationBatch => ({
+        ...verification,
+        stars: [],
+      }),
+    ],
+    [
+      "added List identity",
+      (verification: SnapshotVerificationBatch): SnapshotVerificationBatch => ({
+        ...verification,
+        lists: [
+          ...verification.lists,
+          {
+            listId: asUserListId("L_added"),
+            name: "Added",
+            slug: "added",
+            description: null,
+            isPrivate: false,
+            createdAt: "2026-07-15T00:00:00.000Z",
+            updatedAt: "2026-07-16T00:00:00.000Z",
+            lastAddedAt: null,
+          },
+        ],
+      }),
+    ],
+    [
+      "removed List identity",
+      (verification: SnapshotVerificationBatch): SnapshotVerificationBatch => ({
+        ...verification,
+        lists: [],
+      }),
+    ],
+    [
+      "added membership",
+      (verification: SnapshotVerificationBatch): SnapshotVerificationBatch => ({
+        ...verification,
+        memberships: [
+          ...verification.memberships,
+          {
+            listId: verification.lists[0]!.listId,
+            repositoryId: asRepositoryId("R_added"),
+          },
+        ],
+      }),
+    ],
+  ] as const)("rejects an isolated %s exact-set change", (label, change) => {
+    const state = prepared(`snap_set_${label.replaceAll(" ", "_")}`);
+    const mismatch = error(() =>
+      finishAndComplete(state, change(verificationOf(state.batch))),
+    );
+    expect(mismatch?.details).toEqual({ reason: "collection_changed" });
+    expect(state.fixture.snapshots.getCompleteSnapshot(state.id)).toBeNull();
+    state.fixture.database.close();
+  });
+
+  test.each([
     ["name", "Changed"],
     ["slug", "changed"],
     ["description", "Changed description"],

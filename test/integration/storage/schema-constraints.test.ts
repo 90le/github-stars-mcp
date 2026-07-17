@@ -52,38 +52,88 @@ describe("Migration 001 constraints", () => {
     database.close();
   });
 
-  test("installs the locked indexes and relationship triggers", () => {
+  test("installs exactly the locked nonautomatic indexes and relationship triggers", () => {
     const database = migrated();
-    const names = database
+    const indexes = database
       .prepare(
         `SELECT name FROM sqlite_schema
-         WHERE type IN ('index','trigger') AND sql IS NOT NULL`,
+         WHERE type='index' AND sql IS NOT NULL
+         ORDER BY name`,
       )
       .pluck()
       .all();
-    expect(names).toEqual(
-      expect.arrayContaining([
-        "snapshots_latest_complete",
-        "snapshots_recovery_lease",
-        "snapshot_repositories_version",
-        "user_lists_order",
-        "staging_memberships_reverse",
-        "memberships_reverse",
-        "repository_evidence_expiry",
-        "dependencies_reverse",
-        "run_operations_plan",
-        "runs_recovery_lease",
-        "reconciliations_attempt",
-        "run_operation_insert_requires_initial_projection",
-        "run_operation_attempt_requires_current_projection",
-        "reconciliation_requires_current_unresolved_attempt",
-        "reconciled_projection_requires_latest_event",
-        "reconciliation_events_are_append_only_update",
-        "reconciliation_events_are_append_only_delete",
-      ]),
-    );
+    expect(indexes).toEqual([
+      "dependencies_reverse",
+      "memberships_reverse",
+      "reconciliations_attempt",
+      "repository_evidence_expiry",
+      "run_operations_plan",
+      "run_operations_sequence",
+      "runs_recovery_lease",
+      "snapshot_repositories_version",
+      "snapshots_latest_complete",
+      "snapshots_recovery_lease",
+      "staging_memberships_reverse",
+      "user_lists_order",
+    ]);
+    const triggers = database
+      .prepare(
+        `SELECT name FROM sqlite_schema
+         WHERE type='trigger' AND sql IS NOT NULL
+         ORDER BY name`,
+      )
+      .pluck()
+      .all();
+    expect(triggers).toEqual([
+      "reconciled_projection_requires_latest_event",
+      "reconciliation_events_are_append_only_delete",
+      "reconciliation_events_are_append_only_update",
+      "reconciliation_requires_current_unresolved_attempt",
+      "run_operation_attempt_requires_current_projection",
+      "run_operation_insert_requires_initial_projection",
+    ]);
     database.close();
   });
+
+  test.each([
+    [
+      "snapshot_stars",
+      "sqlite_autoindex_snapshot_stars_1",
+      "SELECT repository_id FROM snapshot_stars WHERE snapshot_id=? ORDER BY repository_id",
+      ["snapshot"],
+    ],
+    [
+      "run_operation_attempts",
+      "sqlite_autoindex_run_operation_attempts_1",
+      `SELECT attempt FROM run_operation_attempts
+       WHERE run_id=? AND operation_id=? ORDER BY attempt`,
+      ["run", "operation"],
+    ],
+    [
+      "run_operation_reconciliations",
+      "sqlite_autoindex_run_operation_reconciliations_1",
+      `SELECT event_sequence FROM run_operation_reconciliations
+       WHERE run_id=? AND operation_id=? ORDER BY event_sequence`,
+      ["run", "operation"],
+    ],
+  ] as const)(
+    "uses the composite primary-key autoindex for %s ordered queries",
+    (table, autoindex, sql, parameters) => {
+      const database = migrated();
+      const indexes = database.prepare(`PRAGMA index_list(${table})`).all() as {
+        readonly name: string;
+        readonly origin: string;
+      }[];
+      expect(indexes).toContainEqual(
+        expect.objectContaining({ name: autoindex, origin: "pk" }),
+      );
+      const plan = database
+        .prepare(`EXPLAIN QUERY PLAN ${sql}`)
+        .all(...parameters) as { readonly detail: string }[];
+      expect(plan.map((row) => row.detail).join("\n")).toContain(autoindex);
+      database.close();
+    },
+  );
 
   test("rejects hashes containing an embedded NUL", () => {
     const database = migrated();

@@ -188,4 +188,99 @@ describe("SQLite migrations", () => {
     ).toBe(1);
     database.close();
   });
+
+  test.each([
+    "bEgIn",
+    "cOmMiT",
+    "rOlLbAcK",
+    "sAvEpOiNt rogue",
+    "rElEaSe rogue",
+    "eNd",
+  ])("rejects top-level migration transaction control: %s", (control) => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    const escaping: SqliteMigration = {
+      version: 2,
+      name: "transaction-escape",
+      sql: `/* harmless leading comment */ -- another comment
+            \uFEFF${control}; CREATE TABLE escaped(value TEXT) STRICT;`,
+    };
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", [
+        ...SQLITE_MIGRATIONS,
+        escaping,
+      ]),
+    ).toThrow(/transaction control/u);
+    expect(database.inTransaction).toBe(false);
+    database.close();
+  });
+
+  test("rejects COMMIT before executing any migration body or ledger write", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    const escaping: SqliteMigration = {
+      version: 2,
+      name: "commit-escape",
+      sql: `CREATE TABLE must_not_persist(value TEXT) STRICT;
+            COMMIT;
+            CREATE TABLE also_must_not_persist(value TEXT) STRICT;
+            BEGIN IMMEDIATE;`,
+    };
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", [
+        ...SQLITE_MIGRATIONS,
+        escaping,
+      ]),
+    ).toThrow(/transaction control/u);
+    expect(
+      database
+        .prepare(
+          `SELECT name FROM sqlite_schema
+           WHERE type='table' AND name IN
+             ('must_not_persist','also_must_not_persist')`,
+        )
+        .all(),
+    ).toEqual([]);
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(1);
+    expect(database.inTransaction).toBe(false);
+    database.close();
+  });
+
+  test("allows transaction words in comments, literals, and trigger bodies", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
+    const safe: SqliteMigration = {
+      version: 2,
+      name: "lexical-safety",
+      sql: `-- COMMIT and ROLLBACK are documentation here.
+            /* BEGIN; SAVEPOINT ignored; RELEASE ignored; END; */
+            CREATE TABLE lexical_safe(
+              value TEXT DEFAULT 'COMMIT',
+              "BEGIN" TEXT,
+              \`END\` TEXT,
+              [SAVEPOINT] TEXT
+            ) STRICT;
+            CREATE TRIGGER lexical_safe_trigger
+            AFTER INSERT ON lexical_safe
+            BEGIN
+              SELECT CASE
+                WHEN NEW.value='ROLLBACK' THEN 'SAVEPOINT'
+                ELSE 'RELEASE'
+              END;
+              SELECT RAISE(ROLLBACK, 'not executed by this test');
+            END;`,
+    };
+    expect(() =>
+      migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z", [
+        ...SQLITE_MIGRATIONS,
+        safe,
+      ]),
+    ).not.toThrow();
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(2);
+    database.close();
+  });
 });
