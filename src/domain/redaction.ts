@@ -351,31 +351,6 @@ function redactString(value: string, secrets: readonly string[]): string {
   return redactCredentials(redacted);
 }
 
-function redactLiteral(value: string, secret: string): string {
-  if (secret.length === 0) return value;
-  let match = INTRINSICS.reflectApply(INTRINSICS.stringIndexOf, value, [
-    secret,
-    0,
-  ]);
-  if (match < 0) return value;
-
-  let result = "";
-  let start = 0;
-  do {
-    result +=
-      INTRINSICS.reflectApply(INTRINSICS.stringSlice, value, [start, match]) +
-      REDACTED;
-    start = match + secret.length;
-    match = INTRINSICS.reflectApply(INTRINSICS.stringIndexOf, value, [
-      secret,
-      start,
-    ]);
-  } while (match >= 0);
-  return (
-    result + INTRINSICS.reflectApply(INTRINSICS.stringSlice, value, [start])
-  );
-}
-
 function unsupportedPrimitive(
   value: bigint | symbol | undefined,
   secrets: readonly string[],
