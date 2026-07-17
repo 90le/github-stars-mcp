@@ -6,7 +6,7 @@
 
 **Architecture:** `PlanService`, `ApplyService`, `RollbackService`, and `InspectService` depend only on the named `GitHubPort` and synchronous `StoragePort`. Planning resolves all selectors and membership deltas against one complete snapshot and persists canonical executable content once. Apply verifies the persisted content, authenticated account, capability, expiry, and global account lease before claiming a run. Every external mutation has a durable write-ahead row, stable-ID precondition, postcondition, one-at-a-time pacing, and explicit reconciliation. Rollback projects only successful source operations into a new immutable plan and never mutates GitHub.
 
-**Tech Stack:** Node.js 22/24, TypeScript 7.0.2 strict ESM, Octokit 5.0.5, `better-sqlite3` behind `StoragePort`, Node `crypto`, Vitest v4.
+**Tech Stack:** Node.js 22/24, TypeScript 6.0.3 strict ESM, Octokit 5.0.5, `better-sqlite3` behind `StoragePort`, Node `crypto`, Vitest v4.
 
 ## Locked Dependencies from Plans 01 and 02
 

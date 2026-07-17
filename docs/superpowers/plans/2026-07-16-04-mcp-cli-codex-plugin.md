@@ -6,7 +6,7 @@
 
 **Architecture:** The MCP layer validates Zod input, calls application-service interfaces, and maps results into a versioned envelope; it contains no GitHub or SQL logic. The CLI owns process startup and stderr diagnostics, while the plugin contains only distribution metadata and agent instructions.
 
-**Tech Stack:** Node.js 22/24, TypeScript 7.0.2, ESM, `@modelcontextprotocol/sdk` 1.29.0, Zod v4, Vitest v4, npm.
+**Tech Stack:** Node.js 22/24, TypeScript 6.0.3, ESM, `@modelcontextprotocol/sdk` 1.29.0, Zod v4, Vitest v4, npm.
 
 ## Global Constraints
 

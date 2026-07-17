@@ -6,7 +6,7 @@
 
 **Architecture:** Pure domain modules own validated IDs, records, filters, canonical hashes, and lifecycle rules without importing MCP, GitHub, or SQLite. Application services depend on one synchronous `StoragePort`; `SQLiteStore` composes focused repositories over one `better-sqlite3` connection and never keeps a transaction open across an `await`.
 
-**Tech Stack:** TypeScript 7.0.2 strict ESM, Node.js 22/24, Zod v4, `better-sqlite3`, Vitest v4, ESLint, Prettier, npm with `npm-shrinkwrap.json`.
+**Tech Stack:** TypeScript 6.0.3 strict ESM, Node.js 22/24, Zod v4, `better-sqlite3`, Vitest v4, ESLint, Prettier, npm with `npm-shrinkwrap.json`.
 
 ## Global Constraints
 
@@ -58,7 +58,7 @@ Operations are exactly `star`, `unstar`, `list_create`, `list_update`, `list_del
 
 - [ ] **Step 1: Create package configuration and the failing import test**
 
-Pin dependencies: `@modelcontextprotocol/sdk@1.29.0`, `better-sqlite3@12.4.1`, `octokit@5.0.5`, `zod@4.1.12`. Pin dev dependencies: `@eslint/js@9.39.2`, `@types/better-sqlite3@7.6.13`, `@types/node@24.10.1`, `@vitest/coverage-v8@4.0.18`, `eslint@9.39.2`, `prettier@3.7.4`, `typescript@7.0.2`, `typescript-eslint@8.48.1`, `vitest@4.0.18`.
+Pin dependencies: `@modelcontextprotocol/sdk@1.29.0`, `better-sqlite3@12.4.1`, `octokit@5.0.5`, `zod@4.1.12`. Pin dev dependencies: `@eslint/js@9.39.2`, `@types/better-sqlite3@7.6.13`, `@types/node@24.10.1`, `@vitest/coverage-v8@4.0.18`, `eslint@9.39.2`, `prettier@3.7.4`, `typescript@6.0.3`, `typescript-eslint@8.64.0`, `vitest@4.0.18`. This exact TypeScript/typescript-eslint pair is the newest mutually supported stable pair resolved from npm on 2026-07-17; never use `--force` or legacy peer-dependency bypasses.
 
 ```json
 {
@@ -72,8 +72,8 @@ Pin dependencies: `@modelcontextprotocol/sdk@1.29.0`, `better-sqlite3@12.4.1`, `
   "devDependencies": {
     "@eslint/js": "9.39.2", "@types/better-sqlite3": "7.6.13",
     "@types/node": "24.10.1", "@vitest/coverage-v8": "4.0.18",
-    "eslint": "9.39.2", "prettier": "3.7.4", "typescript": "7.0.2",
-    "typescript-eslint": "8.48.1", "vitest": "4.0.18"
+    "eslint": "9.39.2", "prettier": "3.7.4", "typescript": "6.0.3",
+    "typescript-eslint": "8.64.0", "vitest": "4.0.18"
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json", "typecheck": "tsc -p tsconfig.json --noEmit",

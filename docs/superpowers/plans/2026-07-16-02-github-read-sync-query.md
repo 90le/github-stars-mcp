@@ -6,7 +6,7 @@
 
 **Architecture:** `OctokitGitHubAdapter` is the only network adapter and implements named `GitHubPort` methods. Read services depend on that port and synchronous `StoragePort`; sync writes bounded batches to an unreadable `building` snapshot and atomically promotes it only after all remote pages pass completeness checks, while query, evidence, and discovery return bounded agent-ready data.
 
-**Tech Stack:** TypeScript 7.0.2 strict ESM, Node.js 22/24, Octokit 5.0.5 with retry/throttling, REST API `2026-03-10`, GitHub GraphQL, SQLite through `StoragePort`, Vitest v4.
+**Tech Stack:** TypeScript 6.0.3 strict ESM, Node.js 22/24, Octokit 5.0.5 with retry/throttling, REST API `2026-03-10`, GitHub GraphQL, SQLite through `StoragePort`, Vitest v4.
 
 ## Global Constraints
 
