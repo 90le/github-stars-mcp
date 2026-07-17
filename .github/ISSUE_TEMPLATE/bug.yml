@@ -1,0 +1,98 @@
+name: Bug report
+description: Report a reproducible defect without credentials or private repository data.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues before filing. Send suspected security defects through GitHub private vulnerability reporting: https://github.com/90le/github-stars-mcp/security/advisories/new
+  - type: dropdown
+    id: version
+    attributes:
+      label: Affected version
+      description: Select the release or source version that showed the defect.
+      options:
+        - 1.x release
+        - Built from main
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: node_version
+    attributes:
+      label: Node.js version
+      placeholder: "24.6.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: operating_system
+    attributes:
+      label: Operating system
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - npx package
+        - npm global install
+        - Local source build
+        - Codex plugin
+        - Other MCP host
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use fictional logins, repository IDs, List IDs, and token-shaped values.
+      placeholder: |
+        1. Run ...
+        2. Call ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: read_only
+    attributes:
+      label: Read-only setting
+      description: State the value of GITHUB_STARS_MCP_READ_ONLY without including other environment values.
+      options:
+        - "true"
+        - "false"
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs
+      description: Redact tokens, authorization headers, private repository metadata, usernames, and local paths.
+      render: text
+  - type: checkboxes
+    id: data_safety
+    attributes:
+      label: Data safety
+      options:
+        - label: I removed credentials, personal data, and private repository metadata from this report.
+          required: true
