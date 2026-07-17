@@ -8,11 +8,7 @@ import {
 } from "../../domain/filter.js";
 import { canonicalJsonClone } from "../../domain/canonical-json.js";
 import { AppError } from "../../domain/errors.js";
-import {
-  asSnapshotId,
-  type RepositoryId,
-  type SnapshotId,
-} from "../../domain/ids.js";
+import { asSnapshotId, type SnapshotId } from "../../domain/ids.js";
 import type { JsonValue } from "../../domain/json.js";
 import type {
   AccountBinding,
@@ -20,6 +16,7 @@ import type {
 } from "../../domain/repository.js";
 import { parseSnapshot, type Snapshot } from "../../domain/snapshot.js";
 import type { StoragePort } from "../ports/storage-port.js";
+import type { EvidenceRecord, EvidenceService } from "./evidence-service.js";
 
 export type QueryStoragePort = Pick<
   StoragePort,
@@ -62,16 +59,7 @@ export type StarsQueryInput = Readonly<{
   evidenceLimit: number;
 }>;
 
-export type EvidenceRecord = Readonly<{
-  repositoryId: RepositoryId;
-  kind: "untrusted_external_text";
-  text: string;
-  sourceUrl: string;
-  sha: string | null;
-  byteLength: number;
-  truncated: boolean;
-  missing: boolean;
-}>;
+export type EvidenceReader = Pick<EvidenceService, "fetch">;
 
 export type StarsQueryResult = Readonly<{
   snapshotId: SnapshotId;
@@ -398,22 +386,23 @@ function projectRepository(
 export class QueryService {
   readonly #storage: QueryStoragePort;
   readonly #binding: AccountBinding;
+  readonly #evidence: EvidenceReader;
 
-  constructor(storage: QueryStoragePort, binding: AccountBinding) {
+  constructor(
+    storage: QueryStoragePort,
+    binding: AccountBinding,
+    evidence: EvidenceReader,
+  ) {
     this.#storage = storage;
     this.#binding = copyQueryBinding(binding);
+    this.#evidence = evidence;
   }
 
-  async query(input: StarsQueryInput): Promise<StarsQueryResult> {
+  async query(
+    input: StarsQueryInput,
+    signal?: AbortSignal,
+  ): Promise<StarsQueryResult> {
     const parsed = parseStarsQueryInput(input);
-    if (parsed.evidence !== "none") {
-      throw new AppError(
-        "CAPABILITY_UNAVAILABLE",
-        "Evidence enrichment is not available",
-        { retryable: false },
-      );
-    }
-
     const snapshot = resolveQuerySnapshot(
       this.#storage,
       this.#binding,
@@ -435,6 +424,19 @@ export class QueryService {
         cursor: parsed.cursor,
       }),
     );
+    let evidence = EMPTY_EVIDENCE;
+    if (parsed.evidence !== "none") {
+      if (parsed.evidenceLimit > Math.min(20, page.items.length)) {
+        return validation(
+          "evidenceLimit cannot exceed the selected repository page",
+        );
+      }
+      evidence = await this.#evidence.fetch(
+        page.items.slice(0, parsed.evidenceLimit),
+        parsed.evidence,
+        signal,
+      );
+    }
     const items = Object.freeze(
       page.items.map((repository) =>
         projectRepository(repository, parsed.fields),
@@ -446,7 +448,7 @@ export class QueryService {
         total: page.total,
         aggregates: page.aggregates,
         items,
-        evidence: EMPTY_EVIDENCE,
+        evidence,
         nextCursor: page.nextCursor,
       }),
     );

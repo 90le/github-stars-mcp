@@ -61,13 +61,14 @@ async function rejectedError(promise: Promise<unknown>): Promise<AppError> {
 }
 
 describe("GitHub User List read contracts", () => {
-  it("advances the adapter structurally to the sync-read port without later stubs", () => {
+  it("keeps the progressive adapter free of discovery and mutation stubs", () => {
     expectTypeOf<OctokitGitHubAdapter>().toMatchTypeOf<GitHubSyncReadPort>();
     expect(
       Object.getOwnPropertyNames(OctokitGitHubAdapter.prototype).sort(),
     ).toEqual(
       [
         "constructor",
+        "getReadme",
         "getViewer",
         "listStarredRepositories",
         "listUserListItems",

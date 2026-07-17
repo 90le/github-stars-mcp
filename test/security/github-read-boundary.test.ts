@@ -77,7 +77,7 @@ describe("GitHub read capability boundary", () => {
     );
     expect(source).not.toMatch(/constructor\s*\(\s*transport\s*:[^,)]*,/u);
     expect(source).not.toMatch(
-      /\b(?:getReadme|searchRepositories|deleteRepository|archiveRepository|transferRepository)\s*\(/u,
+      /\b(?:searchRepositories|deleteRepository|archiveRepository|transferRepository)\s*\(/u,
     );
   });
 });

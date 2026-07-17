@@ -69,7 +69,7 @@ function customTransport(input: {
 }
 
 describe("GitHub identity and capability contracts", () => {
-  it("locks progressive ports without making the Task 3 adapter stub later methods", () => {
+  it("keeps the progressive adapter free of discovery and mutation stubs", () => {
     expectTypeOf<GitHubStatusReadPort>().toHaveProperty("getViewer");
     expectTypeOf<GitHubStatusReadPort>().toHaveProperty("probeCapabilities");
     expectTypeOf<GitHubStarReadPort>().toHaveProperty(
@@ -82,6 +82,7 @@ describe("GitHub identity and capability contracts", () => {
     ).toEqual(
       [
         "constructor",
+        "getReadme",
         "getViewer",
         "listStarredRepositories",
         "listUserListItems",

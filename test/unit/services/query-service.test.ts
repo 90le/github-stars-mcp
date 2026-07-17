@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { describe, expect, it, vi } from "vitest";
 import {
   ListsQueryService,
@@ -5,9 +6,11 @@ import {
 } from "../../../src/app/services/lists-query-service.js";
 import {
   QueryService,
+  type EvidenceReader,
   type QueryStoragePort,
   type StarsQueryInput,
 } from "../../../src/app/services/query-service.js";
+import type { EvidenceRecord } from "../../../src/app/services/evidence-service.js";
 import { AppError, serializeError } from "../../../src/domain/errors.js";
 import type {
   ListMembershipQueryPage,
@@ -23,6 +26,7 @@ import {
 import {
   repositoryViewSchema,
   type AccountBinding,
+  type Repository,
   type RepositoryView,
 } from "../../../src/domain/repository.js";
 import { parseSnapshot, type Snapshot } from "../../../src/domain/snapshot.js";
@@ -208,6 +212,48 @@ function fakeStorage(
   };
 }
 
+function fakeEvidence(records: readonly EvidenceRecord[] = []) {
+  const fetch = vi.fn(
+    (
+      repositories: readonly Repository[],
+      mode: "summary" | "readme",
+      signal?: AbortSignal,
+    ): Promise<readonly EvidenceRecord[]> => {
+      void repositories;
+      void mode;
+      void signal;
+      return Promise.resolve(records);
+    },
+  );
+  return {
+    port: { fetch } satisfies EvidenceReader,
+    fetch,
+  };
+}
+
+function queryService(
+  storage: QueryStoragePort,
+  evidence: EvidenceReader = fakeEvidence().port,
+): QueryService {
+  return new QueryService(storage, binding, evidence);
+}
+
+function evidenceRecord(
+  repository: RepositoryView,
+  text: string,
+): EvidenceRecord {
+  return Object.freeze({
+    repositoryId: repository.repositoryId,
+    kind: "untrusted_external_text",
+    text,
+    sourceUrl: repository.url,
+    sha: null,
+    byteLength: Buffer.byteLength(text, "utf8"),
+    truncated: false,
+    missing: false,
+  });
+}
+
 function expectCode(action: () => unknown, code: string) {
   return Promise.resolve()
     .then(action)
@@ -237,7 +283,8 @@ describe("QueryService", () => {
       fields: ["repository_id", "full_name"],
     });
 
-    const result = await new QueryService(storage.port, binding).query(input);
+    const evidence = fakeEvidence();
+    const result = await queryService(storage.port, evidence.port).query(input);
 
     expect(storage.getLatestCompleteSnapshot).toHaveBeenCalledWith(binding);
     expect(storage.getCompleteSnapshot).not.toHaveBeenCalled();
@@ -267,6 +314,7 @@ describe("QueryService", () => {
       evidence: [],
       nextCursor: "repository_cursor",
     });
+    expect(evidence.fetch).not.toHaveBeenCalled();
   });
 
   it("uses an explicit snapshot without consulting latest", async () => {
@@ -274,7 +322,7 @@ describe("QueryService", () => {
       explicit: completeSnapshot({ id: asSnapshotId("snap_explicit") }),
     });
 
-    const result = await new QueryService(storage.port, binding).query(
+    const result = await queryService(storage.port).query(
       baseStarsInput({ snapshotId: asSnapshotId("snap_explicit") }),
     );
 
@@ -290,7 +338,7 @@ describe("QueryService", () => {
 
     await expectCode(
       () =>
-        new QueryService(storage.port, binding).query(
+        queryService(storage.port).query(
           baseStarsInput({ snapshotId: asSnapshotId("snap_requested") }),
         ),
       "STALE_SNAPSHOT",
@@ -300,9 +348,7 @@ describe("QueryService", () => {
 
   it("returns all safe fields by default and never projects list_ids", async () => {
     const storage = fakeStorage();
-    const result = await new QueryService(storage.port, binding).query(
-      baseStarsInput(),
-    );
+    const result = await queryService(storage.port).query(baseStarsInput());
 
     expect(Object.keys(result.items[0]!)).toEqual(allFields);
     expect(result.items[0]).not.toHaveProperty("list_ids");
@@ -310,7 +356,7 @@ describe("QueryService", () => {
 
   it("allows an empty field list for aggregate-only paging", async () => {
     const storage = fakeStorage();
-    const result = await new QueryService(storage.port, binding).query(
+    const result = await queryService(storage.port).query(
       baseStarsInput({ fields: [] }),
     );
 
@@ -329,7 +375,7 @@ describe("QueryService", () => {
         nextCursor: null,
       },
     });
-    const result = await new QueryService(storage.port, binding).query(
+    const result = await queryService(storage.port).query(
       baseStarsInput({
         fields: ["topics", "name", "repository_database_id"],
       }),
@@ -366,7 +412,7 @@ describe("QueryService", () => {
     const storage = fakeStorage();
     await expectCode(
       () =>
-        new QueryService(storage.port, binding).query(
+        queryService(storage.port).query(
           baseStarsInput(patch as Partial<StarsQueryInput>),
         ),
       "VALIDATION_ERROR",
@@ -384,23 +430,62 @@ describe("QueryService", () => {
     };
 
     await expectCode(
-      () => new QueryService(storage.port, binding).query(input),
+      () => queryService(storage.port).query(input),
       "VALIDATION_ERROR",
     );
     expect(storage.getLatestCompleteSnapshot).not.toHaveBeenCalled();
   });
 
-  it("fails non-none evidence explicitly before storage until Task 7", async () => {
+  it.each(["summary", "readme"] as const)(
+    "enriches only the first selected repositories in %s mode and passes the signal",
+    async (mode) => {
+      const repositories = [
+        repositoryView("1"),
+        repositoryView("2"),
+        repositoryView("3"),
+      ];
+      const storage = fakeStorage({
+        repositoryPage: {
+          items: repositories,
+          total: 3,
+          aggregates: { languages: [], archived: 0, forks: 0 },
+          nextCursor: null,
+        },
+      });
+      const records = repositories
+        .slice(0, 2)
+        .map((repository) => evidenceRecord(repository, repository.fullName));
+      const evidence = fakeEvidence(Object.freeze(records));
+      const signal = new AbortController().signal;
+
+      const result = await queryService(storage.port, evidence.port).query(
+        baseStarsInput({ evidence: mode, evidenceLimit: 2 }),
+        signal,
+      );
+
+      expect(evidence.fetch).toHaveBeenCalledOnce();
+      expect(evidence.fetch).toHaveBeenCalledWith(
+        repositories.slice(0, 2),
+        mode,
+        signal,
+      );
+      expect(result.evidence).toEqual(records);
+    },
+  );
+
+  it("rejects an evidence limit larger than the selected page before enrichment", async () => {
     const storage = fakeStorage();
+    const evidence = fakeEvidence();
 
     await expectCode(
       () =>
-        new QueryService(storage.port, binding).query(
-          baseStarsInput({ evidence: "summary", evidenceLimit: 2 }),
+        queryService(storage.port, evidence.port).query(
+          baseStarsInput({ evidence: "summary", evidenceLimit: 3 }),
         ),
-      "CAPABILITY_UNAVAILABLE",
+      "VALIDATION_ERROR",
     );
-    expect(storage.getLatestCompleteSnapshot).not.toHaveBeenCalled();
+    expect(storage.queryRepositories).toHaveBeenCalledOnce();
+    expect(evidence.fetch).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -434,7 +519,7 @@ describe("QueryService", () => {
     async (_label, value) => {
       const storage = fakeStorage({ latest: value });
       await expectCode(
-        () => new QueryService(storage.port, binding).query(baseStarsInput()),
+        () => queryService(storage.port).query(baseStarsInput()),
         "STALE_SNAPSHOT",
       );
       expect(storage.queryRepositories).not.toHaveBeenCalled();
@@ -449,7 +534,7 @@ describe("QueryService", () => {
         counts: { repositories: 2, stars: 2, lists: 0, memberships: 0 },
       });
       const ordinary = fakeStorage({ latest: snapshot });
-      await new QueryService(ordinary.port, binding).query(
+      await queryService(ordinary.port).query(
         baseStarsInput({
           filter: { field: "is_archived", op: "eq", value: false },
         }),
@@ -459,7 +544,7 @@ describe("QueryService", () => {
       const dependent = fakeStorage({ latest: snapshot });
       await expectCode(
         () =>
-          new QueryService(dependent.port, binding).query(
+          queryService(dependent.port).query(
             baseStarsInput({
               filter: {
                 field: "is_unclassified",
@@ -475,7 +560,7 @@ describe("QueryService", () => {
       const listIdFilter = fakeStorage({ latest: snapshot });
       await expectCode(
         () =>
-          new QueryService(listIdFilter.port, binding).query(
+          queryService(listIdFilter.port).query(
             baseStarsInput({
               filter: {
                 field: "list_ids",
@@ -498,9 +583,7 @@ describe("QueryService", () => {
 
     await expectCode(
       () =>
-        new QueryService(storage.port, binding).query(
-          baseStarsInput({ cursor: "opaque" }),
-        ),
+        queryService(storage.port).query(baseStarsInput({ cursor: "opaque" })),
       "VALIDATION_ERROR",
     );
   });
@@ -524,11 +607,11 @@ describe("QueryService", () => {
     const storage = fakeStorage();
 
     await expectCode(
-      () => new QueryService(storage.port, binding).query(getter),
+      () => queryService(storage.port).query(getter),
       "VALIDATION_ERROR",
     );
     await expectCode(
-      () => new QueryService(storage.port, binding).query(proxy),
+      () => queryService(storage.port).query(proxy),
       "VALIDATION_ERROR",
     );
     expect(getterCalls).toBe(0);
@@ -549,7 +632,7 @@ describe("QueryService", () => {
     });
 
     await expectCode(
-      () => new QueryService(storage.port, binding).query(baseStarsInput()),
+      () => queryService(storage.port).query(baseStarsInput()),
       "VALIDATION_ERROR",
     );
   });

@@ -1,8 +1,11 @@
+import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import type {
   CapabilityState,
   GitHubCapabilities,
+  GitHubEvidenceReadPort,
   GitHubListItem,
+  GitHubReadme,
   GitHubStar,
   GitHubSyncReadPort,
   GitHubUserList,
@@ -15,6 +18,7 @@ import { repositorySchema, userListSchema } from "../domain/repository.js";
 import type {
   AccountBinding,
   Repository,
+  RepositoryCoordinates,
   UserList,
 } from "../domain/repository.js";
 import { canonicalUtcTimestamp } from "../domain/timestamp.js";
@@ -48,7 +52,13 @@ const MAX_LICENSE = 100;
 const MAX_LIST_NAME = 255;
 const MAX_LIST_SLUG = 255;
 const MAX_LIST_DESCRIPTION = 8_192;
+const MAX_README_BYTES = 1_048_576;
+const MAX_README_BASE64 = 1_500_000;
+const MAX_README_URL = 4_096;
 const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/u;
+const README_BASE64 =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
+const README_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u;
 
 type SafeRecord = ReadonlyMap<string, unknown>;
 
@@ -142,6 +152,16 @@ function safeRecord(value: unknown, operation: string): SafeRecord {
 function required(record: SafeRecord, key: string, operation: string): unknown {
   if (!record.has(key)) throw malformedRemote(operation);
   return record.get(key);
+}
+
+function exactKeys(
+  record: SafeRecord,
+  keys: readonly string[],
+  operation: string,
+): void {
+  if (record.size !== keys.length || keys.some((key) => !record.has(key))) {
+    throw malformedRemote(operation);
+  }
 }
 
 function denseArray(
@@ -688,6 +708,170 @@ function restEnvelope(
   });
 }
 
+function invalidRepositoryCoordinates(): AppError {
+  return new AppError(
+    "VALIDATION_ERROR",
+    "Repository coordinates are invalid",
+    {
+      retryable: false,
+      details: {
+        operation: "getReadme",
+        reason: "invalid_repository_coordinates",
+      },
+    },
+  );
+}
+
+function repositoryCoordinates(
+  value: RepositoryCoordinates,
+): RepositoryCoordinates {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    Array.isArray(value)
+  ) {
+    throw invalidRepositoryCoordinates();
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Reflect.getPrototypeOf(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw invalidRepositoryCoordinates();
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    (prototype !== Object.prototype && prototype !== null) ||
+    keys.length !== 2 ||
+    keys.some((key) => key !== "owner" && key !== "name")
+  ) {
+    throw invalidRepositoryCoordinates();
+  }
+
+  const read = (key: "owner" | "name", maximum: number): string => {
+    const descriptor = descriptors[key];
+    const candidate = descriptor?.value as unknown;
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      descriptor.enumerable !== true ||
+      typeof candidate !== "string" ||
+      candidate.length === 0 ||
+      candidate.length > maximum ||
+      candidate !== candidate.trim() ||
+      !wellFormedUnicode(candidate) ||
+      !controlFree(candidate) ||
+      /[/\\?#]/u.test(candidate)
+    ) {
+      throw invalidRepositoryCoordinates();
+    }
+    return candidate;
+  };
+
+  return Object.freeze({
+    owner: read("owner", MAX_LOGIN),
+    name: read("name", MAX_REPOSITORY_NAME),
+  });
+}
+
+function readmeSourceUrl(
+  value: unknown,
+  coordinates: RepositoryCoordinates,
+  operation: string,
+): string {
+  const text = boundedText(value, MAX_README_URL, operation);
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    throw malformedRemote(operation);
+  }
+  const prefix = `/${encodeURIComponent(coordinates.owner)}/${encodeURIComponent(
+    coordinates.name,
+  )}/blob/`;
+  if (
+    url.protocol !== "https:" ||
+    url.hostname !== "github.com" ||
+    url.port !== "" ||
+    url.username !== "" ||
+    url.password !== "" ||
+    url.search !== "" ||
+    url.hash !== "" ||
+    url.href !== text ||
+    !url.pathname.startsWith(prefix) ||
+    url.pathname.length <= prefix.length
+  ) {
+    throw malformedRemote(operation);
+  }
+  return text;
+}
+
+function readmeFromResponse(
+  response: unknown,
+  coordinates: RepositoryCoordinates,
+): GitHubReadme {
+  const operation = "getReadme";
+  const envelope = restEnvelope(response, operation);
+  const data = safeRecord(envelope.data, operation);
+  exactKeys(
+    data,
+    ["encoding", "content", "html_url", "sha", "size"],
+    operation,
+  );
+  if (required(data, "encoding", operation) !== "base64") {
+    throw malformedRemote(operation);
+  }
+  const rawContent = required(data, "content", operation);
+  if (
+    typeof rawContent !== "string" ||
+    rawContent.length > MAX_README_BASE64 ||
+    !wellFormedUnicode(rawContent)
+  ) {
+    throw malformedRemote(operation);
+  }
+  const content = rawContent.replace(/[\r\n]/gu, "");
+  if (!README_BASE64.test(content) || content.length % 4 !== 0) {
+    throw malformedRemote(operation);
+  }
+
+  let decoded: Buffer;
+  try {
+    decoded = Buffer.from(content, "base64");
+  } catch {
+    throw malformedRemote(operation);
+  }
+  if (decoded.toString("base64") !== content) {
+    throw malformedRemote(operation);
+  }
+
+  const size = required(data, "size", operation);
+  if (
+    typeof size !== "number" ||
+    !Number.isSafeInteger(size) ||
+    size < 0 ||
+    size > MAX_README_BYTES ||
+    decoded.byteLength !== size
+  ) {
+    throw malformedRemote(operation);
+  }
+  const sha = required(data, "sha", operation);
+  if (typeof sha !== "string" || !README_SHA.test(sha)) {
+    throw malformedRemote(operation);
+  }
+  return Object.freeze({
+    text: decoded.toString("utf8"),
+    sourceUrl: readmeSourceUrl(
+      required(data, "html_url", operation),
+      coordinates,
+      operation,
+    ),
+    sha,
+    byteLength: size,
+  });
+}
+
 function starPageFromResponse(
   response: unknown,
   operation: string,
@@ -1059,7 +1243,9 @@ async function probeRead(
   }
 }
 
-export class OctokitGitHubAdapter implements GitHubSyncReadPort {
+export class OctokitGitHubAdapter
+  implements GitHubSyncReadPort, GitHubEvidenceReadPort
+{
   readonly #transport: GitHubTransport;
 
   constructor(transport: GitHubTransport) {
@@ -1158,5 +1344,28 @@ export class OctokitGitHubAdapter implements GitHubSyncReadPort {
     );
     const envelope = graphqlData(response, "listItems");
     return userListItemsPage(envelope.data, envelope.rateLimit);
+  }
+
+  async getReadme(
+    repository: RepositoryCoordinates,
+    signal?: AbortSignal,
+  ): Promise<GitHubReadme | null> {
+    const coordinates = repositoryCoordinates(repository);
+    try {
+      const response = await this.#transport.rest(
+        "getReadme",
+        Object.freeze({
+          owner: coordinates.owner,
+          repo: coordinates.name,
+        }),
+        signal,
+      );
+      return readmeFromResponse(response, coordinates);
+    } catch (error) {
+      if (error instanceof AppError && error.code === "NOT_FOUND") {
+        return null;
+      }
+      throw error;
+    }
   }
 }
