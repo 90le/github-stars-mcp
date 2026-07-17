@@ -271,7 +271,13 @@ Run `npm test -- test/unit/domain/errors-config.test.ts`; expect FAIL resolving 
 
 - [ ] **Step 3: Implement safe public values**
 
-`AppErrorCode` is exactly the 18 codes in specification 16.1. `AppError` stores `code`, `retryable`, JSON `details`, secret strings, and an optional cause. `SerializedDomainError` is:
+`AppErrorCode` is exactly the 18 codes in specification 16.1.
+`APP_ERROR_CODES` is runtime-frozen, and validation uses a private immutable
+lookup that exported callers cannot mutate. `AppError` stores `code`,
+`retryable`, JSON `details`, secret strings, and an optional cause. Registered
+secrets are non-enumerable, and `JSON.stringify(AppError)` delegates to the
+same redacted public serialization rather than exposing raw details or the
+secret registry. `SerializedDomainError` is:
 
 ```ts
 export const APP_ERROR_CODES = ["AUTH_REQUIRED","INSUFFICIENT_PERMISSION","CAPABILITY_UNAVAILABLE","VALIDATION_ERROR","NOT_FOUND","RATE_LIMITED","SECONDARY_RATE_LIMITED","GITHUB_UNAVAILABLE","STALE_SNAPSHOT","PLAN_EXPIRED","PLAN_HASH_MISMATCH","PLAN_ACCOUNT_MISMATCH","PLAN_TOO_LARGE","PRECONDITION_FAILED","PARTIAL_FAILURE","RECONCILIATION_REQUIRED","STORAGE_ERROR","INTERNAL_ERROR"] as const;
@@ -282,7 +288,15 @@ export interface SerializedDomainError {
 }
 ```
 
-`redactSecrets` recursively clones arrays and plain data properties, caps depth at 20, replaces secret substrings and values under case-insensitive `authorization`, `token`, `access_token`, `password`, `cookie` with `[REDACTED]`, never invokes getters, and stringifies unsupported values. `serializeError` omits stack/cause and maps unknown errors to `INTERNAL_ERROR`.
+`redactSecrets` recursively clones arrays and plain data properties, caps
+depth at 20, replaces secret substrings and values under case-insensitive
+`authorization`, `token`, `access_token`, `password`, `cookie` with
+`[REDACTED]`, never invokes getters, and stringifies unsupported values.
+Secret-array inspection examines every numeric index descriptor regardless of
+enumerability and fails closed for holes, accessors, or malformed entries.
+Redacted arrays are dense `JsonValue[]` values: sparse, non-enumerable, or
+accessor indices become a JSON-safe marker without invoking accessors.
+`serializeError` omits stack/cause and maps unknown errors to `INTERNAL_ERROR`.
 
 ```ts
 export interface AppConfig {
@@ -297,7 +311,7 @@ export function loadConfig(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform):
 Resolve data directory from `GITHUB_STARS_MCP_DATA_DIR`, `%LOCALAPPDATA%\github-stars-mcp`, `$XDG_STATE_HOME/github-stars-mcp`, or `~/.local/state/github-stars-mcp`. Reject non-`github.com`, relative paths, concurrency outside 1–8, interval below 1,000, actions outside 1–5,000, TTL outside 1–10,080, and invalid booleans. Never read credential variables.
 
 - [ ] **Step 4: Verify no secret appears**
-Run `npm test -- test/unit/domain/errors-config.test.ts && npm run typecheck && npm run lint`; expect one pass, no `ghp_secret` output, and clean static checks.
+Run `npm test -- test/unit/domain/errors-config.test.ts && npm run typecheck && npm run lint`; expect all focused tests to pass, no `ghp_secret` output, and clean static checks.
 
 - [ ] **Step 5: Commit**
 
