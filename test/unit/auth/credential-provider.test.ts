@@ -13,12 +13,7 @@ vi.mock("node:child_process", () => ({
 }));
 
 const EXECUTABLE = "gh" as const;
-const ARGUMENTS = [
-  "auth",
-  "token",
-  "--hostname",
-  "github.com",
-] as const;
+const ARGUMENTS = ["auth", "token", "--hostname", "github.com"] as const;
 
 function config(authMode: "auto" | "env" | "gh" = "auto") {
   return { host: "github.com" as const, authMode };
@@ -149,13 +144,9 @@ describe("CredentialProvider", () => {
   ])(
     "rejects control characters from %s without exposing the value",
     async (source, secret, authMode) => {
-      const run = vi
-        .fn<ExecFileRunner>()
-        .mockResolvedValue({ stdout: secret });
+      const run = vi.fn<ExecFileRunner>().mockResolvedValue({ stdout: secret });
       const env =
-        source === "environment"
-          ? { GITHUB_STARS_TOKEN: secret }
-          : {};
+        source === "environment" ? { GITHUB_STARS_TOKEN: secret } : {};
       const error = await caught(
         new CredentialProvider(config(authMode), run, env).resolve(),
       );
@@ -244,11 +235,9 @@ describe("CredentialProvider", () => {
   });
 
   test("returns a frozen credential with a non-enumerable token data property", async () => {
-    const credential = await new CredentialProvider(
-      config(),
-      runner(),
-      { GITHUB_TOKEN: "secret-token" },
-    ).resolve();
+    const credential = await new CredentialProvider(config(), runner(), {
+      GITHUB_TOKEN: "secret-token",
+    }).resolve();
 
     expect(Object.isFrozen(credential)).toBe(true);
     expect(Object.keys(credential)).toEqual(["source"]);
@@ -269,11 +258,7 @@ describe("CredentialProvider", () => {
         file: string,
         args: readonly string[],
         options: Record<string, unknown>,
-        callback: (
-          error: Error | null,
-          stdout: string,
-          stderr: string,
-        ) => void,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
       ) => {
         expect(file).toBe(EXECUTABLE);
         expect(args).toEqual(ARGUMENTS);

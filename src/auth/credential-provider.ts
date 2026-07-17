@@ -54,10 +54,7 @@ function normalizedToken(value: unknown): string | null {
   return token;
 }
 
-function createCredential(
-  token: string,
-  source: CredentialSource,
-): Credential {
+function createCredential(token: string, source: CredentialSource): Credential {
   const credential = { source } as {
     token: string;
     source: CredentialSource;
