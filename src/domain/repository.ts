@@ -79,7 +79,7 @@ const repositoryDatabaseIdSchema = z
   .transform((value) => value as RepositoryDatabaseId);
 
 const trimmedNameSchema = z.string().trim().min(1);
-const isoTimestampSchema = z.string().datetime({ offset: true });
+const isoTimestampSchema = z.string().datetime({ offset: false });
 
 const httpsGitHubUrlSchema = z
   .string()
@@ -108,23 +108,25 @@ const topicsSchema = z
     ].sort(),
   );
 
-export const repositorySchema = z.object({
-  repositoryId: repositoryIdSchema,
-  repositoryDatabaseId: repositoryDatabaseIdSchema,
-  owner: trimmedNameSchema,
-  name: trimmedNameSchema,
-  fullName: trimmedNameSchema,
-  description: z.string().nullable(),
-  url: httpsGitHubUrlSchema,
-  stargazerCount: z.number().int().nonnegative(),
-  isFork: z.boolean(),
-  isArchived: z.boolean(),
-  isDisabled: z.boolean(),
-  isPrivate: z.boolean(),
-  visibility: z.enum(["public", "private", "internal"]),
-  primaryLanguage: trimmedNameSchema.nullable(),
-  topics: topicsSchema,
-  licenseSpdxId: z.string().nullable(),
-  pushedAt: isoTimestampSchema.nullable(),
-  updatedAt: isoTimestampSchema,
-});
+export const repositorySchema = z
+  .object({
+    repositoryId: repositoryIdSchema,
+    repositoryDatabaseId: repositoryDatabaseIdSchema,
+    owner: trimmedNameSchema,
+    name: trimmedNameSchema,
+    fullName: trimmedNameSchema,
+    description: z.string().nullable(),
+    url: httpsGitHubUrlSchema,
+    stargazerCount: z.number().int().nonnegative(),
+    isFork: z.boolean(),
+    isArchived: z.boolean(),
+    isDisabled: z.boolean(),
+    isPrivate: z.boolean(),
+    visibility: z.enum(["public", "private", "internal"]),
+    primaryLanguage: trimmedNameSchema.nullable(),
+    topics: topicsSchema,
+    licenseSpdxId: z.string().nullable(),
+    pushedAt: isoTimestampSchema.nullable(),
+    updatedAt: isoTimestampSchema,
+  })
+  .transform((repository): Repository => repository);

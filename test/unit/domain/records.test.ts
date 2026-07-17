@@ -19,6 +19,7 @@ import {
   type AccountBinding,
   type ListMembership,
   type ObservedRepositoryMetadata,
+  type Repository,
   type RepositoryView,
   type StarRecord,
   type UserList,
@@ -30,6 +31,19 @@ import type {
   SnapshotDraft,
 } from "../../../src/domain/snapshot.js";
 import { repositoryInputFixture } from "../../fixtures/domain.js";
+
+function assertParsedRepositoryReadonly(): void {
+  const repository = repositorySchema.parse(repositoryInputFixture);
+
+  // @ts-expect-error Parsed repository fields must remain readonly.
+  repository.owner = "Other";
+  /* eslint-disable @typescript-eslint/no-unsafe-call */
+  // @ts-expect-error Parsed repository topics must remain readonly.
+  repository.topics.push("mutation");
+  /* eslint-enable @typescript-eslint/no-unsafe-call */
+}
+
+void assertParsedRepositoryReadonly;
 
 test("validates stable identities and normalizes topics", () => {
   expect(() => asRepositoryId(" ")).toThrow(/repository_id/u);
@@ -58,8 +72,10 @@ test("validates stable identities and normalizes topics", () => {
   expect(runtime.operationId()).toMatch(/^op_[0-9a-f-]{36}$/u);
 
   const repository = repositorySchema.parse(repositoryInputFixture);
+  const readonlyRepository: Repository = repository;
   expect(repository.repositoryId).toBe("R_1");
   expect(repository.topics).toEqual(["agent", "mcp"]);
+  expect(readonlyRepository).toBe(repository);
 
   const trimmedRepository = repositorySchema.parse({
     ...repositoryInputFixture,
@@ -95,6 +111,18 @@ test("validates stable identities and normalizes topics", () => {
       updatedAt: "yesterday",
     }),
   ).toThrow();
+  expect(
+    repositorySchema.safeParse({
+      ...repositoryInputFixture,
+      pushedAt: "2026-07-16T08:00:00+08:00",
+    }).success,
+  ).toBe(false);
+  expect(
+    repositorySchema.safeParse({
+      ...repositoryInputFixture,
+      updatedAt: "2026-07-16T09:00:00+08:00",
+    }).success,
+  ).toBe(false);
 
   const binding: AccountBinding = {
     host: "github.com",
