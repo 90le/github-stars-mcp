@@ -1055,7 +1055,7 @@ test("attempt and reconciliation parsers enforce their closed lifecycle matrices
     runId: "run_1",
     operationId: "op_1",
     attempt: 1,
-    eventSequence: 0,
+    eventSequence: 1,
     after: { starred: true },
     observedAt: "2026-07-16T00:02:00.000Z",
     status: "failed",
@@ -1070,6 +1070,7 @@ test("attempt and reconciliation parsers enforce their closed lifecycle matrices
   expect(parseRunOperationReconciliation(confirmed).status).toBe("failed");
   for (const invalid of [
     { ...confirmed, eventSequence: -1 },
+    { ...confirmed, eventSequence: 0 },
     { ...confirmed, error: { ...confirmed.error, retryable: false } },
     {
       ...confirmed,

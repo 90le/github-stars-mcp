@@ -20,10 +20,12 @@ import {
   matchesFilter,
   normalizeSort,
   parseFilter,
+  parseRepositoryQuery,
   repositoryCursorPosition,
+  type FilterExpression,
   type RepositorySort,
 } from "../../../src/domain/filter.js";
-import type { RepositoryView } from "../../../src/domain/repository.js";
+import type { RepositoryFilterView } from "../../../src/domain/repository.js";
 import { canonicalUtcTimestamp } from "../../../src/domain/timestamp.js";
 import {
   compileCursor,
@@ -50,7 +52,9 @@ function expectValidationError(action: () => unknown, message?: RegExp): void {
   throw new Error("expected validation error");
 }
 
-function createDatabase(views: readonly RepositoryView[]): Database.Database {
+function createDatabase(
+  views: readonly RepositoryFilterView[],
+): Database.Database {
   const database = new Database(":memory:");
   database.exec(`
     CREATE TABLE repository_versions (
@@ -122,7 +126,7 @@ function createDatabase(views: readonly RepositoryView[]): Database.Database {
   return database;
 }
 
-function sqlMatches(view: RepositoryView, input: unknown): boolean {
+function sqlMatches(view: RepositoryFilterView, input: unknown): boolean {
   const filter = parseFilter(input);
   const compiled = compileFilter(filter);
   const database = createDatabase([view]);
@@ -143,9 +147,9 @@ function sqlMatches(view: RepositoryView, input: unknown): boolean {
 }
 
 function withView(
-  overrides: Partial<RepositoryView>,
+  overrides: Partial<RepositoryFilterView>,
   suffix = "case",
-): RepositoryView {
+): RepositoryFilterView {
   const repositoryId = overrides.repositoryId ?? asRepositoryId(`R_${suffix}`);
   return {
     ...repositoryViewFixture,
@@ -417,6 +421,83 @@ describe("closed repository filter language", () => {
     const view = withView({ owner: "OpenAI" }, "recursive");
     expect(matchesFilter(view, filter)).toBe(true);
     expect(sqlMatches(view, input)).toBe(true);
+  });
+
+  test("deep-freezes canonical nested filters returned in repository queries", () => {
+    const query = parseRepositoryQuery({
+      snapshotId: SNAPSHOT_ID,
+      filter: {
+        all: [
+          {
+            any: [
+              {
+                not: {
+                  field: "is_archived",
+                  op: "eq",
+                  value: true,
+                },
+              },
+            ],
+          },
+          {
+            field: "owner",
+            op: "in",
+            value: ["Other", "OpenAI"],
+          },
+        ],
+      },
+      sort: [],
+      pageSize: 10,
+      cursor: null,
+    });
+    const filter = query.filter as Extract<
+      FilterExpression,
+      { readonly all: readonly FilterExpression[] }
+    >;
+    const anyNode = filter.all[0] as Extract<
+      FilterExpression,
+      { readonly any: readonly FilterExpression[] }
+    >;
+    const notNode = anyNode.any[0] as Extract<
+      FilterExpression,
+      { readonly not: FilterExpression }
+    >;
+    const setLeaf = filter.all[1] as {
+      readonly field: "owner";
+      readonly op: "in";
+      readonly value: readonly string[];
+    };
+    const setValues = setLeaf.value;
+
+    expect(
+      [
+        query,
+        query.sort,
+        filter,
+        filter.all,
+        anyNode,
+        anyNode.any,
+        notNode,
+        notNode.not,
+        setLeaf,
+        setValues,
+      ].every((value) => Object.isFrozen(value)),
+    ).toBe(true);
+    expect(setValues).toEqual(["OpenAI", "Other"]);
+    expect(() =>
+      (filter.all as FilterExpression[]).push({
+        field: "owner",
+        op: "eq",
+        value: "mutated",
+      }),
+    ).toThrow(TypeError);
+    expect(() => (setValues as string[]).push("mutated")).toThrow(TypeError);
+    expect(() => Object.assign(notNode.not, { value: false })).toThrow(
+      TypeError,
+    );
+    expect(
+      matchesFilter(withView({ owner: "OpenAI" }, "immutable"), filter),
+    ).toBe(true);
   });
 
   test.each([

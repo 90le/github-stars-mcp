@@ -217,7 +217,8 @@ export interface Repository extends RepositoryCoordinates {
 export interface StarRecord { readonly repositoryId: RepositoryId; readonly starredAt: string }
 export interface UserList { readonly listId: UserListId; readonly name: string; readonly slug: string; readonly description: string | null; readonly isPrivate: boolean; readonly createdAt: string; readonly updatedAt: string; readonly lastAddedAt: string | null }
 export interface ListMembership { readonly listId: UserListId; readonly repositoryId: RepositoryId }
-export interface RepositoryView extends Repository { readonly starredAt: string; readonly listIds: readonly UserListId[] }
+export interface RepositoryView extends Repository { readonly starredAt: string }
+export interface RepositoryFilterView extends RepositoryView { readonly listIds: readonly UserListId[] }
 export interface ObservedRepositoryMetadata { readonly repository: Repository; readonly observedAt: string }
 ```
 
@@ -349,7 +350,7 @@ git commit -m "feat: add safe errors and configuration"
 - Create: `test/unit/domain/filter.test.ts`
 
 **Interfaces:**
-- Consumes: `RepositoryView`, `SnapshotId`, branded IDs, `AppError`.
+- Consumes: internal `RepositoryFilterView`, `SnapshotId`, branded IDs, `AppError`.
 - Produces: `FilterExpression`, `RepositorySort`, `RepositoryQuery`, `RepositoryQueryPage`, `ListQuery`, `ListQueryPage`, evaluators and SQL compiler.
 
 - [ ] **Step 1: Write failing equivalence, injection, and cursor tests**
@@ -434,6 +435,8 @@ temporal comparisons it also accepts
 and immediately resolves it, using the injected UTC `now`, to the absolute ISO
 timestamp present in the returned `FilterExpression`. Calendar months/years
 use UTC calendar arithmetic; all other units use exact duration arithmetic.
+The normalized filter, every nested group/leaf, and every set-value array are
+returned as detached, recursively frozen canonical data.
 Any relative result outside years `0000..9999` is rejected. The shared
 `canonicalUtcTimestamp` accepts only a valid `YYYY-MM-DDTHH:mm:ss[.SSS]Z`
 value with zero through three fractional digits and returns exactly
@@ -447,7 +450,9 @@ before in-memory comparison or cursor creation, so even a manually constructed
 view cannot disagree with SQLite. Adapters and storage must parse through
 these schemas at their boundaries. No unresolved relative value reaches SQL
 or an executable plan.
-`is_unclassified` means `listIds.length === 0`. Null checks are accepted only
+Filter evaluation uses the internal `RepositoryFilterView`;
+`is_unclassified` means its `listIds.length === 0`. Public `RepositoryView`
+and `RepositoryQueryPage` rows never expose memberships. Null checks are accepted only
 for nullable fields/collections and use a Boolean value. `normalizeSort`
 descriptor-snapshots plain data-only terms exactly once, rejects accessors,
 symbols, sparse arrays, custom prototypes, and hostile proxies, deduplicates,
@@ -842,6 +847,8 @@ descriptor-safe clone, reject unknown fields/aliases, and deeply freeze all
 returned values. The language aggregate is an ordered array rather than a
 property-keyed record, so a GitHub language such as `__proto__` is inert.
 `ListSummary` exposes `repositoryCount` and never embeds members.
+`RepositoryView` exposes repository metadata plus `starredAt` and never
+embeds `listIds`.
 `queryListMemberships` is the only membership read and returns a strict
 direction-specific ID page (`repositoryIds` for List selection or `listIds`
 for repository selection) with a cursor authenticated against the exact
@@ -852,11 +859,13 @@ remain available.
 `memory-storage.ts` starts unmigrated, initializes a private random 32-byte
 cursor key only in `migrate()`, and rejects all other operations before ready.
 A deterministic key may be injected only through the fixture factory input;
-no key/codec getter, own property, transaction snapshot, error, or log is
+it is copied immediately into a dedicated byte buffer, including when the
+source view is backed by `SharedArrayBuffer`, and temporary bytes are wiped.
+No key/codec getter, own property, transaction snapshot, error, or log is
 exposed. Repeated migration and close are idempotent. Writes parse detached
 copies; reads return new frozen detached values. Snapshot metadata versions
-and current pointers advance monotonically, and a completed snapshot remains
-unchanged after later metadata observations.
+and current pointers advance by lexical `(observedAt, versionHash)`, and a
+completed snapshot remains unchanged after later metadata observations.
 
 Snapshot coverage transitions are exact: `collecting -> complete`,
 `unavailable -> unavailable`, and `omitted -> omitted`. No other publication
@@ -978,7 +987,10 @@ root `migrate`, `close`, or another `withTransaction` are likewise rejected.
 It supplies a revocable transaction facade.
 It rolls back every Map/index/lease/attempt mutation on throw, native Promise,
 proxy, or any callable-data/accessor/inherited thenable detected by walking
-descriptors without reading or invoking `then`. The facade is revoked before
+descriptors without reading or invoking `then`. Each prototype level is
+checked for Proxy identity before reflection; the returned data graph is
+checked before a final poison-state check, so a caught reentry during
+inspection cannot commit. The facade is revoked before
 commit/rollback returns, so a captured
 `tx` cannot mutate later. It exposes no raw SQL, generic query, `execute`, or
 async transaction.

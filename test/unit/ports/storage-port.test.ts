@@ -4,6 +4,10 @@ import type {
   StoragePort,
   StorageTransaction,
 } from "../../../src/app/ports/storage-port.js";
+import {
+  canonicalJson,
+  sha256Hex,
+} from "../../../src/domain/canonical-json.js";
 import { AppError } from "../../../src/domain/errors.js";
 import {
   asPlanId,
@@ -272,6 +276,75 @@ describe("synchronous revocable transactions", () => {
     expect(() => rolledBackFacade?.getPlan(changePlanFixture.id)).toThrow();
   });
 
+  test("rejects dangerous return graphs before prototype traps can commit", () => {
+    const trapStore = openStore();
+    let reentryCaught = 0;
+    let getTrapCalls = 0;
+    const proxyPrototype = new Proxy(Object.create(null) as object, {
+      get(_target, property) {
+        getTrapCalls += 1;
+        return property === "then" ? () => undefined : undefined;
+      },
+      getOwnPropertyDescriptor() {
+        try {
+          trapStore.getPlan(changePlanFixture.id);
+        } catch {
+          reentryCaught += 1;
+        }
+        return undefined;
+      },
+    });
+    const disguised = Object.create(proxyPrototype) as object;
+
+    let caught: unknown;
+    try {
+      trapStore.withTransaction((tx) => {
+        tx.savePlan(changePlanFixture);
+        return disguised;
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AppError);
+    expect(caught).toMatchObject({ code: "PRECONDITION_FAILED" });
+    expect(reentryCaught).toBe(0);
+    expect(getTrapCalls).toBe(0);
+    expect(trapStore.getPlan(changePlanFixture.id)).toBeNull();
+
+    const nestedStore = openStore();
+    expect(() =>
+      nestedStore.withTransaction((tx) => {
+        tx.savePlan(changePlanFixture);
+        return { nested: new Proxy({}, {}) };
+      }),
+    ).toThrow(/synchronous|proxy|return/iu);
+    expect(nestedStore.getPlan(changePlanFixture.id)).toBeNull();
+  });
+
+  test("accepts ordinary class and null-prototype synchronous results", () => {
+    class TransactionResult {
+      readonly status = "committed";
+    }
+
+    const results = [
+      new TransactionResult(),
+      Object.assign(Object.create(null) as Record<string, unknown>, {
+        status: "committed",
+      }),
+      { nested: { status: "committed" } },
+    ] as const;
+    for (const result of results) {
+      const store = openStore();
+      expect(
+        store.withTransaction((tx) => {
+          tx.savePlan(changePlanFixture);
+          return result;
+        }),
+      ).toBe(result);
+      expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+    }
+  });
+
   test("poisons caught root reentry and nested transactions", () => {
     const store = openStore();
     expect(() =>
@@ -314,6 +387,35 @@ describe("synchronous revocable transactions", () => {
     store.close();
     store.close();
     expect(() => store.getSchemaVersion()).toThrow();
+  });
+
+  test("copies SharedArrayBuffer-backed cursor keys before migrate", () => {
+    const keyByte = 0x45;
+    const baseline = createMemoryStorage({
+      cursorKey: new Uint8Array(32).fill(keyByte),
+    });
+    const sharedBuffer = new SharedArrayBuffer(32);
+    const sharedKey = new Uint8Array(sharedBuffer);
+    sharedKey.fill(keyByte);
+    const isolated = createMemoryStorage({ cursorKey: sharedKey });
+    sharedKey.fill(0x99);
+
+    baseline.migrate();
+    isolated.migrate();
+    for (const store of [baseline, isolated]) {
+      acquireSync(store);
+      completeSnapshot(store, { batch: twoItemBatch() });
+    }
+    const query = {
+      snapshotId: snapshotDraftFixture.id,
+      filter: null,
+      sort: [],
+      pageSize: 1,
+      cursor: null,
+    } as const;
+    expect(baseline.queryRepositories(query).nextCursor).toBe(
+      isolated.queryRepositories(query).nextCursor,
+    );
   });
 });
 
@@ -622,6 +724,47 @@ describe("atomic snapshots, exact verification, and bounded queries", () => {
     ).not.toBe(first);
   });
 
+  test("selects equal-time current metadata by lexical version hash", () => {
+    const observedAt = "2026-07-17T00:00:00.000Z";
+    const repositories = [
+      { ...repositoryInputFixture, stargazerCount: 111 },
+      { ...repositoryInputFixture, stargazerCount: 222 },
+    ] as const;
+    const expected = [...repositories].sort((left, right) =>
+      sha256Hex(canonicalJson(left)).localeCompare(
+        sha256Hex(canonicalJson(right)),
+      ),
+    )[1]!;
+
+    for (const [index, ordered] of [
+      repositories,
+      [...repositories].reverse(),
+    ].entries()) {
+      const store = openStore();
+      acquireSync(store);
+      for (const [snapshotIndex, repository] of ordered.entries()) {
+        const batch = parseSnapshotBatch({
+          ...structuredClone(snapshotBatchFixture),
+          repositories: [{ repository, observedAt }],
+        });
+        completeSnapshot(store, {
+          id: `snap_metadata_${index}_${snapshotIndex}`,
+          batch,
+        });
+      }
+      expect(
+        store.getRepositoryMetadata(asRepositoryId("R_1"))?.repository
+          .stargazerCount,
+      ).toBe(expected.stargazerCount);
+      expect(
+        store.getSnapshotRepository(
+          asSnapshotId(`snap_metadata_${index}_0`),
+          asRepositoryId("R_1"),
+        )?.stargazerCount,
+      ).toBe(ordered[0].stargazerCount);
+    }
+  });
+
   test("authenticates List and both membership pagination directions", () => {
     const store = openStore();
     acquireSync(store);
@@ -688,6 +831,136 @@ describe("atomic snapshots, exact verification, and bounded queries", () => {
         cursor: tampered,
       }),
     ).toThrow();
+  });
+
+  test("keeps 101 memberships out of public repository rows and pages them only through membership queries", () => {
+    const store = openStore();
+    acquireSync(store);
+    const draft = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_many_memberships",
+    });
+    const lists = Array.from({ length: 101 }, (_, index) => ({
+      listId: asUserListId(`UL_many_${String(index).padStart(3, "0")}`),
+      name: `List ${String(index).padStart(3, "0")}`,
+      slug: `list-${String(index).padStart(3, "0")}`,
+      description: null,
+      isPrivate: false,
+      createdAt: "2026-07-15T00:00:00.000Z",
+      updatedAt: "2026-07-16T00:00:00.000Z",
+      lastAddedAt: null,
+    }));
+    const memberships = lists.map((list) => ({
+      listId: list.listId,
+      repositoryId: asRepositoryId("R_1"),
+    }));
+    store.createSnapshot({ draft, lease: SYNC_GUARD });
+    store.appendSnapshotBatch({
+      id: draft.id,
+      batch: {
+        repositories: snapshotBatchFixture.repositories,
+        stars: snapshotBatchFixture.stars,
+        lists: [],
+        memberships: [],
+      },
+      lease: SYNC_GUARD,
+    });
+    for (const [listPage, membershipPage] of [
+      [lists.slice(0, 100), memberships.slice(0, 100)],
+      [lists.slice(100), memberships.slice(100)],
+    ] as const) {
+      store.appendSnapshotBatch({
+        id: draft.id,
+        batch: {
+          repositories: [],
+          stars: [],
+          lists: listPage,
+          memberships: membershipPage,
+        },
+        lease: SYNC_GUARD,
+      });
+    }
+    store.beginSnapshotVerification({
+      id: draft.id,
+      listCoverage: "complete",
+      lease: SYNC_GUARD,
+    });
+    store.appendSnapshotVerificationBatch({
+      id: draft.id,
+      batch: {
+        stars: snapshotBatchFixture.stars,
+        lists: [],
+        memberships: [],
+      },
+      lease: SYNC_GUARD,
+    });
+    for (const [listPage, membershipPage] of [
+      [lists.slice(0, 100), memberships.slice(0, 100)],
+      [lists.slice(100), memberships.slice(100)],
+    ] as const) {
+      store.appendSnapshotVerificationBatch({
+        id: draft.id,
+        batch: {
+          stars: [],
+          lists: listPage,
+          memberships: membershipPage,
+        },
+        lease: SYNC_GUARD,
+      });
+    }
+    store.finishSnapshotVerification({ id: draft.id, lease: SYNC_GUARD });
+    store.completeSnapshot({
+      id: draft.id,
+      completedAt: "2026-07-16T00:02:00.000Z",
+      listCoverage: "complete",
+      counts: {
+        repositories: 1,
+        stars: 1,
+        lists: 101,
+        memberships: 101,
+      },
+      warningCount: 0,
+      sourceRateLimit: null,
+      lease: SYNC_GUARD,
+    });
+
+    expect(
+      store.getSnapshotRepository(draft.id, asRepositoryId("R_1")),
+    ).not.toHaveProperty("listIds");
+    expect(
+      store.queryRepositories({
+        snapshotId: draft.id,
+        filter: null,
+        sort: [],
+        pageSize: 1,
+        cursor: null,
+      }).items[0],
+    ).not.toHaveProperty("listIds");
+
+    const first = store.queryListMemberships({
+      snapshotId: draft.id,
+      selector: {
+        kind: "repository",
+        repositoryId: asRepositoryId("R_1"),
+      },
+      pageSize: 100,
+      cursor: null,
+    });
+    expect("listIds" in first && first.listIds).toHaveLength(100);
+    expect(first.total).toBe(101);
+    expect(first.nextCursor).not.toBeNull();
+    const second = store.queryListMemberships({
+      snapshotId: draft.id,
+      selector: {
+        kind: "repository",
+        repositoryId: asRepositoryId("R_1"),
+      },
+      pageSize: 100,
+      cursor: first.nextCursor,
+    });
+    expect("listIds" in second && second.listIds).toHaveLength(1);
+    expect(second.total).toBe(101);
+    expect(second.nextCursor).toBeNull();
   });
 });
 
@@ -862,6 +1135,9 @@ describe("plans, runs, attempts, reconciliation, and audit bounds", () => {
       "failed",
     ]);
     expect(
+      reconciliations.items.map(({ eventSequence }) => eventSequence),
+    ).toEqual([1, 2, 3]);
+    expect(
       store.getRunOperationAttempt({
         runId: changeRunFixture.id,
         operationId: pendingOperationFixture.operationId,
@@ -906,6 +1182,109 @@ describe("plans, runs, attempts, reconciliation, and audit bounds", () => {
         pageSize: 101,
       }),
     ).toThrow(/page size/iu);
+  });
+
+  test("rejects an unknown finish phase without finalizing the dispatch attempt", () => {
+    const store = openStore();
+    prepareRun(store);
+    store.startRunOperation({
+      runId: changeRunFixture.id,
+      operationId: pendingOperationFixture.operationId,
+      startedAt: "2026-07-16T02:02:00.000Z",
+      lease: APPLY_GUARD,
+    });
+    const finishUnknown = (input: unknown): unknown =>
+      (store.finishRunOperation as unknown as (rawInput: unknown) => unknown)(
+        input,
+      );
+    let caught: unknown;
+    try {
+      finishUnknown({
+        phase: "after_dispach",
+        runId: changeRunFixture.id,
+        operationId: pendingOperationFixture.operationId,
+        status: "succeeded",
+        reconciliation: "not_required",
+        externalRequestId: null,
+        after: { starred: false },
+        error: null,
+        finishedAt: "2026-07-16T02:03:00.000Z",
+        lease: APPLY_GUARD,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(AppError);
+    expect(caught).toMatchObject({ code: "VALIDATION_ERROR" });
+    expect(
+      store.getRunOperation({
+        runId: changeRunFixture.id,
+        operationId: pendingOperationFixture.operationId,
+      })?.status,
+    ).toBe("running");
+    expect(
+      store.getRunOperationAttempt({
+        runId: changeRunFixture.id,
+        operationId: pendingOperationFixture.operationId,
+        attempt: 1,
+      })?.status,
+    ).toBe("running");
+  });
+
+  test("allows a retried pending operation to skip without a new dispatch attempt", () => {
+    const store = openStore();
+    prepareRun(store);
+    store.startRunOperation({
+      runId: changeRunFixture.id,
+      operationId: pendingOperationFixture.operationId,
+      startedAt: "2026-07-16T02:02:00.000Z",
+      lease: APPLY_GUARD,
+    });
+    store.finishRunOperation({
+      phase: "after_dispatch",
+      runId: changeRunFixture.id,
+      operationId: pendingOperationFixture.operationId,
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      externalRequestId: null,
+      after: { starred: true },
+      error: retryableError(),
+      finishedAt: "2026-07-16T02:03:00.000Z",
+      lease: APPLY_GUARD,
+    });
+    store.retryRunOperation({
+      runId: changeRunFixture.id,
+      operationId: pendingOperationFixture.operationId,
+      maxAttempts: 2,
+      lease: APPLY_GUARD,
+    });
+    const skipped = store.finishRunOperation({
+      phase: "before_dispatch",
+      runId: changeRunFixture.id,
+      operationId: pendingOperationFixture.operationId,
+      status: "skipped",
+      reconciliation: "not_required",
+      error: null,
+      finishedAt: "2026-07-16T02:04:00.000Z",
+      lease: APPLY_GUARD,
+    });
+    expect(skipped).toMatchObject({
+      status: "skipped",
+      reconciliation: "not_required",
+      attempts: 1,
+      startedAt: null,
+      externalRequestId: null,
+      after: null,
+      error: null,
+    });
+    expect(
+      store.listRunOperationAttemptsPage({
+        runId: changeRunFixture.id,
+        operationId: pendingOperationFixture.operationId,
+        afterAttempt: null,
+        pageSize: 10,
+      }),
+    ).toMatchObject({ total: 1, nextAttempt: null });
   });
 
   test("validates all requested CAS edges before reading and requires fresh finish times", () => {
@@ -1072,6 +1451,40 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
     ).toEqual([]);
   });
 
+  test("rolls back every global snapshot recovery when a later candidate is invalid", () => {
+    const store = openStore();
+    store.acquireLease({
+      name: "sync:atomic",
+      ownerId: "old",
+      now: "2026-07-16T00:00:00.000Z",
+      expiresAt: "2026-07-16T00:10:00.000Z",
+    });
+    const guard = {
+      name: "sync:atomic",
+      ownerId: "old",
+      now: "2026-07-16T00:01:00.000Z",
+    } as const;
+    const early = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_atomic_early",
+      startedAt: "2026-07-16T00:00:00.000Z",
+    });
+    const future = parseSnapshotDraft({
+      ...snapshotDraftFixture,
+      id: "snap_atomic_future",
+      startedAt: "2026-07-16T00:20:00.000Z",
+    });
+    store.createSnapshot({ draft: early, lease: guard });
+    store.createSnapshot({ draft: future, lease: guard });
+
+    expect(() =>
+      store.recoverIncompleteSnapshots("2026-07-16T00:15:00.000Z"),
+    ).toThrow(/precede|timestamp/iu);
+    expect(
+      store.recoverIncompleteSnapshots("2026-07-16T00:21:00.000Z"),
+    ).toEqual([early.id, future.id]);
+  });
+
   test("recovers pending/running audit state once and rebinds a resumed run", () => {
     const store = openStore();
     prepareRun(store);
@@ -1126,6 +1539,109 @@ describe("leases, targeted takeover recovery, and bounded summaries", () => {
         lease: resumed,
       }).state,
     ).toBe("running");
+  });
+
+  test("rolls back targeted run recovery and classifies pending rows before dispatch", () => {
+    const store = openStore();
+    const leaseName = "apply:atomic";
+    store.acquireLease({
+      name: leaseName,
+      ownerId: "old",
+      now: "2026-07-16T02:00:00.000Z",
+      expiresAt: "2026-07-16T02:10:00.000Z",
+    });
+    const oldGuard = {
+      name: leaseName,
+      ownerId: "old",
+      now: "2026-07-16T02:01:00.000Z",
+    } as const;
+
+    const createCandidate = (
+      suffix: "early" | "future",
+      startedAt: string,
+      withOperation: boolean,
+    ) => {
+      const plan = parseChangePlan({
+        ...changePlanFixture,
+        id: `plan_atomic_${suffix}`,
+      });
+      const run = parseChangeRun({
+        ...changeRunFixture,
+        id: `run_atomic_${suffix}`,
+        planId: plan.id,
+        startedAt,
+      });
+      store.savePlan(plan);
+      store.compareAndSetPlanState({
+        planId: plan.id,
+        expected: ["ready"],
+        next: "applying",
+      });
+      store.createRun({ run, lease: oldGuard });
+      store.compareAndSetRunState({
+        runId: run.id,
+        expected: ["pending"],
+        next: "running",
+        finishedAt: null,
+        lease: oldGuard,
+      });
+      if (withOperation) {
+        store.createRunOperation({
+          operation: parseRunOperation({
+            ...pendingOperationFixture,
+            runId: run.id,
+          }),
+          lease: oldGuard,
+        });
+      }
+      return run;
+    };
+
+    const early = createCandidate("early", "2026-07-16T02:00:00.000Z", true);
+    const future = createCandidate("future", "2026-07-16T03:00:00.000Z", false);
+    store.acquireLease({
+      name: leaseName,
+      ownerId: "new",
+      now: "2026-07-16T02:11:00.000Z",
+      expiresAt: "2026-07-16T04:00:00.000Z",
+    });
+    expect(() =>
+      store.recoverAbandonedRuns({
+        binding: accountBindingFixture,
+        lease: {
+          name: leaseName,
+          ownerId: "new",
+          now: "2026-07-16T02:12:00.000Z",
+        },
+      }),
+    ).toThrow(/precede|finishedAt/iu);
+
+    expect(
+      store.recoverAbandonedRuns({
+        binding: accountBindingFixture,
+        lease: {
+          name: leaseName,
+          ownerId: "new",
+          now: "2026-07-16T03:01:00.000Z",
+        },
+      }),
+    ).toEqual([early.id, future.id]);
+    expect(
+      store.getRunOperation({
+        runId: early.id,
+        operationId: pendingOperationFixture.operationId,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      attempts: 0,
+      startedAt: null,
+      externalRequestId: null,
+      error: {
+        code: "INTERNAL_ERROR",
+        retryable: true,
+      },
+    });
   });
 
   test("bounds incomplete summaries while reporting full totals and status counts", () => {

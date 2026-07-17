@@ -55,6 +55,9 @@ export interface ListMembership {
 
 export interface RepositoryView extends Repository {
   readonly starredAt: string;
+}
+
+export interface RepositoryFilterView extends RepositoryView {
   readonly listIds: readonly UserListId[];
 }
 
@@ -180,10 +183,17 @@ export const userListSchema = z
 export const repositoryViewSchema = repositoryObjectSchema
   .extend({
     starredAt: isoTimestampSchema,
-    listIds: z.array(userListIdSchema),
   })
   .strict()
   .transform((view): RepositoryView => view);
+
+export const repositoryFilterViewSchema = repositoryObjectSchema
+  .extend({
+    starredAt: isoTimestampSchema,
+    listIds: z.array(userListIdSchema),
+  })
+  .strict()
+  .transform((view): RepositoryFilterView => view);
 
 export const observedRepositoryMetadataSchema = z
   .object({

@@ -441,7 +441,6 @@ export function parseRunOperation(input: unknown): RunOperation {
   const skipped =
     status === "skipped" &&
     reconciliation === "not_required" &&
-    attempts === 0 &&
     startedAt === null &&
     finishedAt !== null &&
     externalRequestId === null &&
@@ -653,7 +652,7 @@ export function parseRunOperationReconciliation(
       MAX_STABLE_ID,
     ),
     attempt: positiveInteger(root.attempt as JsonValue, "attempt number"),
-    eventSequence: nonnegativeInteger(
+    eventSequence: positiveInteger(
       root.eventSequence as JsonValue,
       "reconciliation event sequence",
     ),

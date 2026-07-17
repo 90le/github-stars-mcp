@@ -16,6 +16,7 @@ import { SystemRuntime } from "../../../src/app/ports/runtime-port.js";
 import type { JsonValue } from "../../../src/domain/json.js";
 import {
   observedRepositoryMetadataSchema,
+  repositoryFilterViewSchema,
   repositorySchema,
   repositoryViewSchema,
   starRecordSchema,
@@ -24,6 +25,7 @@ import {
   type ListMembership,
   type ObservedRepositoryMetadata,
   type Repository,
+  type RepositoryFilterView,
   type RepositoryView,
   type StarRecord,
   type UserList,
@@ -137,10 +139,18 @@ test("validates stable identities and normalizes topics", () => {
     ...repositoryInputFixture,
     pushedAt: "2026-07-16T00:00:00Z",
     starredAt: "2026-07-15T12:00:00Z",
-    listIds: ["UL_1"],
   });
   expect(parsedView.pushedAt).toBe("2026-07-16T00:00:00.000Z");
   expect(parsedView.starredAt).toBe("2026-07-15T12:00:00.000Z");
+  expect(
+    repositoryViewSchema.safeParse({ ...parsedView, listIds: ["UL_1"] })
+      .success,
+  ).toBe(false);
+  const parsedFilterView = repositoryFilterViewSchema.parse({
+    ...parsedView,
+    listIds: ["UL_1"],
+  });
+  expect(parsedFilterView.listIds).toEqual(["UL_1"]);
 
   const parsedObservation = observedRepositoryMetadataSchema.parse({
     repository: {
@@ -256,6 +266,9 @@ test("validates stable identities and normalizes topics", () => {
   const view: RepositoryView = {
     ...repository,
     starredAt: star.starredAt,
+  };
+  const filterView: RepositoryFilterView = {
+    ...view,
     listIds: [list.listId],
   };
   const observed: ObservedRepositoryMetadata = {
@@ -295,6 +308,7 @@ test("validates stable identities and normalizes topics", () => {
 
   expect(view.isDisabled).toBe(false);
   expect(view.isPrivate).toBe(false);
+  expect(filterView.listIds).toEqual([list.listId]);
   expect(list.lastAddedAt).toBeNull();
   expect(snapshot.sourceRateLimit).toEqual({ remaining: 4_999 });
   expect(batch.memberships).toEqual([membership]);

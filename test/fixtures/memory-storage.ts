@@ -18,6 +18,7 @@ import {
   canonicalJson,
   canonicalJsonClone,
   freezeJsonValue,
+  sha256Hex,
 } from "../../src/domain/canonical-json.js";
 import {
   createCursorCodec,
@@ -65,9 +66,11 @@ import {
 } from "../../src/domain/plan.js";
 import {
   observedRepositoryMetadataSchema,
+  repositoryFilterViewSchema,
   repositoryViewSchema,
   type AccountBinding,
   type ObservedRepositoryMetadata,
+  type RepositoryFilterView,
   type RepositoryView,
   type StarRecord,
   type UserList,
@@ -451,10 +454,27 @@ function metadataClone(
   return frozenClone(observedRepositoryMetadataSchema.parse(input));
 }
 
-function buildRepositoryView(
+function repositoryVersionHash(
+  observation: ObservedRepositoryMetadata,
+): string {
+  return sha256Hex(canonicalJson(observation.repository));
+}
+
+function metadataIsNewer(
+  candidate: ObservedRepositoryMetadata,
+  current: ObservedRepositoryMetadata,
+): boolean {
+  return (
+    candidate.observedAt > current.observedAt ||
+    (candidate.observedAt === current.observedAt &&
+      repositoryVersionHash(candidate) > repositoryVersionHash(current))
+  );
+}
+
+function buildRepositoryFilterView(
   record: SnapshotRecord,
   repositoryId: RepositoryId,
-): RepositoryView | null {
+): RepositoryFilterView | null {
   const observation = record.repositories.get(repositoryId);
   const star = record.stars.get(repositoryId);
   if (observation === undefined || star === undefined) return null;
@@ -463,12 +483,18 @@ function buildRepositoryView(
     .map((entry) => entry.listId)
     .sort(binaryCompare);
   return frozenClone(
-    repositoryViewSchema.parse({
+    repositoryFilterViewSchema.parse({
       ...observation.repository,
       starredAt: star.starredAt,
       listIds,
     }),
   );
+}
+
+function publicRepositoryView(view: RepositoryFilterView): RepositoryView {
+  const publicView: Record<string, unknown> = { ...view };
+  Reflect.deleteProperty(publicView, "listIds");
+  return frozenClone(repositoryViewSchema.parse(publicView));
 }
 
 function requireListCoverage(record: SnapshotRecord): void {
@@ -603,11 +629,11 @@ function pageResult<T>(
 
 function recoveryError(kind: "pending" | "running"): SerializedDomainError {
   return Object.freeze({
-    code: kind === "running" ? "RECONCILIATION_REQUIRED" : "PARTIAL_FAILURE",
+    code: kind === "running" ? "RECONCILIATION_REQUIRED" : "INTERNAL_ERROR",
     message:
       kind === "running"
         ? "Dispatch outcome is unknown after interruption"
-        : "Operation was interrupted before dispatch",
+        : "Operation was interrupted before dispatch; dispatch did not occur",
     retryable: kind === "pending",
     details: Object.freeze({ recovered: true }),
   });
@@ -734,7 +760,7 @@ export function createMemoryStorage(
       ) {
         return failure("VALIDATION_ERROR", "cursor key must be a Uint8Array");
       }
-      injectedKey = structuredClone(cursorKeyInput);
+      injectedKey = new Uint8Array(cursorKeyInput);
     } catch {
       return failure("VALIDATION_ERROR", "cursor key must be a Uint8Array");
     }
@@ -910,8 +936,10 @@ export function createMemoryStorage(
           const current = target.repositoryMetadata.get(idValue);
           if (
             current !== undefined &&
-            current.observedAt === observation.observedAt &&
-            canonicalJson(current) !== canonicalJson(observation)
+            repositoryVersionHash(current) ===
+              repositoryVersionHash(observation) &&
+            canonicalJson(current.repository) !==
+              canonicalJson(observation.repository)
           ) {
             return failure(
               "PRECONDITION_FAILED",
@@ -949,7 +977,7 @@ export function createMemoryStorage(
           const idValue = cloned.repository.repositoryId;
           record.repositories.set(idValue, cloned);
           const current = target.repositoryMetadata.get(idValue);
-          if (current === undefined || cloned.observedAt > current.observedAt) {
+          if (current === undefined || metadataIsNewer(cloned, current)) {
             target.repositoryMetadata.set(idValue, cloned);
           }
         }
@@ -1273,7 +1301,8 @@ export function createMemoryStorage(
         );
         const record = target.snapshots.get(snapshotId);
         if (record?.snapshot.status !== "complete") return null;
-        return buildRepositoryView(record, repositoryId);
+        const view = buildRepositoryFilterView(record, repositoryId);
+        return view === null ? null : publicRepositoryView(view);
       }
       case "getSnapshotListSummary": {
         const snapshotId = asSnapshotId(
@@ -1879,8 +1908,8 @@ export function createMemoryStorage(
     const record = completeSnapshotRecord(target, query.snapshotId);
     if (filterRequiresListCoverage(query.filter)) requireListCoverage(record);
     const selected = [...record.stars.keys()]
-      .map((id) => buildRepositoryView(record, asRepositoryId(id)))
-      .filter((view): view is RepositoryView => view !== null)
+      .map((id) => buildRepositoryFilterView(record, asRepositoryId(id)))
+      .filter((view): view is RepositoryFilterView => view !== null)
       .filter((view) =>
         query.filter === null ? true : matchesFilter(view, query.filter),
       )
@@ -1928,13 +1957,13 @@ export function createMemoryStorage(
         ? cursorCodec.encodeRepository(
             context,
             repositoryCursorPosition(
-              items.at(-1) as RepositoryView,
+              items.at(-1) as RepositoryFilterView,
               query.sort,
             ),
           )
         : null;
     return parseRepositoryQueryPage({
-      items,
+      items: items.map(publicRepositoryView),
       total: selected.length,
       aggregates: {
         languages,
@@ -2099,6 +2128,10 @@ export function createMemoryStorage(
     const root = canonicalJsonClone(raw);
     if (root === null || typeof root !== "object" || Array.isArray(root)) {
       return failure("VALIDATION_ERROR", "finish input must be an object");
+    }
+    const phase = (root as Record<string, JsonValue>).phase;
+    if (phase !== "before_dispatch" && phase !== "after_dispatch") {
+      return failure("VALIDATION_ERROR", "finish operation phase is invalid");
     }
     const input = root as unknown as FinishRunOperationInput;
     const expectedKeys =
@@ -2276,7 +2309,7 @@ export function createMemoryStorage(
       runId,
       operationId,
       attempt: operation.attempts,
-      eventSequence: events.length,
+      eventSequence: events.length + 1,
       after: input.after,
       observedAt,
       status: input.status,
@@ -2306,26 +2339,53 @@ export function createMemoryStorage(
     return callCore(name, state, args);
   }
 
-  function rejectsThenable(value: unknown): boolean {
+  function rejectsDangerousTransactionResult(value: unknown): boolean {
     if (
       (typeof value !== "object" || value === null) &&
       typeof value !== "function"
     ) {
       return false;
     }
-    if (utilTypes.isProxy(value)) return true;
-    let current: object | null = value;
+    const pending: object[] = [value];
+    const inspected = new Set<object>();
     try {
-      while (current !== null) {
-        const descriptor = Reflect.getOwnPropertyDescriptor(current, "then");
-        if (
-          descriptor !== undefined &&
-          (!Object.hasOwn(descriptor, "value") ||
-            typeof descriptor.value === "function")
-        ) {
-          return true;
+      while (pending.length > 0) {
+        const node = pending.pop() as object;
+        if (inspected.has(node)) continue;
+        inspected.add(node);
+        const prototypes = new Set<object>();
+        let current: object | null = node;
+        while (current !== null) {
+          if (prototypes.has(current) || utilTypes.isProxy(current))
+            return true;
+          prototypes.add(current);
+          const descriptors = Object.getOwnPropertyDescriptors(current);
+          const thenDescriptor = descriptors.then;
+          if (
+            thenDescriptor !== undefined &&
+            (!Object.hasOwn(thenDescriptor, "value") ||
+              typeof thenDescriptor.value === "function")
+          ) {
+            return true;
+          }
+          if (current === node) {
+            for (const key of Reflect.ownKeys(descriptors)) {
+              const descriptor = Reflect.get(
+                descriptors,
+                key,
+              ) as PropertyDescriptor;
+              if (
+                Object.hasOwn(descriptor, "value") &&
+                ((typeof descriptor.value === "object" &&
+                  descriptor.value !== null) ||
+                  typeof descriptor.value === "function")
+              ) {
+                pending.push(descriptor.value as object);
+              }
+            }
+          }
+          current = Reflect.getPrototypeOf(current);
         }
-        current = Reflect.getPrototypeOf(current);
       }
     } catch {
       return true;
@@ -2385,16 +2445,17 @@ export function createMemoryStorage(
     });
     try {
       const result = fn(revocable.proxy as StorageTransaction);
+      const dangerousResult = rejectsDangerousTransactionResult(result);
       if (transactionPoisoned) {
         return failure(
           "PRECONDITION_FAILED",
           "root storage reentry invalidated the transaction",
         );
       }
-      if (rejectsThenable(result)) {
+      if (dangerousResult) {
         return failure(
           "PRECONDITION_FAILED",
-          "transactions must be synchronous and cannot return thenables",
+          "transaction return graph must be synchronous and proxy-free",
         );
       }
       state = working;
@@ -2408,20 +2469,20 @@ export function createMemoryStorage(
   }
 
   function recoverSnapshots(
+    target: MemoryState,
     binding: AccountBinding | null,
     now: string,
     leaseName: string | null,
   ): readonly SnapshotId[] {
     const recovered: SnapshotId[] = [];
-    for (const record of state.snapshots.values()) {
-      if (
-        record.snapshot.status !== "building" ||
-        (binding !== null && !sameBinding(record.snapshot.binding, binding)) ||
-        (leaseName !== null && record.leaseName !== leaseName) ||
-        hasActiveStoredLease(state, record, now)
-      ) {
-        continue;
-      }
+    const candidates = [...target.snapshots.values()].filter(
+      (record) =>
+        record.snapshot.status === "building" &&
+        (binding === null || sameBinding(record.snapshot.binding, binding)) &&
+        (leaseName === null || record.leaseName === leaseName) &&
+        !hasActiveStoredLease(target, record, now),
+    );
+    for (const record of candidates) {
       record.snapshot = parseSnapshot({
         ...record.snapshot,
         status: "failed",
@@ -2441,21 +2502,21 @@ export function createMemoryStorage(
   }
 
   function recoverRuns(
+    target: MemoryState,
     binding: AccountBinding | null,
     now: string,
     leaseName: string | null,
   ): readonly RunId[] {
     const recovered: RunId[] = [];
-    for (const record of state.runs.values()) {
-      if (
-        (record.run.state !== "pending" && record.run.state !== "running") ||
-        (binding !== null && !sameBinding(record.run.binding, binding)) ||
-        (leaseName !== null && record.leaseName !== leaseName) ||
-        hasActiveStoredLease(state, record, now)
-      ) {
-        continue;
-      }
-      recoverRun(state, record, now);
+    const candidates = [...target.runs.values()].filter(
+      (record) =>
+        (record.run.state === "pending" || record.run.state === "running") &&
+        (binding === null || sameBinding(record.run.binding, binding)) &&
+        (leaseName === null || record.leaseName === leaseName) &&
+        !hasActiveStoredLease(target, record, now),
+    );
+    for (const record of candidates) {
+      recoverRun(target, record, now);
       recovered.push(record.run.id);
     }
     return Object.freeze(recovered.sort(binaryCompare));
@@ -2477,10 +2538,14 @@ export function createMemoryStorage(
           failure("STORAGE_ERROR", "closed storage cannot be migrated");
         }
         if (migrated) return;
-        codec = createCursorCodec(
-          injectedKey === null ? randomBytes(32) : injectedKey,
-        );
-        injectedKey = null;
+        const temporaryKey =
+          injectedKey === null ? randomBytes(32) : injectedKey;
+        try {
+          codec = createCursorCodec(temporaryKey);
+        } finally {
+          temporaryKey.fill(0);
+          injectedKey = null;
+        }
         migrated = true;
       },
     },
@@ -2572,7 +2637,15 @@ export function createMemoryStorage(
         const binding = parseBinding(input.binding as JsonValue);
         const guard = parseGuard(input.lease as JsonValue);
         assertLeaseCore(state, guard);
-        return recoverSnapshots(binding, guard.now, guard.name);
+        const working = structuredClone(state);
+        const recovered = recoverSnapshots(
+          working,
+          binding,
+          guard.now,
+          guard.name,
+        );
+        state = working;
+        return recovered;
       },
     },
     recoverAbandonedRuns: {
@@ -2588,7 +2661,10 @@ export function createMemoryStorage(
         const binding = parseBinding(input.binding as JsonValue);
         const guard = parseGuard(input.lease as JsonValue);
         assertLeaseCore(state, guard);
-        return recoverRuns(binding, guard.now, guard.name);
+        const working = structuredClone(state);
+        const recovered = recoverRuns(working, binding, guard.now, guard.name);
+        state = working;
+        return recovered;
       },
     },
     recoverIncompleteSnapshots: {
@@ -2596,11 +2672,11 @@ export function createMemoryStorage(
       value: (rawNow: unknown): readonly SnapshotId[] => {
         ensureRoot();
         ensureReady();
-        return recoverSnapshots(
-          null,
-          canonicalUtcTimestamp(rawNow, "recovery now"),
-          null,
-        );
+        const now = canonicalUtcTimestamp(rawNow, "recovery now");
+        const working = structuredClone(state);
+        const recovered = recoverSnapshots(working, null, now, null);
+        state = working;
+        return recovered;
       },
     },
     recoverInterruptedRuns: {
@@ -2608,11 +2684,11 @@ export function createMemoryStorage(
       value: (rawNow: unknown): readonly RunId[] => {
         ensureRoot();
         ensureReady();
-        return recoverRuns(
-          null,
-          canonicalUtcTimestamp(rawNow, "recovery now"),
-          null,
-        );
+        const now = canonicalUtcTimestamp(rawNow, "recovery now");
+        const working = structuredClone(state);
+        const recovered = recoverRuns(working, null, now, null);
+        state = working;
+        return recovered;
       },
     },
     close: {
@@ -2622,6 +2698,7 @@ export function createMemoryStorage(
         if (closed) return;
         closed = true;
         codec = null;
+        injectedKey?.fill(0);
         injectedKey = null;
       },
     },

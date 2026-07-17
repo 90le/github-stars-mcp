@@ -15,6 +15,7 @@ import type { JsonValue } from "./json.js";
 import {
   repositoryViewSchema,
   userListSchema,
+  type RepositoryFilterView,
   type RepositoryView,
   type UserList,
 } from "./repository.js";
@@ -698,7 +699,7 @@ export function parseFilter(
   }
 
   try {
-    return parseNode(input, 1);
+    return frozenClone(parseNode(input, 1));
   } catch (error) {
     if (error instanceof AppError) throw error;
     throw new AppError("VALIDATION_ERROR", "filter could not be parsed", {
@@ -762,14 +763,14 @@ function temporalValue(
 }
 
 function collectionValue(
-  view: RepositoryView,
+  view: RepositoryFilterView,
   field: CollectionFilterField,
 ): readonly string[] {
   return field === "topics" ? view.topics : view.listIds;
 }
 
 export function matchesFilter(
-  view: RepositoryView,
+  view: RepositoryFilterView,
   filter: FilterExpression,
 ): boolean {
   if ("all" in filter) {

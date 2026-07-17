@@ -12,8 +12,8 @@ import {
   type PlanExecutableContent,
 } from "../../src/domain/plan.js";
 import {
-  repositoryViewSchema,
-  type RepositoryView,
+  repositoryFilterViewSchema,
+  type RepositoryFilterView,
 } from "../../src/domain/repository.js";
 import { parseChangeRun, parseRunOperation } from "../../src/domain/run.js";
 import {
@@ -42,13 +42,12 @@ export const repositoryInputFixture = {
   updatedAt: "2026-07-16T01:00:00.000Z",
 } as const;
 
-export const repositoryViewFixture: RepositoryView = repositoryViewSchema.parse(
-  {
+export const repositoryViewFixture: RepositoryFilterView =
+  repositoryFilterViewSchema.parse({
     ...repositoryInputFixture,
     starredAt: "2026-07-15T12:00:00.000Z",
     listIds: [asUserListId("UL_1")],
-  },
-);
+  });
 
 export const accountBindingFixture = Object.freeze({
   host: "github.com",
