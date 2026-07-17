@@ -29,7 +29,9 @@
       "Find strong GitHub repositories for my topic and compare them.",
       "Plan a safe reorganization of my Stars and User Lists."
     ],
-    "brandColor": "#7C5CFC"
+    "brandColor": "#F5B301",
+    "composerIcon": "./assets/icon.png",
+    "logo": "./assets/logo.png"
   },
   "mcpServers": "./.mcp.json"
 }

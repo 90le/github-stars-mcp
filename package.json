@@ -40,6 +40,7 @@
     "yaml:check": "node scripts/verify-yaml.mjs",
     "workflows:check": "node scripts/verify-workflows.mjs",
     "plugin:validate": "node scripts/validate-plugin.mjs",
+    "assets:check": "node scripts/verify-assets.mjs",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:coverage": "vitest run --coverage",
