@@ -103,10 +103,13 @@ Set the shared compiler options to `module`/`moduleResolution: NodeNext`, target
 `src/**/*.ts`, uses `rootDir: "src"` and `outDir: "dist"`, and enables
 declarations and source maps. No test can emit under `dist/`. Configure Vitest
 for Node, `test/**/*.test.ts`, and coverage thresholds 90% lines/functions and
-85% branches.
+85% branches. Coverage must explicitly include `src/**/*.ts`, including files
+that no test imports. The generated shrinkwrap may contain only official
+`https://registry.npmjs.org/` registry resolution URLs—never a developer's
+machine-specific mirror.
 
 - [ ] **Step 2: Install and prove the source module is missing**
-Run `npm install && npm test -- --run test/unit/project-setup.test.ts`; expect install success followed by failure loading `../../src/version.js`.
+Run `npm install && npm test -- test/unit/project-setup.test.ts`; expect install success followed by failure loading `../../src/version.js`.
 
 - [ ] **Step 3: Add the minimum identity and freeze dependencies**
 
@@ -115,10 +118,11 @@ export const PACKAGE_NAME = "github-stars-mcp";
 export const PACKAGE_VERSION = "0.1.0";
 ```
 
-Run `npm shrinkwrap`; verify lockfile version 3 and exact direct versions.
+Run `npm shrinkwrap`; verify lockfile version 3, exact direct versions, and no
+non-official registry resolution URL.
 
 - [ ] **Step 4: Verify foundation behavior**
-Run `npm run format && npm run lint && npm run typecheck && npm test -- --run test/unit/project-setup.test.ts && npm run build && npm pack --dry-run`; expect all exit 0, one passing test, and no `src`, `test`, or `.env` in the tarball.
+Run `npm run format && npm run lint && npm run typecheck && npm test -- test/unit/project-setup.test.ts && npm run build && npm pack --dry-run`; expect all exit 0, one passing test, and no `src`, `test`, or `.env` in the tarball.
 
 - [ ] **Step 5: Commit**
 
@@ -161,7 +165,7 @@ test("validates stable identities and normalizes topics", () => {
 ```
 
 - [ ] **Step 2: Prove the domain modules are missing**
-Run `npm test -- --run test/unit/domain/records.test.ts`; expect FAIL resolving `src/domain/ids.ts`.
+Run `npm test -- test/unit/domain/records.test.ts`; expect FAIL resolving `src/domain/ids.ts`.
 
 - [ ] **Step 3: Implement the exact contracts**
 
@@ -220,7 +224,7 @@ export interface SnapshotBatch { readonly repositories: readonly ObservedReposit
 ```
 
 - [ ] **Step 4: Verify records and types**
-Run `npm test -- --run test/unit/domain/records.test.ts && npm run typecheck && npm run lint`; expect one passing test and zero static-check errors.
+Run `npm test -- test/unit/domain/records.test.ts && npm run typecheck && npm run lint`; expect one passing test and zero static-check errors.
 
 - [ ] **Step 5: Commit**
 
@@ -259,7 +263,7 @@ test("redacts nested secrets and defaults read-only", () => {
 ```
 
 - [ ] **Step 2: Prove both imports fail**
-Run `npm test -- --run test/unit/domain/errors-config.test.ts`; expect FAIL resolving `src/config.ts` or `src/domain/errors.ts`.
+Run `npm test -- test/unit/domain/errors-config.test.ts`; expect FAIL resolving `src/config.ts` or `src/domain/errors.ts`.
 
 - [ ] **Step 3: Implement safe public values**
 
@@ -289,7 +293,7 @@ export function loadConfig(env?: NodeJS.ProcessEnv, platform?: NodeJS.Platform):
 Resolve data directory from `GITHUB_STARS_MCP_DATA_DIR`, `%LOCALAPPDATA%\github-stars-mcp`, `$XDG_STATE_HOME/github-stars-mcp`, or `~/.local/state/github-stars-mcp`. Reject non-`github.com`, relative paths, concurrency outside 1–8, interval below 1,000, actions outside 1–5,000, TTL outside 1–10,080, and invalid booleans. Never read credential variables.
 
 - [ ] **Step 4: Verify no secret appears**
-Run `npm test -- --run test/unit/domain/errors-config.test.ts && npm run typecheck && npm run lint`; expect one pass, no `ghp_secret` output, and clean static checks.
+Run `npm test -- test/unit/domain/errors-config.test.ts && npm run typecheck && npm run lint`; expect one pass, no `ghp_secret` output, and clean static checks.
 
 - [ ] **Step 5: Commit**
 
@@ -350,7 +354,7 @@ test("evaluates filters while parameterizing caller text", () => {
 ```
 
 - [ ] **Step 2: Prove filter modules are absent**
-Run `npm test -- --run test/unit/domain/filter.test.ts`; expect FAIL resolving `src/domain/filter.ts`.
+Run `npm test -- test/unit/domain/filter.test.ts`; expect FAIL resolving `src/domain/filter.ts`.
 
 - [ ] **Step 3: Implement the closed query language**
 
@@ -410,7 +414,7 @@ boundaries, duplicate sort values, empty final pages, cursor tampering, and
 cross-snapshot/filter/sort/resource reuse.
 
 - [ ] **Step 4: Verify behavior and SQL safety**
-Run `npm test -- --run test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect one pass, hostile text only in parameters, and clean static checks.
+Run `npm test -- test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect one pass, hostile text only in parameters, and clean static checks.
 
 - [ ] **Step 5: Commit**
 
@@ -449,7 +453,7 @@ test("canonicalizes, orders dependencies, and guards terminals", () => {
 ```
 
 - [ ] **Step 2: Prove plan modules are absent**
-Run `npm test -- --run test/unit/domain/plan-run.test.ts`; expect FAIL resolving `src/domain/canonical-json.ts`.
+Run `npm test -- test/unit/domain/plan-run.test.ts`; expect FAIL resolving `src/domain/canonical-json.ts`.
 
 - [ ] **Step 3: Implement exact request, operation, plan, and run types**
 
@@ -496,7 +500,7 @@ export interface RunOperation { readonly runId:RunId; readonly operationId:strin
 Run transitions: `pending→running`, `running→completed|partial|failed`, `partial→running`. `canonicalJson`, `sha256Hex`, and `hashPlanExecutable` reject unsupported/non-finite values and hash only `PlanExecutableContent`. The planner derives `binding` from the referenced complete snapshot, uses the fixed `policyVersion: "1"`, and never accepts caller-supplied account identity.
 
 - [ ] **Step 4: Verify hash determinism and transition tables**
-Run `npm test -- --run test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect one pass with graph, hash, and state assertions green.
+Run `npm test -- test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect one pass with graph, hash, and state assertions green.
 
 - [ ] **Step 5: Commit**
 
@@ -529,7 +533,7 @@ test("StoragePort transactions are synchronous", () => {
 ```
 
 - [ ] **Step 2: Prove the port is missing**
-Run `npm test -- --run test/unit/ports/storage-port.test.ts`; expect FAIL resolving `src/app/ports/storage-port.ts`.
+Run `npm test -- test/unit/ports/storage-port.test.ts`; expect FAIL resolving `src/app/ports/storage-port.ts`.
 
 - [ ] **Step 3: Define every exact method**
 
@@ -588,7 +592,7 @@ rows remain immutable. It exposes no raw SQL, generic query, `execute`, or
 async transaction.
 
 - [ ] **Step 4: Verify exact structural compliance**
-Run `npm test -- --run test/unit/ports/storage-port.test.ts && npm run typecheck && npm run lint`; expect one pass and exact fake-port structural compliance.
+Run `npm test -- test/unit/ports/storage-port.test.ts && npm run typecheck && npm run lint`; expect one pass and exact fake-port structural compliance.
 
 - [ ] **Step 5: Commit**
 
@@ -647,7 +651,7 @@ test("later metadata observations cannot change a completed snapshot", () => {
 ```
 
 - [ ] **Step 2: Prove storage modules are absent**
-Run `npm test -- --run test/integration/storage/snapshot.test.ts`; expect FAIL resolving `src/storage/sqlite-database.ts`.
+Run `npm test -- test/integration/storage/snapshot.test.ts`; expect FAIL resolving `src/storage/sqlite-database.ts`.
 
 - [ ] **Step 3: Implement schema and focused repositories**
 
@@ -715,7 +719,7 @@ pre-existing restrictive mode, and skip only the numeric-mode assertions on
 Windows.
 
 - [ ] **Step 4: Verify rollback, foreign keys, queries, and lease ownership**
-Run `npm test -- --run test/integration/storage/snapshot.test.ts test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect all pass, including orphan-FK rejection, mid-save rollback, and duplicate-free cursor pages.
+Run `npm test -- test/integration/storage/snapshot.test.ts test/unit/domain/filter.test.ts && npm run typecheck && npm run lint`; expect all pass, including orphan-FK rejection, mid-save rollback, and duplicate-free cursor pages.
 
 - [ ] **Step 5: Commit**
 
@@ -777,7 +781,7 @@ test("running audit records recover as unresolved", () => {
 ```
 
 - [ ] **Step 2: Prove facade and plan repository are absent**
-Run `npm test -- --run test/integration/storage/plan-run.test.ts`; expect FAIL resolving `src/storage/sqlite-store.ts`.
+Run `npm test -- test/integration/storage/plan-run.test.ts`; expect FAIL resolving `src/storage/sqlite-store.ts`.
 
 - [ ] **Step 3: Implement immutable persistence and recovery**
 
@@ -836,7 +840,7 @@ exist.
 `SQLiteStore` delegates every port method, owns one connection, makes `close` idempotent, and implements `withTransaction` with `db.transaction(fn).immediate()`. If the callback returns a Promise, roll back and throw `STORAGE_ERROR`; no transaction crosses `await`.
 
 - [ ] **Step 4: Run complete foundation and reopen verification**
-Run `npm test -- --run test/unit test/integration/storage && npm run test:coverage && npm run format:check && npm run lint && npm run typecheck && npm run build && git diff --check`; expect full success, coverage gates, and a reopen test proving one-time recovery without hash/before-state changes.
+Run `npm test -- test/unit test/integration/storage && npm run test:coverage && npm run format:check && npm run lint && npm run typecheck && npm run build && git diff --check`; expect full success, coverage gates, and a reopen test proving one-time recovery without hash/before-state changes.
 
 - [ ] **Step 5: Commit**
 

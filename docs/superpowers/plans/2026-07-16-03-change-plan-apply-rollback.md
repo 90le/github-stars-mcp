@@ -195,7 +195,7 @@ expect(scripted.requests).toHaveLength(1);
 Run:
 
 ```bash
-npm test -- --run test/contract/github/mutations.test.ts
+npm test -- test/contract/github/mutations.test.ts
 ```
 
 Expected: FAIL on missing port methods, mutation documents, or mutation transcript variants.
@@ -275,7 +275,7 @@ Extend the scripted seam's REST method union with `PUT | DELETE`, GraphQL steps 
 Run:
 
 ```bash
-npm test -- --run test/contract/github/mutations.test.ts test/security/github-read-boundary.test.ts
+npm test -- test/contract/github/mutations.test.ts test/security/github-read-boundary.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -385,7 +385,7 @@ Also test:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/plan-service.test.ts
+npm test -- test/unit/services/plan-service.test.ts
 ```
 
 Expected: FAIL resolving `plan-service.ts`, `operation-resolver.ts`, or the shared fixture.
@@ -439,7 +439,7 @@ Call `topologicalOperationIds` before `savePlan`, save once inside one synchrono
 Run:
 
 ```bash
-npm test -- --run test/unit/services/plan-service.test.ts test/unit/domain/plan-run.test.ts
+npm test -- test/unit/services/plan-service.test.ts test/unit/domain/plan-run.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -530,7 +530,7 @@ await expect(executor.execute({
 Run:
 
 ```bash
-npm test -- --run test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
+npm test -- test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
 ```
 
 Expected: FAIL resolving the two service modules.
@@ -556,7 +556,7 @@ For every Star operation, `MutationExecutor` calls `getRepositoryIdentity(coordi
 Run:
 
 ```bash
-npm test -- --run test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
+npm test -- test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -630,7 +630,7 @@ Also test:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-service.test.ts
+npm test -- test/unit/services/apply-service.test.ts
 ```
 
 Expected: FAIL resolving `apply-service.ts`.
@@ -674,7 +674,7 @@ with plan operations.
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-service.test.ts test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
+npm test -- test/unit/services/apply-service.test.ts test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -748,7 +748,7 @@ Add resume tests proving:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-reconciliation.test.ts
+npm test -- test/unit/services/apply-reconciliation.test.ts
 ```
 
 Expected: FAIL resolving `reconciliation.ts` or on incorrect resume state.
@@ -782,7 +782,7 @@ Keep the mutation transport's retry count at zero; all repeat dispatches are vis
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-reconciliation.test.ts test/unit/services/apply-service.test.ts test/contract/github/mutations.test.ts
+npm test -- test/unit/services/apply-reconciliation.test.ts test/unit/services/apply-service.test.ts test/contract/github/mutations.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -846,7 +846,7 @@ Test:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/rollback-service.test.ts
+npm test -- test/unit/services/rollback-service.test.ts
 ```
 
 Expected: FAIL resolving `rollback-service.ts`.
@@ -872,7 +872,7 @@ Rollback operation routing/preconditions come from persisted source `before`/`af
 Run:
 
 ```bash
-npm test -- --run test/unit/services/rollback-service.test.ts test/unit/domain/plan-run.test.ts
+npm test -- test/unit/services/rollback-service.test.ts test/unit/domain/plan-run.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -942,7 +942,7 @@ The security test also reads `src/app/ports/github-port.ts` and `src/github/octo
 Run:
 
 ```bash
-npm test -- --run test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
+npm test -- test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
 ```
 
 Expected: FAIL resolving `inspect-service.ts` or the mutation manifest.
@@ -958,7 +958,7 @@ Call `redactSecrets` on the complete presentation object after paging. Never ret
 Run:
 
 ```bash
-npm test -- --run test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
+npm test -- test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -999,7 +999,7 @@ Require the repository to equal `<login>/github-stars-mcp-fixture-<suffix>` with
 Run:
 
 ```bash
-npm test -- --run test/unit/live-contract-config.test.ts
+npm test -- test/unit/live-contract-config.test.ts
 ```
 
 Expected: FAIL resolving `test/fixtures/live-contract.ts`. This command must not discover or run `test/live/**`.
@@ -1037,8 +1037,8 @@ No PR/default CI command may execute the live suite.
 Run:
 
 ```bash
-npm test -- --run test/unit/live-contract-config.test.ts
-npm test -- --run test/security/github-capability-boundary.test.ts
+npm test -- test/unit/live-contract-config.test.ts
+npm test -- test/security/github-capability-boundary.test.ts
 npm run typecheck
 npm run lint
 ```
