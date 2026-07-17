@@ -51,6 +51,12 @@ function graphqlOnlyTransport(
         typeof response === "function" ? response(operation, signal) : response;
       return Promise.resolve(result as GraphqlTransportResponse<T>);
     },
+    restMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected REST mutation"));
+    },
+    graphqlMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected GraphQL mutation"));
+    },
   };
 }
 
@@ -61,20 +67,30 @@ async function rejectedError(promise: Promise<unknown>): Promise<AppError> {
 }
 
 describe("GitHub User List read contracts", () => {
-  it("exposes the final read methods without mutation stubs", () => {
+  it("exposes only the approved named adapter methods", () => {
     expectTypeOf<OctokitGitHubAdapter>().toMatchTypeOf<GitHubSyncReadPort>();
     expect(
       Object.getOwnPropertyNames(OctokitGitHubAdapter.prototype).sort(),
     ).toEqual(
       [
         "constructor",
+        "checkStar",
+        "createUserList",
+        "deleteUserList",
         "getReadme",
+        "getRepositoryIdentity",
+        "getRepositoryListIds",
+        "getUserList",
         "getViewer",
         "listStarredRepositories",
         "listUserListItems",
         "listUserLists",
         "probeCapabilities",
         "searchRepositories",
+        "setRepositoryListIds",
+        "star",
+        "unstar",
+        "updateUserList",
       ].sort(),
     );
   });

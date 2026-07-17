@@ -2200,7 +2200,12 @@ describe("Octokit GitHub transport", () => {
   it("exposes only the transport methods and keeps plugin retries disabled in source", async () => {
     const harness = transportHarness([]);
 
-    expect(Object.keys(harness.transport).sort()).toEqual(["graphql", "rest"]);
+    expect(Object.keys(harness.transport).sort()).toEqual([
+      "graphql",
+      "graphqlMutation",
+      "rest",
+      "restMutation",
+    ]);
     expect(JSON.stringify(harness.transport)).not.toContain(TOKEN);
     expectTypeOf<OctokitTransportRuntime>().toEqualTypeOf<{
       fetch: typeof globalThis.fetch;

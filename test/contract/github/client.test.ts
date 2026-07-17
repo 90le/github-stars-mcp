@@ -1,8 +1,11 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type {
   CapabilityState,
+  CreateUserListInput,
   GitHubCapabilities,
+  GitHubLiveReadPort,
   GitHubListItem,
+  GitHubMutationPort,
   GitHubPort,
   GitHubReadme,
   GitHubRepository,
@@ -10,10 +13,14 @@ import type {
   GitHubSearchPage,
   GitHubStar,
   GitHubUserList,
+  MutationReceipt,
   Page,
   RateLimitState,
+  RepositoryIdentity,
+  UpdateUserListInput,
+  UserListMutationResult,
 } from "../../../src/app/ports/github-port.js";
-import type { UserListId } from "../../../src/domain/ids.js";
+import type { RepositoryId, UserListId } from "../../../src/domain/ids.js";
 import type {
   AccountBinding,
   Repository,
@@ -21,13 +28,19 @@ import type {
   UserList,
 } from "../../../src/domain/repository.js";
 import {
+  GITHUB_MUTATION_METHOD_NAMES,
+  GRAPHQL_MUTATION_DOCUMENTS,
+  GRAPHQL_MUTATION_OPERATIONS,
   GRAPHQL_READ_DOCUMENTS,
   GRAPHQL_READ_OPERATIONS,
+  REST_MUTATION_OPERATIONS,
   REST_READ_OPERATIONS,
   type GitHubTransport,
+  type GraphqlMutationOperation,
   type GraphqlReadOperation,
   type GraphqlTransportError,
   type GraphqlTransportResponse,
+  type RestMutationOperation,
   type RestReadOperation,
   type RestTransportResponse,
   type TransportHeaders,
@@ -47,13 +60,23 @@ type ExpectedPortMethod =
   | "listUserLists"
   | "listUserListItems"
   | "getReadme"
-  | "searchRepositories";
+  | "searchRepositories"
+  | "getRepositoryIdentity"
+  | "getUserList"
+  | "checkStar"
+  | "getRepositoryListIds"
+  | "star"
+  | "unstar"
+  | "createUserList"
+  | "updateUserList"
+  | "deleteUserList"
+  | "setRepositoryListIds";
 
 const normalizeDocument = (document: string): string =>
   document.replace(/\s+/gu, " ").trim();
 
-describe("GitHub read boundary contracts", () => {
-  it("locks the application port to the seven approved named methods", () => {
+describe("GitHub read and mutation boundary contracts", () => {
+  it("locks the application port to the approved named methods", () => {
     const hasExactMethodSet: Equal<keyof GitHubPort, ExpectedPortMethod> = true;
 
     expect(hasExactMethodSet).toBe(true);
@@ -91,6 +114,71 @@ describe("GitHub read boundary contracts", () => {
         signal?: AbortSignal,
       ) => Promise<GitHubSearchPage>
     >();
+    expectTypeOf<GitHubPort["getRepositoryIdentity"]>().toEqualTypeOf<
+      (
+        repository: RepositoryCoordinates,
+        signal?: AbortSignal,
+      ) => Promise<RepositoryIdentity | null>
+    >();
+    expectTypeOf<GitHubPort["getUserList"]>().toEqualTypeOf<
+      (
+        listId: UserListId,
+        signal?: AbortSignal,
+      ) => Promise<GitHubUserList | null>
+    >();
+    expectTypeOf<GitHubPort["checkStar"]>().toEqualTypeOf<
+      (
+        repository: RepositoryCoordinates,
+        signal?: AbortSignal,
+      ) => Promise<boolean>
+    >();
+    expectTypeOf<GitHubPort["getRepositoryListIds"]>().toEqualTypeOf<
+      (
+        repositoryId: RepositoryId,
+        signal?: AbortSignal,
+      ) => Promise<readonly UserListId[]>
+    >();
+    expectTypeOf<GitHubPort["star"]>().toEqualTypeOf<
+      (
+        repository: RepositoryCoordinates,
+        operationId: string,
+        signal?: AbortSignal,
+      ) => Promise<MutationReceipt>
+    >();
+    expectTypeOf<GitHubPort["unstar"]>().toEqualTypeOf<GitHubPort["star"]>();
+    expectTypeOf<GitHubPort["createUserList"]>().toEqualTypeOf<
+      (
+        input: CreateUserListInput,
+        operationId: string,
+        signal?: AbortSignal,
+      ) => Promise<UserListMutationResult>
+    >();
+    expectTypeOf<GitHubPort["updateUserList"]>().toEqualTypeOf<
+      (
+        listId: UserListId,
+        input: UpdateUserListInput,
+        operationId: string,
+        signal?: AbortSignal,
+      ) => Promise<UserListMutationResult>
+    >();
+    expectTypeOf<GitHubPort["deleteUserList"]>().toEqualTypeOf<
+      (
+        listId: UserListId,
+        operationId: string,
+        signal?: AbortSignal,
+      ) => Promise<MutationReceipt>
+    >();
+    expectTypeOf<GitHubPort["setRepositoryListIds"]>().toEqualTypeOf<
+      (
+        repositoryId: RepositoryId,
+        listIds: readonly UserListId[],
+        operationId: string,
+        signal?: AbortSignal,
+      ) => Promise<MutationReceipt>
+    >();
+    expectTypeOf<GitHubPort>().toMatchTypeOf<
+      GitHubLiveReadPort & GitHubMutationPort
+    >();
   });
 
   it("keeps the approved port value types aligned with domain identities", () => {
@@ -121,12 +209,16 @@ describe("GitHub read boundary contracts", () => {
       listStars: "GET /user/starred",
       getReadme: "GET /repos/{owner}/{repo}/readme",
       searchRepositories: "GET /search/repositories",
+      getRepositoryIdentity: "GET /repos/{owner}/{repo}",
+      checkStar: "GET /user/starred/{owner}/{repo}",
     });
     expect(GRAPHQL_READ_OPERATIONS).toEqual({
       listLists: "ViewerLists",
       listItems: "UserListItems",
+      getUserList: "GetUserList",
     });
     expect(Object.keys(GRAPHQL_READ_DOCUMENTS).sort()).toEqual([
+      "getUserList",
       "listItems",
       "listLists",
     ]);
@@ -134,10 +226,53 @@ describe("GitHub read boundary contracts", () => {
     expect(Object.isFrozen(GRAPHQL_READ_OPERATIONS)).toBe(true);
     expect(Object.isFrozen(GRAPHQL_READ_DOCUMENTS)).toBe(true);
     expectTypeOf<RestReadOperation>().toEqualTypeOf<
-      "getViewer" | "listStars" | "getReadme" | "searchRepositories"
+      | "getViewer"
+      | "listStars"
+      | "getReadme"
+      | "searchRepositories"
+      | "getRepositoryIdentity"
+      | "checkStar"
     >();
     expectTypeOf<GraphqlReadOperation>().toEqualTypeOf<
-      "listLists" | "listItems"
+      "listLists" | "listItems" | "getUserList"
+    >();
+  });
+
+  it("keeps mutation registries separate, exact, and frozen", () => {
+    expect(REST_MUTATION_OPERATIONS).toEqual({
+      star: "PUT /user/starred/{owner}/{repo}",
+      unstar: "DELETE /user/starred/{owner}/{repo}",
+    });
+    expect(GRAPHQL_MUTATION_OPERATIONS).toEqual({
+      createUserList: "CreateUserList",
+      updateUserList: "UpdateUserList",
+      deleteUserList: "DeleteUserList",
+      setRepositoryListIds: "UpdateUserListsForItem",
+    });
+    expect(Object.keys(GRAPHQL_MUTATION_DOCUMENTS).sort()).toEqual([
+      "createUserList",
+      "deleteUserList",
+      "setRepositoryListIds",
+      "updateUserList",
+    ]);
+    expect(GITHUB_MUTATION_METHOD_NAMES).toEqual([
+      "star",
+      "unstar",
+      "createUserList",
+      "updateUserList",
+      "deleteUserList",
+      "setRepositoryListIds",
+    ]);
+    expect(Object.isFrozen(REST_MUTATION_OPERATIONS)).toBe(true);
+    expect(Object.isFrozen(GRAPHQL_MUTATION_OPERATIONS)).toBe(true);
+    expect(Object.isFrozen(GRAPHQL_MUTATION_DOCUMENTS)).toBe(true);
+    expect(Object.isFrozen(GITHUB_MUTATION_METHOD_NAMES)).toBe(true);
+    expectTypeOf<RestMutationOperation>().toEqualTypeOf<"star" | "unstar">();
+    expectTypeOf<GraphqlMutationOperation>().toEqualTypeOf<
+      | "createUserList"
+      | "updateUserList"
+      | "deleteUserList"
+      | "setRepositoryListIds"
     >();
   });
 
@@ -273,6 +408,22 @@ describe("GitHub read boundary contracts", () => {
       <Response>(
         operation: GraphqlReadOperation,
         variables: Readonly<Record<string, unknown>>,
+        signal?: AbortSignal,
+      ) => Promise<GraphqlTransportResponse<Response>>
+    >();
+    expectTypeOf<GitHubTransport["restMutation"]>().toEqualTypeOf<
+      <Response>(
+        operation: RestMutationOperation,
+        parameters: Readonly<Record<string, unknown>>,
+        operationId: string,
+        signal?: AbortSignal,
+      ) => Promise<RestTransportResponse<Response>>
+    >();
+    expectTypeOf<GitHubTransport["graphqlMutation"]>().toEqualTypeOf<
+      <Response>(
+        operation: GraphqlMutationOperation,
+        variables: Readonly<Record<string, unknown>>,
+        operationId: string,
         signal?: AbortSignal,
       ) => Promise<GraphqlTransportResponse<Response>>
     >();

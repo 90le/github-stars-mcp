@@ -28,6 +28,12 @@ function restOnlyTransport(
     graphql(): Promise<never> {
       return Promise.reject(new Error("unexpected GraphQL request"));
     },
+    restMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected REST mutation"));
+    },
+    graphqlMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected GraphQL mutation"));
+    },
   };
 }
 

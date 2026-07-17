@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import type {
   CapabilityState,
+  CreateUserListInput,
   GitHubCapabilities,
   GitHubListItem,
   GitHubPort,
@@ -10,11 +11,19 @@ import type {
   GitHubSearchPage,
   GitHubStar,
   GitHubUserList,
+  MutationReceipt,
   Page,
   RateLimitState,
+  RepositoryIdentity,
+  UpdateUserListInput,
+  UserListMutationResult,
 } from "../app/ports/github-port.js";
 import { AppError, type AppErrorCode } from "../domain/errors.js";
-import type { UserListId } from "../domain/ids.js";
+import type {
+  RepositoryDatabaseId,
+  RepositoryId,
+  UserListId,
+} from "../domain/ids.js";
 import { repositorySchema, userListSchema } from "../domain/repository.js";
 import type {
   AccountBinding,
@@ -24,8 +33,10 @@ import type {
 } from "../domain/repository.js";
 import { canonicalUtcTimestamp } from "../domain/timestamp.js";
 import {
+  GRAPHQL_MUTATION_OPERATIONS,
   GRAPHQL_READ_OPERATIONS,
   type GitHubTransport,
+  type GraphqlMutationOperation,
   type GraphqlReadOperation,
   type GraphqlTransportError,
 } from "./allowed-operations.js";
@@ -56,6 +67,10 @@ const MAX_LIST_DESCRIPTION = 8_192;
 const MAX_README_BYTES = 1_048_576;
 const MAX_README_BASE64 = 1_500_000;
 const MAX_README_URL = 4_096;
+const MAX_MUTATION_INPUT_NAME = 100;
+const MAX_MUTATION_INPUT_DESCRIPTION = 1_024;
+const MAX_MUTATION_LIST_IDS = 5_000;
+const MAX_REQUEST_ID = 256;
 const GRAPHQL_NAME = /^[_A-Za-z][_0-9A-Za-z]*$/u;
 const README_BASE64 =
   /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u;
@@ -722,14 +737,14 @@ function restEnvelope(
   });
 }
 
-function invalidRepositoryCoordinates(): AppError {
+function invalidRepositoryCoordinates(operation = "getReadme"): AppError {
   return new AppError(
     "VALIDATION_ERROR",
     "Repository coordinates are invalid",
     {
       retryable: false,
       details: {
-        operation: "getReadme",
+        operation,
         reason: "invalid_repository_coordinates",
       },
     },
@@ -738,6 +753,7 @@ function invalidRepositoryCoordinates(): AppError {
 
 function repositoryCoordinates(
   value: RepositoryCoordinates,
+  operation = "getReadme",
 ): RepositoryCoordinates {
   if (
     value === null ||
@@ -745,7 +761,7 @@ function repositoryCoordinates(
     utilTypes.isProxy(value) ||
     Array.isArray(value)
   ) {
-    throw invalidRepositoryCoordinates();
+    throw invalidRepositoryCoordinates(operation);
   }
   let prototype: object | null;
   let descriptors: PropertyDescriptorMap;
@@ -753,7 +769,7 @@ function repositoryCoordinates(
     prototype = Reflect.getPrototypeOf(value);
     descriptors = Object.getOwnPropertyDescriptors(value);
   } catch {
-    throw invalidRepositoryCoordinates();
+    throw invalidRepositoryCoordinates(operation);
   }
   const keys = Reflect.ownKeys(descriptors);
   if (
@@ -761,7 +777,7 @@ function repositoryCoordinates(
     keys.length !== 2 ||
     keys.some((key) => key !== "owner" && key !== "name")
   ) {
-    throw invalidRepositoryCoordinates();
+    throw invalidRepositoryCoordinates(operation);
   }
 
   const read = (key: "owner" | "name", maximum: number): string => {
@@ -779,7 +795,7 @@ function repositoryCoordinates(
       !controlFree(candidate) ||
       /[/\\?#]/u.test(candidate)
     ) {
-      throw invalidRepositoryCoordinates();
+      throw invalidRepositoryCoordinates(operation);
     }
     return candidate;
   };
@@ -788,6 +804,184 @@ function repositoryCoordinates(
     owner: read("owner", MAX_LOGIN),
     name: read("name", MAX_REPOSITORY_NAME),
   });
+}
+
+function boundaryInputError(operation: string): AppError {
+  return new AppError("VALIDATION_ERROR", "GitHub operation input is invalid", {
+    retryable: false,
+    details: { operation, reason: "invalid_input" },
+  });
+}
+
+function inputRecord(
+  value: unknown,
+  operation: string,
+): ReadonlyMap<string, unknown> {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    Array.isArray(value)
+  ) {
+    throw boundaryInputError(operation);
+  }
+  let prototype: object | null;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    prototype = Reflect.getPrototypeOf(value);
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    throw boundaryInputError(operation);
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw boundaryInputError(operation);
+  }
+  const result = new Map<string, unknown>();
+  for (const key of Reflect.ownKeys(descriptors)) {
+    if (typeof key !== "string") throw boundaryInputError(operation);
+    const descriptor = descriptors[key];
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      descriptor.enumerable !== true
+    ) {
+      throw boundaryInputError(operation);
+    }
+    result.set(key, descriptor.value as unknown);
+  }
+  return result;
+}
+
+function inputText(
+  value: unknown,
+  maximum: number,
+  operation: string,
+  options: Readonly<{
+    allowEmpty?: boolean;
+    trimEqual?: boolean;
+  }> = {},
+): string {
+  if (
+    typeof value !== "string" ||
+    (options.allowEmpty !== true && value.length === 0) ||
+    value.length > maximum ||
+    (options.trimEqual === true && value !== value.trim()) ||
+    !controlFree(value) ||
+    !wellFormedUnicode(value)
+  ) {
+    throw boundaryInputError(operation);
+  }
+  return value;
+}
+
+function stableInputId(value: unknown, operation: string): string {
+  return inputText(value, MAX_ID, operation, { trimEqual: true });
+}
+
+function validatedOperationId(value: unknown, operation: string): string {
+  return stableInputId(value, operation);
+}
+
+function inputDescription(value: unknown, operation: string): string | null {
+  return value === null
+    ? null
+    : inputText(value, MAX_MUTATION_INPUT_DESCRIPTION, operation, {
+        allowEmpty: true,
+      });
+}
+
+function validatedCreateUserListInput(
+  value: CreateUserListInput,
+): CreateUserListInput {
+  const operation = "createUserList";
+  const input = inputRecord(value, operation);
+  const keys = ["name", "description", "isPrivate"] as const;
+  if (
+    input.size !== keys.length ||
+    keys.some((key) => !input.has(key)) ||
+    typeof input.get("isPrivate") !== "boolean"
+  ) {
+    throw boundaryInputError(operation);
+  }
+  return Object.freeze({
+    name: inputText(input.get("name"), MAX_MUTATION_INPUT_NAME, operation),
+    description: inputDescription(input.get("description"), operation),
+    isPrivate: input.get("isPrivate") as boolean,
+  });
+}
+
+function validatedUpdateUserListInput(
+  value: UpdateUserListInput,
+): UpdateUserListInput {
+  const operation = "updateUserList";
+  const input = inputRecord(value, operation);
+  const allowed = new Set(["name", "description", "isPrivate"]);
+  if (
+    input.size === 0 ||
+    input.size > allowed.size ||
+    [...input.keys()].some((key) => !allowed.has(key)) ||
+    (input.has("isPrivate") && typeof input.get("isPrivate") !== "boolean")
+  ) {
+    throw boundaryInputError(operation);
+  }
+  const name = input.has("name")
+    ? inputText(input.get("name"), MAX_MUTATION_INPUT_NAME, operation)
+    : undefined;
+  const description = input.has("description")
+    ? inputDescription(input.get("description"), operation)
+    : undefined;
+  return Object.freeze({
+    ...(name === undefined ? {} : { name }),
+    ...(description === undefined ? {} : { description }),
+    ...(input.has("isPrivate")
+      ? { isPrivate: input.get("isPrivate") as boolean }
+      : {}),
+  });
+}
+
+function utf8Compare(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function validatedListIds(
+  value: readonly UserListId[],
+  operation: string,
+): readonly UserListId[] {
+  if (
+    utilTypes.isProxy(value) ||
+    !Array.isArray(value) ||
+    Reflect.getPrototypeOf(value) !== Array.prototype ||
+    value.length > MAX_MUTATION_LIST_IDS
+  ) {
+    throw boundaryInputError(operation);
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value as object);
+  } catch {
+    throw boundaryInputError(operation);
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    keys.some((key) => typeof key !== "string") ||
+    keys.length !== value.length + 1
+  ) {
+    throw boundaryInputError(operation);
+  }
+  const ids: UserListId[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      descriptor.enumerable !== true
+    ) {
+      throw boundaryInputError(operation);
+    }
+    ids.push(stableInputId(descriptor.value, operation) as UserListId);
+  }
+  ids.sort(utf8Compare);
+  return Object.freeze([...new Set(ids)]);
 }
 
 function readmeSourceUrl(
@@ -1113,7 +1307,7 @@ function recognizedTypes(
 }
 
 function mappedGraphqlError(
-  operation: GraphqlReadOperation,
+  operation: GraphqlReadOperation | GraphqlMutationOperation,
   errors: readonly GraphqlTransportError[],
 ): AppError {
   const types = recognizedTypes(errors);
@@ -1138,7 +1332,9 @@ function mappedGraphqlError(
     code = "GITHUB_UNAVAILABLE";
     retryable = TRANSIENT_TYPES.some(has);
   }
-  const operationName = GRAPHQL_READ_OPERATIONS[operation];
+  const operationName = Object.hasOwn(GRAPHQL_READ_OPERATIONS, operation)
+    ? GRAPHQL_READ_OPERATIONS[operation as GraphqlReadOperation]
+    : GRAPHQL_MUTATION_OPERATIONS[operation as GraphqlMutationOperation];
   return new AppError(code, "GitHub GraphQL operation failed", {
     retryable,
     details: {
@@ -1338,6 +1534,233 @@ function userListItemsPage(
   });
 }
 
+function responseEnvelope(
+  response: unknown,
+  operation: string,
+): Readonly<{
+  data: unknown;
+  status: number;
+  headers: SafeRecord;
+}> {
+  const envelope = safeRecord(response, operation);
+  const status = required(envelope, "status", operation);
+  if (
+    typeof status !== "number" ||
+    !Number.isInteger(status) ||
+    status < 100 ||
+    status > 599
+  ) {
+    throw malformedRemote(operation);
+  }
+  return Object.freeze({
+    data: required(envelope, "data", operation),
+    status,
+    headers: safeHeaders(required(envelope, "headers", operation), operation),
+  });
+}
+
+function requestIdFromHeaders(
+  headers: SafeRecord,
+  operation: string,
+): string | null {
+  const value = headers.get("x-github-request-id");
+  if (value === undefined) return null;
+  return boundedText(value, MAX_REQUEST_ID, operation, {
+    trimEqual: false,
+  });
+}
+
+function restMutationReceipt(
+  response: unknown,
+  operation: "star" | "unstar",
+): MutationReceipt {
+  const envelope = responseEnvelope(response, operation);
+  if (envelope.status !== 204) throw malformedRemote(operation);
+  return Object.freeze({
+    requestId: requestIdFromHeaders(envelope.headers, operation),
+    clientMutationId: null,
+  });
+}
+
+function graphqlMutationData(
+  response: unknown,
+  operation: GraphqlMutationOperation,
+): Readonly<{ data: unknown; headers: SafeRecord }> {
+  const operationName = GRAPHQL_MUTATION_OPERATIONS[operation];
+  const envelope = safeRecord(response, operationName);
+  if (required(envelope, "status", operationName) !== 200) {
+    throw malformedRemote(operationName);
+  }
+  const headers = safeHeaders(
+    required(envelope, "headers", operationName),
+    operationName,
+  );
+  const errors = validateGraphqlErrors(
+    required(envelope, "errors", operationName),
+    operationName,
+  );
+  if (errors.length > 0) throw mappedGraphqlError(operation, errors);
+  graphqlRateLimit(
+    required(envelope, "rateLimit", operationName),
+    operationName,
+  );
+  return Object.freeze({
+    data: required(envelope, "data", operationName),
+    headers,
+  });
+}
+
+function mutationReceipt(
+  headers: SafeRecord,
+  operation: GraphqlMutationOperation,
+  operationId: string,
+): MutationReceipt {
+  return Object.freeze({
+    requestId: requestIdFromHeaders(
+      headers,
+      GRAPHQL_MUTATION_OPERATIONS[operation],
+    ),
+    clientMutationId: operationId,
+  });
+}
+
+function validateEchoedClientMutationId(
+  payload: SafeRecord,
+  operation: GraphqlMutationOperation,
+  operationId: string,
+): void {
+  const operationName = GRAPHQL_MUTATION_OPERATIONS[operation];
+  const echoed = boundedText(
+    required(payload, "clientMutationId", operationName),
+    MAX_ID,
+    operationName,
+  );
+  if (echoed !== operationId) throw malformedRemote(operationName);
+}
+
+function userListMutationResult(
+  response: unknown,
+  operation: "createUserList" | "updateUserList",
+  operationId: string,
+  expectedListId: UserListId | null,
+): UserListMutationResult {
+  const operationName = GRAPHQL_MUTATION_OPERATIONS[operation];
+  const envelope = graphqlMutationData(response, operation);
+  const root = safeRecord(envelope.data, operationName);
+  const payload = safeRecord(
+    required(root, operation, operationName),
+    operationName,
+  );
+  exactKeys(payload, ["list", "clientMutationId"], operationName);
+  validateEchoedClientMutationId(payload, operation, operationId);
+  const list = normalizeUserList(
+    required(payload, "list", operationName),
+    operationName,
+  );
+  if (expectedListId !== null && list.listId !== expectedListId) {
+    throw malformedRemote(operationName);
+  }
+  return Object.freeze({
+    list,
+    receipt: mutationReceipt(envelope.headers, operation, operationId),
+  });
+}
+
+function deleteUserListReceipt(
+  response: unknown,
+  operationId: string,
+): MutationReceipt {
+  const operation = "deleteUserList";
+  const operationName = GRAPHQL_MUTATION_OPERATIONS[operation];
+  const envelope = graphqlMutationData(response, operation);
+  const root = safeRecord(envelope.data, operationName);
+  const payload = safeRecord(
+    required(root, operation, operationName),
+    operationName,
+  );
+  exactKeys(payload, ["clientMutationId"], operationName);
+  validateEchoedClientMutationId(payload, operation, operationId);
+  return mutationReceipt(envelope.headers, operation, operationId);
+}
+
+function sameIds(left: readonly string[], right: readonly string[]): boolean {
+  return (
+    left.length === right.length &&
+    left.every((value, index) => value === right[index])
+  );
+}
+
+function membershipMutationReceipt(
+  response: unknown,
+  repositoryId: RepositoryId,
+  listIds: readonly UserListId[],
+  operationId: string,
+): MutationReceipt {
+  const operation = "setRepositoryListIds";
+  const operationName = GRAPHQL_MUTATION_OPERATIONS[operation];
+  const envelope = graphqlMutationData(response, operation);
+  const root = safeRecord(envelope.data, operationName);
+  const payload = safeRecord(
+    required(root, "updateUserListsForItem", operationName),
+    operationName,
+  );
+  exactKeys(payload, ["item", "lists", "clientMutationId"], operationName);
+  validateEchoedClientMutationId(payload, operation, operationId);
+  const item = safeRecord(
+    required(payload, "item", operationName),
+    operationName,
+  );
+  exactKeys(item, ["__typename", "id"], operationName);
+  if (
+    required(item, "__typename", operationName) !== "Repository" ||
+    boundedText(required(item, "id", operationName), MAX_ID, operationName) !==
+      repositoryId
+  ) {
+    throw malformedRemote(operationName);
+  }
+  const returnedIds = denseArray(
+    required(payload, "lists", operationName),
+    MAX_MUTATION_LIST_IDS,
+    operationName,
+  ).map((candidate) => {
+    const list = safeRecord(candidate, operationName);
+    exactKeys(list, ["id"], operationName);
+    return boundedText(
+      required(list, "id", operationName),
+      MAX_ID,
+      operationName,
+    );
+  });
+  const sortedUnique = [...new Set(returnedIds)].sort(utf8Compare);
+  if (
+    sortedUnique.length !== returnedIds.length ||
+    !sameIds(sortedUnique, listIds)
+  ) {
+    throw malformedRemote(operationName);
+  }
+  return mutationReceipt(envelope.headers, operation, operationId);
+}
+
+function liveReadCancelled(operation: string): AppError {
+  return new AppError("GITHUB_UNAVAILABLE", "GitHub request was cancelled", {
+    retryable: false,
+    details: { operation, reason: "cancelled" },
+  });
+}
+
+function assertLiveReadNotAborted(
+  signal: AbortSignal | undefined,
+  operation: string,
+): void {
+  if (signal === undefined) return;
+  try {
+    if (!signal.aborted) return;
+  } catch {
+    throw liveReadCancelled(operation);
+  }
+  throw liveReadCancelled(operation);
+}
+
 function isCancellation(
   error: unknown,
   signal: AbortSignal | undefined,
@@ -1472,6 +1895,278 @@ export class OctokitGitHubAdapter implements GitHubPort {
     );
     const envelope = graphqlData(response, "listItems");
     return userListItemsPage(envelope.data, envelope.rateLimit);
+  }
+
+  async getRepositoryIdentity(
+    repository: RepositoryCoordinates,
+    signal?: AbortSignal,
+  ): Promise<RepositoryIdentity | null> {
+    const operation = "getRepositoryIdentity";
+    const coordinates = repositoryCoordinates(repository, operation);
+    try {
+      const response = await this.#transport.rest(
+        operation,
+        Object.freeze({
+          owner: coordinates.owner,
+          repo: coordinates.name,
+        }),
+        signal,
+      );
+      const envelope = responseEnvelope(response, operation);
+      if (envelope.status === 404) return null;
+      if (envelope.status !== 200) throw malformedRemote(operation);
+      const data = safeRecord(envelope.data, operation);
+      return Object.freeze({
+        repositoryId: boundedText(
+          required(data, "node_id", operation),
+          MAX_ID,
+          operation,
+        ) as RepositoryId,
+        repositoryDatabaseId: String(
+          nonnegativeInteger(required(data, "id", operation), operation),
+        ) as RepositoryDatabaseId,
+        coordinates,
+      });
+    } catch (error) {
+      if (error instanceof AppError && error.code === "NOT_FOUND") {
+        return null;
+      }
+      throw error;
+    }
+  }
+
+  async getUserList(
+    listId: UserListId,
+    signal?: AbortSignal,
+  ): Promise<GitHubUserList | null> {
+    const operation = "getUserList";
+    const validatedId = stableInputId(listId, operation) as UserListId;
+    const response = await this.#transport.graphql(
+      operation,
+      Object.freeze({ listId: validatedId }),
+      signal,
+    );
+    const envelope = graphqlData(response, operation);
+    const operationName = GRAPHQL_READ_OPERATIONS[operation];
+    const root = safeRecord(envelope.data, operationName);
+    const rawNode = required(root, "node", operationName);
+    if (rawNode === null) return null;
+    const node = safeRecord(rawNode, operationName);
+    if (required(node, "__typename", operationName) !== "UserList") {
+      throw malformedRemote(operationName);
+    }
+    return normalizeUserList(rawNode, operationName);
+  }
+
+  async checkStar(
+    repository: RepositoryCoordinates,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
+    const operation = "checkStar";
+    const coordinates = repositoryCoordinates(repository, operation);
+    try {
+      const response = await this.#transport.rest(
+        operation,
+        Object.freeze({
+          owner: coordinates.owner,
+          repo: coordinates.name,
+        }),
+        signal,
+      );
+      const envelope = responseEnvelope(response, operation);
+      if (envelope.status === 204) return true;
+      if (envelope.status === 404) return false;
+      throw malformedRemote(operation);
+    } catch (error) {
+      if (error instanceof AppError && error.code === "NOT_FOUND") {
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  async getRepositoryListIds(
+    repositoryId: RepositoryId,
+    signal?: AbortSignal,
+  ): Promise<readonly UserListId[]> {
+    const operation = "getRepositoryListIds";
+    const validatedRepositoryId = stableInputId(
+      repositoryId,
+      operation,
+    ) as RepositoryId;
+    const lists: UserListId[] = [];
+    const seenLists = new Set<UserListId>();
+    let listCursor: string | null = null;
+    do {
+      assertLiveReadNotAborted(signal, operation);
+      const page = await this.listUserLists(listCursor, signal);
+      for (const list of page.items) {
+        if (!seenLists.has(list.listId)) {
+          seenLists.add(list.listId);
+          lists.push(list.listId);
+        }
+      }
+      listCursor = page.nextCursor;
+    } while (listCursor !== null);
+
+    const memberships = new Set<UserListId>();
+    for (const listId of lists) {
+      let itemCursor: string | null = null;
+      do {
+        assertLiveReadNotAborted(signal, operation);
+        const page = await this.listUserListItems(listId, itemCursor, signal);
+        if (
+          page.items.some(
+            (item) =>
+              item.kind === "repository" &&
+              item.repository.repositoryId === validatedRepositoryId,
+          )
+        ) {
+          memberships.add(listId);
+        }
+        itemCursor = page.nextCursor;
+      } while (itemCursor !== null);
+    }
+    return Object.freeze([...memberships].sort(utf8Compare));
+  }
+
+  async star(
+    repository: RepositoryCoordinates,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const operation = "star";
+    const coordinates = repositoryCoordinates(repository, operation);
+    const validatedId = validatedOperationId(operationId, operation);
+    const response = await this.#transport.restMutation(
+      operation,
+      Object.freeze({
+        owner: coordinates.owner,
+        repo: coordinates.name,
+      }),
+      validatedId,
+      signal,
+    );
+    return restMutationReceipt(response, operation);
+  }
+
+  async unstar(
+    repository: RepositoryCoordinates,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const operation = "unstar";
+    const coordinates = repositoryCoordinates(repository, operation);
+    const validatedId = validatedOperationId(operationId, operation);
+    const response = await this.#transport.restMutation(
+      operation,
+      Object.freeze({
+        owner: coordinates.owner,
+        repo: coordinates.name,
+      }),
+      validatedId,
+      signal,
+    );
+    return restMutationReceipt(response, operation);
+  }
+
+  async createUserList(
+    input: CreateUserListInput,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<UserListMutationResult> {
+    const operation = "createUserList";
+    const validatedInput = validatedCreateUserListInput(input);
+    const validatedId = validatedOperationId(operationId, operation);
+    const response = await this.#transport.graphqlMutation(
+      operation,
+      Object.freeze({
+        ...validatedInput,
+        clientMutationId: validatedId,
+      }),
+      validatedId,
+      signal,
+    );
+    return userListMutationResult(response, operation, validatedId, null);
+  }
+
+  async updateUserList(
+    listId: UserListId,
+    input: UpdateUserListInput,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<UserListMutationResult> {
+    const operation = "updateUserList";
+    const validatedListId = stableInputId(listId, operation) as UserListId;
+    const validatedInput = validatedUpdateUserListInput(input);
+    const validatedId = validatedOperationId(operationId, operation);
+    const response = await this.#transport.graphqlMutation(
+      operation,
+      Object.freeze({
+        listId: validatedListId,
+        ...validatedInput,
+        clientMutationId: validatedId,
+      }),
+      validatedId,
+      signal,
+    );
+    return userListMutationResult(
+      response,
+      operation,
+      validatedId,
+      validatedListId,
+    );
+  }
+
+  async deleteUserList(
+    listId: UserListId,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const operation = "deleteUserList";
+    const validatedListId = stableInputId(listId, operation) as UserListId;
+    const validatedId = validatedOperationId(operationId, operation);
+    const response = await this.#transport.graphqlMutation(
+      operation,
+      Object.freeze({
+        listId: validatedListId,
+        clientMutationId: validatedId,
+      }),
+      validatedId,
+      signal,
+    );
+    return deleteUserListReceipt(response, validatedId);
+  }
+
+  async setRepositoryListIds(
+    repositoryId: RepositoryId,
+    listIds: readonly UserListId[],
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt> {
+    const operation = "setRepositoryListIds";
+    const validatedRepositoryId = stableInputId(
+      repositoryId,
+      operation,
+    ) as RepositoryId;
+    const validatedIds = validatedListIds(listIds, operation);
+    const validatedOperation = validatedOperationId(operationId, operation);
+    const response = await this.#transport.graphqlMutation(
+      operation,
+      Object.freeze({
+        itemId: validatedRepositoryId,
+        listIds: validatedIds,
+        clientMutationId: validatedOperation,
+      }),
+      validatedOperation,
+      signal,
+    );
+    return membershipMutationReceipt(
+      response,
+      validatedRepositoryId,
+      validatedIds,
+      validatedOperation,
+    );
   }
 
   async getReadme(

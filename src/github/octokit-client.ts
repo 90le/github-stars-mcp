@@ -7,16 +7,21 @@ import { AppError, type AppErrorCode } from "../domain/errors.js";
 import { canonicalUtcTimestamp } from "../domain/timestamp.js";
 import { PACKAGE_NAME, PACKAGE_VERSION } from "../version.js";
 import {
+  GRAPHQL_MUTATION_DOCUMENTS,
   GRAPHQL_READ_DOCUMENTS,
+  REST_MUTATION_OPERATIONS,
   REST_READ_OPERATIONS,
   type GitHubTransport,
+  type GraphqlMutationOperation,
   type GraphqlReadOperation,
   type GraphqlTransportError,
   type GraphqlTransportResponse,
+  type RestMutationOperation,
   type RestReadOperation,
   type RestTransportResponse,
   type TransportHeaders,
 } from "./allowed-operations.js";
+import { AmbiguousMutationError } from "./errors.js";
 import { RateGate } from "./rate-gate.js";
 
 export interface OctokitTransportRuntime {
@@ -37,6 +42,10 @@ const MAX_GRAPHQL_ERROR_MESSAGE_LENGTH = 16_384;
 const MAX_GRAPHQL_ERROR_TYPE_LENGTH = 128;
 const MAX_GRAPHQL_ERROR_PATH_SEGMENTS = 100;
 const MAX_GRAPHQL_ERROR_PATH_STRING_LENGTH = 256;
+const MAX_MUTATION_TEXT_LENGTH = 128;
+const MAX_LIST_NAME_LENGTH = 100;
+const MAX_LIST_DESCRIPTION_LENGTH = 1_024;
+const MAX_LIST_MEMBERSHIPS = 5_000;
 
 const DEFAULT_RUNTIME: OctokitTransportRuntime = Object.freeze({
   fetch: (input: RequestInfo | URL, init?: RequestInit) =>
@@ -96,8 +105,12 @@ type FailureRateObservation =
 
 interface ExpectedRequest {
   readonly kind: "rest" | "graphql";
-  readonly operation: RestReadOperation | GraphqlReadOperation;
-  readonly method: "GET" | "POST";
+  readonly operation:
+    | RestReadOperation
+    | GraphqlReadOperation
+    | RestMutationOperation
+    | GraphqlMutationOperation;
+  readonly method: "GET" | "POST" | "PUT" | "DELETE";
   readonly path: string;
   readonly queryKeys: ReadonlySet<string>;
 }
@@ -305,7 +318,11 @@ function copyRestParameters(
     });
   }
 
-  if (operation === "getReadme") {
+  if (
+    operation === "getReadme" ||
+    operation === "getRepositoryIdentity" ||
+    operation === "checkStar"
+  ) {
     if (
       entries.length !== 2 ||
       entries.some(([key]) => key !== "owner" && key !== "repo")
@@ -372,7 +389,9 @@ function copyGraphqlVariables(
   const allowed =
     operation === "listLists"
       ? new Set(["cursor"])
-      : new Set(["listId", "cursor"]);
+      : operation === "listItems"
+        ? new Set(["listId", "cursor"])
+        : new Set(["listId"]);
   if (entries.some(([key]) => !allowed.has(key))) {
     throw invalidInput("invalid_parameters", operation);
   }
@@ -399,7 +418,281 @@ function copyGraphqlVariables(
   ) {
     throw invalidInput("invalid_parameters", operation);
   }
-  return Object.freeze({ listId, cursor: cursor ?? null });
+  return operation === "listItems"
+    ? Object.freeze({ listId, cursor: cursor ?? null })
+    : Object.freeze({ listId });
+}
+
+function strictDataEntries(
+  value: unknown,
+): readonly (readonly [string, unknown])[] | null {
+  if (
+    value === null ||
+    typeof value !== "object" ||
+    utilTypes.isProxy(value) ||
+    Array.isArray(value)
+  ) {
+    return null;
+  }
+  try {
+    const prototype = Reflect.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const descriptors = Object.getOwnPropertyDescriptors(value);
+    const entries: [string, unknown][] = [];
+    for (const key of Reflect.ownKeys(descriptors)) {
+      if (typeof key !== "string") return null;
+      const descriptor = descriptors[key];
+      if (
+        descriptor === undefined ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.enumerable !== true
+      ) {
+        return null;
+      }
+      entries.push([key, descriptor.value as unknown]);
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+function boundedMutationText(
+  value: unknown,
+  maximum: number,
+  options: Readonly<{
+    allowEmpty?: boolean;
+    trimEqual?: boolean;
+  }> = {},
+): string | null {
+  if (
+    typeof value !== "string" ||
+    (options.allowEmpty !== true && value.length === 0) ||
+    value.length > maximum ||
+    (options.trimEqual === true && value !== value.trim()) ||
+    !controlFree(value) ||
+    !wellFormedUnicode(value)
+  ) {
+    return null;
+  }
+  return value;
+}
+
+function mutationStableId(value: unknown): string | null {
+  return boundedMutationText(value, MAX_MUTATION_TEXT_LENGTH, {
+    trimEqual: true,
+  });
+}
+
+function copyMutationOperationId(value: unknown, operation: string): string {
+  const copied = mutationStableId(value);
+  if (copied === null) throw invalidInput("invalid_parameters", operation);
+  return copied;
+}
+
+function exactMutationValues(
+  value: unknown,
+  keys: ReadonlySet<string>,
+  operation: string,
+): ReadonlyMap<string, unknown> {
+  const entries = strictDataEntries(value);
+  if (
+    entries === null ||
+    entries.length !== keys.size ||
+    entries.some(([key]) => !keys.has(key))
+  ) {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  return new Map(entries);
+}
+
+function copyRestMutationParameters(
+  operation: RestMutationOperation,
+  parameters: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  const values = exactMutationValues(
+    parameters,
+    new Set(["owner", "repo"]),
+    operation,
+  );
+  const owner = mutationStableId(values.get("owner"));
+  const repo = mutationStableId(values.get("repo"));
+  if (
+    owner === null ||
+    repo === null ||
+    /[/\\?#]/u.test(owner) ||
+    /[/\\?#]/u.test(repo)
+  ) {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  return Object.freeze({ owner, repo });
+}
+
+function copyDenseMembershipIds(
+  value: unknown,
+  operation: GraphqlMutationOperation,
+): readonly string[] {
+  if (
+    utilTypes.isProxy(value) ||
+    !Array.isArray(value) ||
+    Reflect.getPrototypeOf(value) !== Array.prototype ||
+    value.length > MAX_LIST_MEMBERSHIPS
+  ) {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value as object);
+  } catch {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  const keys = Reflect.ownKeys(descriptors);
+  if (
+    keys.some((key) => typeof key !== "string") ||
+    keys.length !== value.length + 1
+  ) {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  const ids: string[] = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = descriptors[String(index)];
+    const id =
+      descriptor !== undefined &&
+      Object.hasOwn(descriptor, "value") &&
+      descriptor.enumerable === true
+        ? mutationStableId(descriptor.value)
+        : null;
+    if (id === null) throw invalidInput("invalid_parameters", operation);
+    ids.push(id);
+  }
+  ids.sort((left, right) =>
+    Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8")),
+  );
+  return Object.freeze([...new Set(ids)]);
+}
+
+function mutationDescription(
+  value: unknown,
+  operation: GraphqlMutationOperation,
+): string | null {
+  if (value === null) return null;
+  const description = boundedMutationText(value, MAX_LIST_DESCRIPTION_LENGTH, {
+    allowEmpty: true,
+  });
+  if (description === null) {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  return description;
+}
+
+function mutationName(
+  value: unknown,
+  operation: GraphqlMutationOperation,
+): string {
+  const name = boundedMutationText(value, MAX_LIST_NAME_LENGTH);
+  if (name === null) throw invalidInput("invalid_parameters", operation);
+  return name;
+}
+
+function copyGraphqlMutationVariables(
+  operation: GraphqlMutationOperation,
+  variables: Readonly<Record<string, unknown>>,
+  operationId: string,
+): Readonly<Record<string, unknown>> {
+  if (operation === "createUserList") {
+    const values = exactMutationValues(
+      variables,
+      new Set(["name", "description", "isPrivate", "clientMutationId"]),
+      operation,
+    );
+    if (values.get("isPrivate") !== true && values.get("isPrivate") !== false) {
+      throw invalidInput("invalid_parameters", operation);
+    }
+    if (values.get("clientMutationId") !== operationId) {
+      throw invalidInput("invalid_parameters", operation);
+    }
+    return Object.freeze({
+      name: mutationName(values.get("name"), operation),
+      description: mutationDescription(values.get("description"), operation),
+      isPrivate: values.get("isPrivate") as boolean,
+      clientMutationId: operationId,
+    });
+  }
+
+  if (operation === "updateUserList") {
+    const entries = strictDataEntries(variables);
+    const allowed = new Set([
+      "listId",
+      "name",
+      "description",
+      "isPrivate",
+      "clientMutationId",
+    ]);
+    if (
+      entries === null ||
+      entries.some(([key]) => !allowed.has(key)) ||
+      entries.length < 3 ||
+      entries.length > 5
+    ) {
+      throw invalidInput("invalid_parameters", operation);
+    }
+    const values = new Map(entries);
+    const listId = mutationStableId(values.get("listId"));
+    if (
+      listId === null ||
+      values.get("clientMutationId") !== operationId ||
+      (!values.has("name") &&
+        !values.has("description") &&
+        !values.has("isPrivate"))
+    ) {
+      throw invalidInput("invalid_parameters", operation);
+    }
+    const name = values.has("name")
+      ? mutationName(values.get("name"), operation)
+      : undefined;
+    const description = values.has("description")
+      ? mutationDescription(values.get("description"), operation)
+      : undefined;
+    const privacy = values.get("isPrivate");
+    if (values.has("isPrivate") && privacy !== true && privacy !== false) {
+      throw invalidInput("invalid_parameters", operation);
+    }
+    return Object.freeze({
+      listId,
+      ...(name === undefined ? {} : { name }),
+      ...(description === undefined ? {} : { description }),
+      ...(values.has("isPrivate") ? { isPrivate: privacy as boolean } : {}),
+      clientMutationId: operationId,
+    });
+  }
+
+  if (operation === "deleteUserList") {
+    const values = exactMutationValues(
+      variables,
+      new Set(["listId", "clientMutationId"]),
+      operation,
+    );
+    const listId = mutationStableId(values.get("listId"));
+    if (listId === null || values.get("clientMutationId") !== operationId) {
+      throw invalidInput("invalid_parameters", operation);
+    }
+    return Object.freeze({ listId, clientMutationId: operationId });
+  }
+
+  const values = exactMutationValues(
+    variables,
+    new Set(["itemId", "listIds", "clientMutationId"]),
+    operation,
+  );
+  const itemId = mutationStableId(values.get("itemId"));
+  if (itemId === null || values.get("clientMutationId") !== operationId) {
+    throw invalidInput("invalid_parameters", operation);
+  }
+  return Object.freeze({
+    itemId,
+    listIds: copyDenseMembershipIds(values.get("listIds"), operation),
+    clientMutationId: operationId,
+  });
 }
 
 function isRestReadOperation(value: unknown): value is RestReadOperation {
@@ -411,6 +704,23 @@ function isRestReadOperation(value: unknown): value is RestReadOperation {
 function isGraphqlReadOperation(value: unknown): value is GraphqlReadOperation {
   return (
     typeof value === "string" && Object.hasOwn(GRAPHQL_READ_DOCUMENTS, value)
+  );
+}
+
+function isRestMutationOperation(
+  value: unknown,
+): value is RestMutationOperation {
+  return (
+    typeof value === "string" && Object.hasOwn(REST_MUTATION_OPERATIONS, value)
+  );
+}
+
+function isGraphqlMutationOperation(
+  value: unknown,
+): value is GraphqlMutationOperation {
+  return (
+    typeof value === "string" &&
+    Object.hasOwn(GRAPHQL_MUTATION_DOCUMENTS, value)
   );
 }
 
@@ -447,12 +757,43 @@ function expectedRestRequest(
       queryKeys: new Set(),
     };
   }
+  if (operation === "getRepositoryIdentity" || operation === "checkStar") {
+    return {
+      kind: "rest",
+      operation,
+      method: "GET",
+      path:
+        operation === "getRepositoryIdentity"
+          ? `/repos/${encodeURIComponent(
+              String(parameters.owner),
+            )}/${encodeURIComponent(String(parameters.repo))}`
+          : `/user/starred/${encodeURIComponent(
+              String(parameters.owner),
+            )}/${encodeURIComponent(String(parameters.repo))}`,
+      queryKeys: new Set(),
+    };
+  }
   return {
     kind: "rest",
     operation,
     method: "GET",
     path: "/search/repositories",
     queryKeys: new Set(["q", "sort", "order", "page", "per_page"]),
+  };
+}
+
+function expectedRestMutationRequest(
+  operation: RestMutationOperation,
+  parameters: Readonly<Record<string, unknown>>,
+): ExpectedRequest {
+  return {
+    kind: "rest",
+    operation,
+    method: operation === "star" ? "PUT" : "DELETE",
+    path: `/user/starred/${encodeURIComponent(
+      String(parameters.owner),
+    )}/${encodeURIComponent(String(parameters.repo))}`,
+    queryKeys: new Set(),
   };
 }
 
@@ -489,6 +830,7 @@ function validateUrl(url: URL, expected: ExpectedRequest): void {
 function guardedFetch(
   fetch: typeof globalThis.fetch,
   expected: ExpectedRequest,
+  onDispatch?: () => void,
 ): typeof globalThis.fetch {
   return async (input, init) => {
     let url: URL;
@@ -511,6 +853,9 @@ function guardedFetch(
       "accept",
       expected.operation === "listStars" ? STAR_ACCEPT : DEFAULT_ACCEPT,
     );
+    if (expected.method === "PUT" || expected.method === "DELETE") {
+      headers.set("content-length", "0");
+    }
     const authorization = headers.get("authorization");
     if (
       authorization === null ||
@@ -520,10 +865,17 @@ function guardedFetch(
       throw new BoundaryFailure("malformed_envelope");
     }
 
+    if (signalIsAborted(init?.signal ?? undefined)) {
+      throw cancelled(String(expected.operation));
+    }
+    onDispatch?.();
     const response = await fetch(url.href, {
       ...init,
       method: expected.method,
       headers,
+      ...(expected.method === "PUT" || expected.method === "DELETE"
+        ? { body: null }
+        : {}),
       redirect: "error",
     });
     if (utilTypes.isProxy(response)) {
@@ -600,6 +952,14 @@ function normalizedHeaders(
   for (const [rawName, rawValue] of entries) {
     const name = rawName.toLowerCase();
     if (SENSITIVE_RESPONSE_HEADERS.has(name)) continue;
+    if (
+      name.length === 0 ||
+      !controlFree(name) ||
+      !wellFormedUnicode(name) ||
+      Object.hasOwn(headers, name)
+    ) {
+      throw new BoundaryFailure("malformed_envelope");
+    }
     if (
       rawValue !== undefined &&
       typeof rawValue !== "string" &&
@@ -930,6 +1290,17 @@ function classifyHttpFailure(
   if (status === 404) {
     return none(
       mappedError("NOT_FOUND", false, "not_found", operation, status),
+    );
+  }
+  if (status === 409) {
+    return none(
+      mappedError(
+        "PRECONDITION_FAILED",
+        false,
+        "http_conflict",
+        operation,
+        status,
+      ),
     );
   }
   if (status === 408 || (status >= 500 && status <= 599)) {
@@ -1369,6 +1740,56 @@ async function executeWithRetries<T>(
   );
 }
 
+function observeClassifiedFailure(
+  failure: ClassifiedFailure,
+  rateGate: RateGate,
+): void {
+  if (failure.rateLimit !== null) {
+    rateGate.observe(failure.rateLimit);
+  }
+  if (failure.retry.kind === "primary_limit") {
+    rateGate.observePrimaryLimit(failure.retry.retryAt);
+  } else if (failure.retry.kind === "secondary_limit") {
+    rateGate.observeSecondaryLimit(failure.retry.retryAt);
+  }
+}
+
+function isKnownMutationRejection(error: unknown): boolean {
+  if (!(error instanceof RequestError) || error.response === undefined) {
+    return false;
+  }
+  return [400, 401, 403, 404, 409, 422, 429].includes(error.status);
+}
+
+async function executeMutationOnce<T>(
+  operation: RestMutationOperation | GraphqlMutationOperation,
+  operationId: string,
+  requestKind: "rest" | "graphql",
+  signal: AbortSignal | undefined,
+  rateGate: RateGate,
+  wasDispatched: () => boolean,
+  attempt: () => Promise<T>,
+): Promise<T> {
+  await rateGate.beforeRequest(signal);
+  if (signalIsAborted(signal)) throw cancelled(operation);
+  try {
+    return await attempt();
+  } catch (error) {
+    const dispatched = wasDispatched();
+    const failure = classifyFailure(
+      error,
+      dispatched ? undefined : signal,
+      operation,
+      requestKind,
+    );
+    observeClassifiedFailure(failure, rateGate);
+    if (!dispatched || isKnownMutationRejection(error)) {
+      throw failure.error;
+    }
+    throw new AmbiguousMutationError(operationId, operation, error);
+  }
+}
+
 export function createOctokitTransport(
   credential: Credential,
   version: string,
@@ -1543,6 +1964,157 @@ export function createOctokitTransport(
         async () => {
           const response = (await client.request("POST /graphql", {
             query: GRAPHQL_READ_DOCUMENTS[operation],
+            variables: copiedVariables,
+            request: {
+              fetch,
+              redirect: "error",
+              ...(signal === undefined ? {} : { signal }),
+            },
+          })) as OctokitResponse<unknown>;
+          return normalizedGraphqlResponse<T>(response, rateGate);
+        },
+      );
+    },
+
+    restMutation<T>(
+      operation: RestMutationOperation,
+      parameters: Readonly<Record<string, unknown>>,
+      operationId: string,
+      signal?: AbortSignal,
+    ): Promise<RestTransportResponse<T>> {
+      if (!isRestMutationOperation(operation)) {
+        return Promise.reject(invalidInput("invalid_parameters"));
+      }
+      let copiedOperationId: string;
+      let copiedParameters: Readonly<Record<string, unknown>>;
+      try {
+        copiedOperationId = copyMutationOperationId(operationId, operation);
+        copiedParameters = copyRestMutationParameters(operation, parameters);
+      } catch (error) {
+        return Promise.reject(
+          error instanceof AppError
+            ? error
+            : invalidInput("invalid_parameters", operation),
+        );
+      }
+      if (containsSecret(copiedParameters, token)) {
+        return Promise.reject(invalidInput("invalid_parameters", operation));
+      }
+      const expected = expectedRestMutationRequest(operation, copiedParameters);
+      let dispatched = false;
+      let fetch: typeof globalThis.fetch;
+      try {
+        fetch = guardedFetch(
+          safeRuntimeFetch(runtime, operation),
+          expected,
+          () => {
+            dispatched = true;
+          },
+        );
+      } catch (error) {
+        return Promise.reject(
+          error instanceof AppError
+            ? error
+            : mappedError(
+                "GITHUB_UNAVAILABLE",
+                false,
+                "invalid_fetch",
+                operation,
+              ),
+        );
+      }
+      return executeMutationOnce(
+        operation,
+        copiedOperationId,
+        "rest",
+        signal,
+        rateGate,
+        () => dispatched,
+        async () => {
+          const response = (await client.request(
+            REST_MUTATION_OPERATIONS[operation],
+            {
+              owner: String(copiedParameters.owner),
+              repo: String(copiedParameters.repo),
+              request: {
+                fetch,
+                redirect: "error",
+                ...(signal === undefined ? {} : { signal }),
+              },
+            },
+          )) as OctokitResponse<unknown>;
+          return normalizedRestResponse<T>(response, rateGate);
+        },
+      );
+    },
+
+    graphqlMutation<T>(
+      operation: GraphqlMutationOperation,
+      variables: Readonly<Record<string, unknown>>,
+      operationId: string,
+      signal?: AbortSignal,
+    ): Promise<GraphqlTransportResponse<T>> {
+      if (!isGraphqlMutationOperation(operation)) {
+        return Promise.reject(invalidInput("invalid_parameters"));
+      }
+      let copiedOperationId: string;
+      let copiedVariables: Readonly<Record<string, unknown>>;
+      try {
+        copiedOperationId = copyMutationOperationId(operationId, operation);
+        copiedVariables = copyGraphqlMutationVariables(
+          operation,
+          variables,
+          copiedOperationId,
+        );
+      } catch (error) {
+        return Promise.reject(
+          error instanceof AppError
+            ? error
+            : invalidInput("invalid_parameters", operation),
+        );
+      }
+      if (containsSecret(copiedVariables, token)) {
+        return Promise.reject(invalidInput("invalid_parameters", operation));
+      }
+      const expected: ExpectedRequest = {
+        kind: "graphql",
+        operation,
+        method: "POST",
+        path: "/graphql",
+        queryKeys: new Set(),
+      };
+      let dispatched = false;
+      let fetch: typeof globalThis.fetch;
+      try {
+        fetch = guardedFetch(
+          safeRuntimeFetch(runtime, operation),
+          expected,
+          () => {
+            dispatched = true;
+          },
+        );
+      } catch (error) {
+        return Promise.reject(
+          error instanceof AppError
+            ? error
+            : mappedError(
+                "GITHUB_UNAVAILABLE",
+                false,
+                "invalid_fetch",
+                operation,
+              ),
+        );
+      }
+      return executeMutationOnce(
+        operation,
+        copiedOperationId,
+        "graphql",
+        signal,
+        rateGate,
+        () => dispatched,
+        async () => {
+          const response = (await client.request("POST /graphql", {
+            query: GRAPHQL_MUTATION_DOCUMENTS[operation],
             variables: copiedVariables,
             request: {
               fetch,

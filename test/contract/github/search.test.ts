@@ -80,6 +80,12 @@ function transport(
     graphql<T>(): Promise<GraphqlTransportResponse<T>> {
       return Promise.reject(new Error("unexpected GraphQL request"));
     },
+    restMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected REST mutation"));
+    },
+    graphqlMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected GraphQL mutation"));
+    },
   };
   return { port, rest };
 }
@@ -94,20 +100,30 @@ async function expectCode(
 }
 
 describe("GitHub repository Search adapter", () => {
-  it("advances the adapter to the final seven-method read port", () => {
+  it("keeps the adapter on the approved named port", () => {
     expectTypeOf<OctokitGitHubAdapter>().toMatchTypeOf<GitHubPort>();
     expect(
       Object.getOwnPropertyNames(OctokitGitHubAdapter.prototype).sort(),
     ).toEqual(
       [
         "constructor",
+        "checkStar",
+        "createUserList",
+        "deleteUserList",
         "getReadme",
+        "getRepositoryIdentity",
+        "getRepositoryListIds",
+        "getUserList",
         "getViewer",
         "listStarredRepositories",
         "listUserListItems",
         "listUserLists",
         "probeCapabilities",
         "searchRepositories",
+        "setRepositoryListIds",
+        "star",
+        "unstar",
+        "updateUserList",
       ].sort(),
     );
   });

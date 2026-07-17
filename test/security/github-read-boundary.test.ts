@@ -40,9 +40,14 @@ describe("GitHub read capability boundary", () => {
       ...interfaceMethodNames(source, "GitHubListReadPort"),
       ...interfaceMethodNames(source, "GitHubEvidenceReadPort"),
       ...interfaceMethodNames(source, "GitHubDiscoveryReadPort"),
+      ...interfaceMethodNames(source, "GitHubLiveReadPort"),
     ];
     expect([...new Set(methods)].sort()).toEqual([
+      "checkStar",
       "getReadme",
+      "getRepositoryIdentity",
+      "getRepositoryListIds",
+      "getUserList",
       "getViewer",
       "listStarredRepositories",
       "listUserListItems",
@@ -57,11 +62,18 @@ describe("GitHub read capability boundary", () => {
 
   it("contains no mutation document or non-GET REST route in the read allowlist", async () => {
     const source = await readFile(ALLOWLIST_SOURCE, "utf8");
+    const readStart = source.indexOf("export const REST_READ_OPERATIONS");
+    const mutationStart = source.indexOf(
+      "export const REST_MUTATION_OPERATIONS",
+    );
+    expect(readStart).toBeGreaterThanOrEqual(0);
+    expect(mutationStart).toBeGreaterThan(readStart);
+    const readSource = source.slice(readStart, mutationStart);
 
-    expect(source).not.toMatch(/\bmutation\b/u);
-    expect(source).not.toMatch(/["'`](?:POST|PUT|PATCH|DELETE)\s+\//u);
-    expect(source).not.toMatch(/https?:\/\//u);
-    expect(source).not.toMatch(
+    expect(readSource).not.toMatch(/\bmutation\b/u);
+    expect(readSource).not.toMatch(/["'`](?:POST|PUT|PATCH|DELETE)\s+\//u);
+    expect(readSource).not.toMatch(/https?:\/\//u);
+    expect(readSource).not.toMatch(
       /\b(?:deleteRepository|archiveRepository|transferRepository|updateRepository|updateFile|createOrUpdateFile|deleteFile|createCommit)\b/u,
     );
   });
@@ -78,6 +90,29 @@ describe("GitHub read capability boundary", () => {
     expect(source).not.toMatch(/constructor\s*\(\s*transport\s*:[^,)]*,/u);
     expect(source).not.toMatch(
       /\b(?:deleteRepository|archiveRepository|transferRepository)\s*\(/u,
+    );
+  });
+
+  it("exposes exactly six Star and User List mutations without administration escape hatches", async () => {
+    const [portSource, allowlistSource, adapterSource] = await Promise.all([
+      readFile(PORT_SOURCE, "utf8"),
+      readFile(ALLOWLIST_SOURCE, "utf8"),
+      readFile(ADAPTER_SOURCE, "utf8"),
+    ]);
+
+    expect(interfaceMethodNames(portSource, "GitHubMutationPort")).toEqual([
+      "createUserList",
+      "deleteUserList",
+      "setRepositoryListIds",
+      "star",
+      "unstar",
+      "updateUserList",
+    ]);
+    expect(allowlistSource).not.toMatch(
+      /\b(?:deleteRepository|archiveRepository|transferRepository|updateRepository|updateFile|createOrUpdateFile|deleteFile|createCommit)\b/u,
+    );
+    expect(adapterSource).not.toMatch(
+      /\b(?:rawRequest|deleteRepository|archiveRepository|transferRepository|updateRepository|updateFile|createOrUpdateFile|deleteFile|createCommit)\s*\(/u,
     );
   });
 });

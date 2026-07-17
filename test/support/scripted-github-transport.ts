@@ -1,69 +1,108 @@
+import { Buffer } from "node:buffer";
 import { types as utilTypes } from "node:util";
 import type { RateLimitState } from "../../src/app/ports/github-port.js";
+import { AppError } from "../../src/domain/errors.js";
 import {
+  GRAPHQL_MUTATION_DOCUMENTS,
+  GRAPHQL_MUTATION_OPERATIONS,
   GRAPHQL_READ_DOCUMENTS,
   GRAPHQL_READ_OPERATIONS,
+  REST_MUTATION_OPERATIONS,
   REST_READ_OPERATIONS,
   type GitHubTransport,
+  type GraphqlMutationOperation,
   type GraphqlReadOperation,
   type GraphqlTransportError,
   type GraphqlTransportResponse,
+  type RestMutationOperation,
   type RestReadOperation,
   type RestTransportResponse,
   type TransportHeaders,
 } from "../../src/github/allowed-operations.js";
+import { AmbiguousMutationError } from "../../src/github/errors.js";
 
-type RestPath<Operation extends RestReadOperation> =
-  (typeof REST_READ_OPERATIONS)[Operation] extends `GET ${infer Path}`
-    ? Path
-    : never;
+type AnyRestOperation = RestReadOperation | RestMutationOperation;
+type AnyGraphqlOperation = GraphqlReadOperation | GraphqlMutationOperation;
+
+type RestRoute<Operation extends AnyRestOperation> =
+  Operation extends RestReadOperation
+    ? (typeof REST_READ_OPERATIONS)[Operation]
+    : Operation extends RestMutationOperation
+      ? (typeof REST_MUTATION_OPERATIONS)[Operation]
+      : never;
+
+type RestMethod<Operation extends AnyRestOperation> =
+  RestRoute<Operation> extends `${infer Method} ${string}` ? Method : never;
+
+type RestPath<Operation extends AnyRestOperation> =
+  RestRoute<Operation> extends `${string} ${infer Path}` ? Path : never;
+
+type GraphqlOperationName<Operation extends AnyGraphqlOperation> =
+  Operation extends GraphqlReadOperation
+    ? (typeof GRAPHQL_READ_OPERATIONS)[Operation]
+    : Operation extends GraphqlMutationOperation
+      ? (typeof GRAPHQL_MUTATION_OPERATIONS)[Operation]
+      : never;
+
+type GraphqlDocument<Operation extends AnyGraphqlOperation> =
+  Operation extends GraphqlReadOperation
+    ? (typeof GRAPHQL_READ_DOCUMENTS)[Operation]
+    : Operation extends GraphqlMutationOperation
+      ? (typeof GRAPHQL_MUTATION_DOCUMENTS)[Operation]
+      : never;
 
 export type ScriptedRestStep = {
-  [Operation in RestReadOperation]: Readonly<{
+  [Operation in AnyRestOperation]: Readonly<{
     kind: "rest";
     operation: Operation;
-    method: "GET";
+    method: RestMethod<Operation>;
     path: RestPath<Operation>;
     status: number;
     data?: unknown;
     headers?: TransportHeaders;
+    resetAfterDispatch?: true;
+    abortAfterDispatch?: true;
   }>;
-}[RestReadOperation];
+}[AnyRestOperation];
 
 export type ScriptedGraphqlStep = {
-  [Operation in GraphqlReadOperation]: Readonly<{
+  [Operation in AnyGraphqlOperation]: Readonly<{
     kind: "graphql";
     operation: Operation;
-    graphqlOperation: (typeof GRAPHQL_READ_OPERATIONS)[Operation];
+    graphqlOperation: GraphqlOperationName<Operation>;
     status: number;
     data?: unknown;
     errors?: readonly GraphqlTransportError[];
     headers?: TransportHeaders;
     rateLimit?: RateLimitState | null;
+    resetAfterDispatch?: true;
+    abortAfterDispatch?: true;
   }>;
-}[GraphqlReadOperation];
+}[AnyGraphqlOperation];
 
 export type ScriptedGitHubStep = ScriptedRestStep | ScriptedGraphqlStep;
 
 export type ScriptedRestRequest = {
-  [Operation in RestReadOperation]: Readonly<{
+  [Operation in AnyRestOperation]: Readonly<{
     kind: "rest";
     operation: Operation;
-    method: "GET";
+    method: RestMethod<Operation>;
     path: RestPath<Operation>;
     parameters: Readonly<Record<string, unknown>>;
+    operationId?: string;
   }>;
-}[RestReadOperation];
+}[AnyRestOperation];
 
 export type ScriptedGraphqlRequest = {
-  [Operation in GraphqlReadOperation]: Readonly<{
+  [Operation in AnyGraphqlOperation]: Readonly<{
     kind: "graphql";
     operation: Operation;
-    graphqlOperation: (typeof GRAPHQL_READ_OPERATIONS)[Operation];
-    document: (typeof GRAPHQL_READ_DOCUMENTS)[Operation];
+    graphqlOperation: GraphqlOperationName<Operation>;
+    document: GraphqlDocument<Operation>;
     variables: Readonly<Record<string, unknown>>;
+    operationId?: string;
   }>;
-}[GraphqlReadOperation];
+}[AnyGraphqlOperation];
 
 export type ScriptedGitHubRequest =
   | ScriptedRestRequest
@@ -73,7 +112,7 @@ export interface ScriptedGitHubTransportHarness {
   readonly transport: GitHubTransport;
   readonly requests: readonly ScriptedGitHubRequest[];
   graphqlVariables(
-    operation: GraphqlReadOperation,
+    operation: string,
     occurrence?: number,
   ): Readonly<Record<string, unknown>>;
   graphqlDocuments(): readonly string[];
@@ -88,6 +127,7 @@ class InvalidFixtureValue extends Error {}
 function cloneFixtureValue(
   value: unknown,
   copies: WeakMap<object, unknown>,
+  active: WeakSet<object>,
 ): unknown {
   if (
     value === null ||
@@ -100,35 +140,45 @@ function cloneFixtureValue(
   }
   if (typeof value !== "object") throw new InvalidFixtureValue();
   if (utilTypes.isProxy(value)) throw new InvalidFixtureValue();
+  if (active.has(value)) throw new InvalidFixtureValue();
 
   const priorCopy = copies.get(value);
   if (priorCopy !== undefined) return priorCopy;
+  active.add(value);
 
   if (Array.isArray(value)) {
+    if (Reflect.getPrototypeOf(value) !== Array.prototype) {
+      throw new InvalidFixtureValue();
+    }
+    const descriptors = Object.getOwnPropertyDescriptors(value as object);
+    const keys = Reflect.ownKeys(descriptors);
+    if (
+      keys.some((key) => typeof key !== "string") ||
+      keys.length !== value.length + 1
+    ) {
+      throw new InvalidFixtureValue();
+    }
     const copy: unknown[] = [];
     copies.set(value, copy);
-    const ownKeys = Reflect.ownKeys(value);
-    for (const key of ownKeys) {
-      if (key === "length") continue;
+    for (let index = 0; index < value.length; index += 1) {
+      const key = String(index);
+      const descriptor = descriptors[key];
       if (
-        typeof key !== "string" ||
-        !/^(0|[1-9]\d*)$/u.test(key) ||
-        Number(key) >= value.length
+        descriptor === undefined ||
+        !Object.hasOwn(descriptor, "value") ||
+        descriptor.enumerable !== true
       ) {
-        throw new InvalidFixtureValue();
-      }
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (descriptor === undefined || !("value" in descriptor)) {
         throw new InvalidFixtureValue();
       }
       Object.defineProperty(copy, key, {
         configurable: true,
-        enumerable: descriptor.enumerable ?? false,
-        value: cloneFixtureValue(descriptor.value, copies),
+        enumerable: true,
+        value: cloneFixtureValue(descriptor.value, copies, active),
         writable: true,
       });
     }
     copy.length = value.length;
+    active.delete(value);
     return Object.freeze(copy);
   }
 
@@ -145,22 +195,27 @@ function cloneFixtureValue(
   for (const key of Reflect.ownKeys(value)) {
     if (typeof key !== "string") throw new InvalidFixtureValue();
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    if (descriptor === undefined || !("value" in descriptor)) {
+    if (
+      descriptor === undefined ||
+      !Object.hasOwn(descriptor, "value") ||
+      descriptor.enumerable !== true
+    ) {
       throw new InvalidFixtureValue();
     }
     Object.defineProperty(copy, key, {
       configurable: true,
-      enumerable: descriptor.enumerable ?? false,
-      value: cloneFixtureValue(descriptor.value, copies),
+      enumerable: true,
+      value: cloneFixtureValue(descriptor.value, copies, active),
       writable: true,
     });
   }
+  active.delete(value);
   return Object.freeze(copy);
 }
 
 function copyAndFreeze<T>(value: T): T {
   try {
-    return cloneFixtureValue(value, new WeakMap()) as T;
+    return cloneFixtureValue(value, new WeakMap(), new WeakSet()) as T;
   } catch {
     throw new Error(FIXTURE_VALUE_ERROR);
   }
@@ -232,6 +287,271 @@ function assertNotAborted(signal: AbortSignal | undefined): void {
   if (aborted) throw fixedAbortError();
 }
 
+function scriptedMutationValidation(operation: string): AppError {
+  return new AppError(
+    "VALIDATION_ERROR",
+    "Scripted GitHub mutation input is invalid",
+    {
+      retryable: false,
+      details: { operation, reason: "invalid_input" },
+    },
+  );
+}
+
+function scriptedMutationCancelled(operation: string): AppError {
+  return new AppError("GITHUB_UNAVAILABLE", "GitHub request was cancelled", {
+    retryable: false,
+    details: { operation, reason: "cancelled" },
+  });
+}
+
+function assertMutationNotAborted(
+  signal: AbortSignal | undefined,
+  operation: string,
+): void {
+  if (signal === undefined) return;
+  try {
+    if (!signal.aborted) return;
+  } catch {
+    throw scriptedMutationCancelled(operation);
+  }
+  throw scriptedMutationCancelled(operation);
+}
+
+function scriptedStableText(
+  value: unknown,
+  maximum = 128,
+  trimEqual = true,
+): string | null {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > maximum ||
+    (trimEqual && value !== value.trim())
+  ) {
+    return null;
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || codeUnit === 0x7f) return null;
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return null;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return null;
+    }
+  }
+  return value;
+}
+
+function scriptedDescription(value: unknown): string | null | undefined {
+  if (value === null) return null;
+  if (typeof value !== "string" || value.length > 1_024) return undefined;
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || codeUnit === 0x7f) return undefined;
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return undefined;
+      index += 1;
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return undefined;
+    }
+  }
+  return value;
+}
+
+function exactRequestKeys(
+  value: Readonly<Record<string, unknown>>,
+  keys: ReadonlySet<string>,
+): boolean {
+  const ownKeys = Reflect.ownKeys(value);
+  return (
+    ownKeys.length === keys.size &&
+    ownKeys.every((key) => typeof key === "string" && keys.has(key))
+  );
+}
+
+function copyScriptedRestMutationParameters(
+  operation: RestMutationOperation,
+  parameters: Readonly<Record<string, unknown>>,
+): Readonly<Record<string, unknown>> {
+  let copied: Readonly<Record<string, unknown>>;
+  try {
+    copied = copyRequestFields(parameters);
+  } catch {
+    throw scriptedMutationValidation(operation);
+  }
+  const owner = scriptedStableText(copied.owner);
+  const repo = scriptedStableText(copied.repo);
+  if (
+    !exactRequestKeys(copied, new Set(["owner", "repo"])) ||
+    owner === null ||
+    repo === null ||
+    /[/\\?#]/u.test(owner) ||
+    /[/\\?#]/u.test(repo)
+  ) {
+    throw scriptedMutationValidation(operation);
+  }
+  return copyAndFreeze({ owner, repo });
+}
+
+function utf8Compare(left: string, right: string): number {
+  return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
+}
+
+function scriptedMembershipIds(
+  value: unknown,
+  operation: GraphqlMutationOperation,
+): readonly string[] {
+  if (!Array.isArray(value) || value.length > 5_000) {
+    throw scriptedMutationValidation(operation);
+  }
+  const ids = value.map((candidate) => {
+    const id = scriptedStableText(candidate);
+    if (id === null) throw scriptedMutationValidation(operation);
+    return id;
+  });
+  ids.sort(utf8Compare);
+  return Object.freeze([...new Set(ids)]);
+}
+
+function copyScriptedGraphqlMutationVariables(
+  operation: GraphqlMutationOperation,
+  variables: Readonly<Record<string, unknown>>,
+  operationId: string,
+): Readonly<Record<string, unknown>> {
+  let copied: Readonly<Record<string, unknown>>;
+  try {
+    copied = copyRequestFields(variables);
+  } catch {
+    throw scriptedMutationValidation(operation);
+  }
+  if (copied.clientMutationId !== operationId) {
+    throw scriptedMutationValidation(operation);
+  }
+  if (operation === "createUserList") {
+    const name = scriptedStableText(copied.name, 100, false);
+    const description = scriptedDescription(copied.description);
+    if (
+      !exactRequestKeys(
+        copied,
+        new Set(["name", "description", "isPrivate", "clientMutationId"]),
+      ) ||
+      name === null ||
+      description === undefined ||
+      typeof copied.isPrivate !== "boolean"
+    ) {
+      throw scriptedMutationValidation(operation);
+    }
+    return copyAndFreeze({
+      name,
+      description,
+      isPrivate: copied.isPrivate,
+      clientMutationId: operationId,
+    });
+  }
+  if (operation === "updateUserList") {
+    const keys = Reflect.ownKeys(copied);
+    const allowed = new Set([
+      "listId",
+      "name",
+      "description",
+      "isPrivate",
+      "clientMutationId",
+    ]);
+    const listId = scriptedStableText(copied.listId);
+    if (
+      keys.length < 3 ||
+      keys.length > 5 ||
+      keys.some((key) => typeof key !== "string" || !allowed.has(key)) ||
+      listId === null ||
+      (!Object.hasOwn(copied, "name") &&
+        !Object.hasOwn(copied, "description") &&
+        !Object.hasOwn(copied, "isPrivate"))
+    ) {
+      throw scriptedMutationValidation(operation);
+    }
+    const name = Object.hasOwn(copied, "name")
+      ? scriptedStableText(copied.name, 100, false)
+      : undefined;
+    const description = Object.hasOwn(copied, "description")
+      ? scriptedDescription(copied.description)
+      : undefined;
+    if (
+      (Object.hasOwn(copied, "name") && name === null) ||
+      (Object.hasOwn(copied, "description") && description === undefined) ||
+      (Object.hasOwn(copied, "isPrivate") &&
+        typeof copied.isPrivate !== "boolean")
+    ) {
+      throw scriptedMutationValidation(operation);
+    }
+    return copyAndFreeze({
+      listId,
+      ...(name === undefined ? {} : { name }),
+      ...(description === undefined ? {} : { description }),
+      ...(Object.hasOwn(copied, "isPrivate")
+        ? { isPrivate: copied.isPrivate }
+        : {}),
+      clientMutationId: operationId,
+    });
+  }
+  if (operation === "deleteUserList") {
+    const listId = scriptedStableText(copied.listId);
+    if (
+      !exactRequestKeys(copied, new Set(["listId", "clientMutationId"])) ||
+      listId === null
+    ) {
+      throw scriptedMutationValidation(operation);
+    }
+    return copyAndFreeze({ listId, clientMutationId: operationId });
+  }
+  const itemId = scriptedStableText(copied.itemId);
+  if (
+    !exactRequestKeys(
+      copied,
+      new Set(["itemId", "listIds", "clientMutationId"]),
+    ) ||
+    itemId === null
+  ) {
+    throw scriptedMutationValidation(operation);
+  }
+  return copyAndFreeze({
+    itemId,
+    listIds: scriptedMembershipIds(copied.listIds, operation),
+    clientMutationId: operationId,
+  });
+}
+
+function resetAfterDispatchCause(): Error {
+  const cause = new Error("scripted mutation outcome is unknown");
+  Object.defineProperty(cause, "code", {
+    configurable: false,
+    enumerable: false,
+    value: "ECONNRESET",
+    writable: false,
+  });
+  return cause;
+}
+
+function throwScriptedDispatchFailure(
+  step: ScriptedGitHubStep,
+  operation: RestMutationOperation | GraphqlMutationOperation,
+  operationId: string,
+): void {
+  if (step.resetAfterDispatch === true) {
+    throw new AmbiguousMutationError(
+      operationId,
+      operation,
+      resetAfterDispatchCause(),
+    );
+  }
+  if (step.abortAfterDispatch === true) {
+    throw new AmbiguousMutationError(operationId, operation, fixedAbortError());
+  }
+}
+
 function headersRecord(value: unknown): value is TransportHeaders {
   if (value === null || typeof value !== "object" || Array.isArray(value)) {
     return false;
@@ -273,16 +593,53 @@ function normalizeHeaders(value: unknown): TransportHeaders {
   return copyAndFreeze(normalized);
 }
 
-function isRestOperation(value: unknown): value is RestReadOperation {
+function isRestReadOperation(value: unknown): value is RestReadOperation {
   return (
     typeof value === "string" && Object.hasOwn(REST_READ_OPERATIONS, value)
   );
 }
 
-function isGraphqlOperation(value: unknown): value is GraphqlReadOperation {
+function isRestMutationOperation(
+  value: unknown,
+): value is RestMutationOperation {
+  return (
+    typeof value === "string" && Object.hasOwn(REST_MUTATION_OPERATIONS, value)
+  );
+}
+
+function isRestOperation(value: unknown): value is AnyRestOperation {
+  return isRestReadOperation(value) || isRestMutationOperation(value);
+}
+
+function isGraphqlReadOperation(value: unknown): value is GraphqlReadOperation {
   return (
     typeof value === "string" && Object.hasOwn(GRAPHQL_READ_OPERATIONS, value)
   );
+}
+
+function isGraphqlMutationOperation(
+  value: unknown,
+): value is GraphqlMutationOperation {
+  return (
+    typeof value === "string" &&
+    Object.hasOwn(GRAPHQL_MUTATION_OPERATIONS, value)
+  );
+}
+
+function isGraphqlOperation(value: unknown): value is AnyGraphqlOperation {
+  return isGraphqlReadOperation(value) || isGraphqlMutationOperation(value);
+}
+
+function restRoute(operation: AnyRestOperation): string {
+  return isRestReadOperation(operation)
+    ? REST_READ_OPERATIONS[operation]
+    : REST_MUTATION_OPERATIONS[operation];
+}
+
+function graphqlOperationName(operation: AnyGraphqlOperation): string {
+  return isGraphqlReadOperation(operation)
+    ? GRAPHQL_READ_OPERATIONS[operation]
+    : GRAPHQL_MUTATION_OPERATIONS[operation];
 }
 
 function isValidStatus(value: unknown): value is number {
@@ -311,6 +668,8 @@ const REST_STEP_FIELDS = new Set([
   "status",
   "data",
   "headers",
+  "resetAfterDispatch",
+  "abortAfterDispatch",
 ]);
 const GRAPHQL_STEP_FIELDS = new Set([
   "kind",
@@ -321,6 +680,8 @@ const GRAPHQL_STEP_FIELDS = new Set([
   "errors",
   "headers",
   "rateLimit",
+  "resetAfterDispatch",
+  "abortAfterDispatch",
 ]);
 
 function validGraphqlErrors(value: unknown): boolean {
@@ -364,6 +725,20 @@ function validRateLimit(value: unknown): boolean {
   );
 }
 
+function validDispatchFailureFlags(
+  step: ScriptedGitHubStep,
+  mutation: boolean,
+): boolean {
+  const reset = step.resetAfterDispatch;
+  const abort = step.abortAfterDispatch;
+  return (
+    (reset === undefined || reset === true) &&
+    (abort === undefined || abort === true) &&
+    !(reset === true && abort === true) &&
+    (mutation || (reset === undefined && abort === undefined))
+  );
+}
+
 function validateTranscriptStep(step: ScriptedGitHubStep, index: number): void {
   if (step === null || typeof step !== "object") {
     throw new Error(`Scripted GitHub transcript step ${index} is invalid`);
@@ -380,8 +755,13 @@ function validateTranscriptStep(step: ScriptedGitHubStep, index: number): void {
         `Scripted GitHub transcript rest:${step.operation} has unrecognized fields`,
       );
     }
-    const route = REST_READ_OPERATIONS[step.operation];
-    if (step.method !== "GET" || step.path !== route.slice(4)) {
+    const route = restRoute(step.operation);
+    const separator = route.indexOf(" ");
+    if (
+      separator < 1 ||
+      step.method !== route.slice(0, separator) ||
+      step.path !== route.slice(separator + 1)
+    ) {
       throw new Error(
         `Scripted GitHub transcript route does not match rest:${step.operation}`,
       );
@@ -392,6 +772,13 @@ function validateTranscriptStep(step: ScriptedGitHubStep, index: number): void {
       );
     }
     normalizeHeaders(step.headers);
+    if (
+      !validDispatchFailureFlags(step, isRestMutationOperation(step.operation))
+    ) {
+      throw new Error(
+        `Scripted GitHub transcript rest:${step.operation} has an invalid dispatch failure`,
+      );
+    }
     return;
   }
 
@@ -406,7 +793,7 @@ function validateTranscriptStep(step: ScriptedGitHubStep, index: number): void {
         `Scripted GitHub transcript graphql:${step.operation} has unrecognized fields`,
       );
     }
-    if (step.graphqlOperation !== GRAPHQL_READ_OPERATIONS[step.operation]) {
+    if (step.graphqlOperation !== graphqlOperationName(step.operation)) {
       throw new Error(
         `Scripted GitHub transcript document does not match graphql:${step.operation}`,
       );
@@ -422,6 +809,16 @@ function validateTranscriptStep(step: ScriptedGitHubStep, index: number): void {
         `Scripted GitHub transcript graphql:${step.operation} has an invalid envelope`,
       );
     }
+    if (
+      !validDispatchFailureFlags(
+        step,
+        isGraphqlMutationOperation(step.operation),
+      )
+    ) {
+      throw new Error(
+        `Scripted GitHub transcript graphql:${step.operation} has an invalid dispatch failure`,
+      );
+    }
     return;
   }
 
@@ -430,7 +827,7 @@ function validateTranscriptStep(step: ScriptedGitHubStep, index: number): void {
 
 function requestLabel(
   kind: ScriptedGitHubRequest["kind"],
-  operation: RestReadOperation | GraphqlReadOperation,
+  operation: AnyRestOperation | AnyGraphqlOperation,
 ): string {
   return `${kind}:${operation}`;
 }
@@ -455,7 +852,7 @@ export function createScriptedGitHubTransport(
 
   function consumeStep(
     kind: ScriptedGitHubRequest["kind"],
-    operation: RestReadOperation | GraphqlReadOperation,
+    operation: AnyRestOperation | AnyGraphqlOperation,
   ): ScriptedGitHubStep {
     const received = requestLabel(kind, operation);
     if (queue.length === 0) {
@@ -535,6 +932,98 @@ export function createScriptedGitHubTransport(
         });
       });
     },
+
+    restMutation<T>(
+      operation: RestMutationOperation,
+      parameters: Readonly<Record<string, unknown>>,
+      operationId: string,
+      signal?: AbortSignal,
+    ): Promise<RestTransportResponse<T>> {
+      return Promise.resolve().then(() => {
+        if (!isRestMutationOperation(operation)) {
+          throw scriptedMutationValidation("transport");
+        }
+        assertMutationNotAborted(signal, operation);
+        const copiedOperationId = scriptedStableText(operationId);
+        if (copiedOperationId === null) {
+          throw scriptedMutationValidation(operation);
+        }
+        const copiedParameters = copyScriptedRestMutationParameters(
+          operation,
+          parameters,
+        );
+        const route = REST_MUTATION_OPERATIONS[operation];
+        const separator = route.indexOf(" ");
+        const request = copyAndFreeze({
+          kind: "rest",
+          operation,
+          method: route.slice(0, separator),
+          path: route.slice(separator + 1),
+          parameters: copiedParameters,
+          operationId: copiedOperationId,
+        }) as ScriptedRestRequest;
+        recordedRequests.push(request);
+
+        const step = consumeStep("rest", operation);
+        if (step.kind !== "rest" || !isRestMutationOperation(step.operation)) {
+          throw new Error("Scripted GitHub transport internal kind mismatch");
+        }
+        throwScriptedDispatchFailure(step, operation, copiedOperationId);
+        return copyAndFreeze({
+          data: step.data as T,
+          status: step.status,
+          headers: normalizeHeaders(step.headers),
+        });
+      });
+    },
+
+    graphqlMutation<T>(
+      operation: GraphqlMutationOperation,
+      variables: Readonly<Record<string, unknown>>,
+      operationId: string,
+      signal?: AbortSignal,
+    ): Promise<GraphqlTransportResponse<T>> {
+      return Promise.resolve().then(() => {
+        if (!isGraphqlMutationOperation(operation)) {
+          throw scriptedMutationValidation("transport");
+        }
+        assertMutationNotAborted(signal, operation);
+        const copiedOperationId = scriptedStableText(operationId);
+        if (copiedOperationId === null) {
+          throw scriptedMutationValidation(operation);
+        }
+        const copiedVariables = copyScriptedGraphqlMutationVariables(
+          operation,
+          variables,
+          copiedOperationId,
+        );
+        const request = copyAndFreeze({
+          kind: "graphql",
+          operation,
+          graphqlOperation: GRAPHQL_MUTATION_OPERATIONS[operation],
+          document: GRAPHQL_MUTATION_DOCUMENTS[operation],
+          variables: copiedVariables,
+          operationId: copiedOperationId,
+        }) as ScriptedGraphqlRequest;
+        recordedRequests.push(request);
+
+        const step = consumeStep("graphql", operation);
+        if (
+          step.kind !== "graphql" ||
+          !isGraphqlMutationOperation(step.operation)
+        ) {
+          throw new Error("Scripted GitHub transport internal kind mismatch");
+        }
+        throwScriptedDispatchFailure(step, operation, copiedOperationId);
+        return copyAndFreeze({
+          data: (step.data ?? null) as T | null,
+          errors: step.errors ?? [],
+          status: step.status,
+          headers: normalizeHeaders(step.headers),
+          rateLimit: step.rateLimit ?? null,
+        });
+      });
+    },
   };
 
   return {
@@ -543,7 +1032,7 @@ export function createScriptedGitHubTransport(
       return copyAndFreeze(recordedRequests);
     },
     graphqlVariables(
-      operation: GraphqlReadOperation,
+      operation: string,
       occurrence = 0,
     ): Readonly<Record<string, unknown>> {
       if (!Number.isInteger(occurrence) || occurrence < 0) {
@@ -552,7 +1041,9 @@ export function createScriptedGitHubTransport(
       const request = recordedRequests
         .filter(
           (candidate): candidate is ScriptedGraphqlRequest =>
-            candidate.kind === "graphql" && candidate.operation === operation,
+            candidate.kind === "graphql" &&
+            (candidate.operation === operation ||
+              candidate.graphqlOperation === operation),
         )
         .at(occurrence);
       if (request === undefined) {

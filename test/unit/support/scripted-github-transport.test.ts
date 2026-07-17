@@ -74,18 +74,16 @@ describe("scripted GitHub transport", () => {
     scripted.assertExhausted();
   });
 
-  it("copies and freezes arrays, null-prototype objects, and cyclic fixture data", async () => {
+  it("copies arrays and null-prototype objects but rejects cyclic fixture data", async () => {
     const dictionary: Record<string, unknown> = { key: "value" };
     Object.setPrototypeOf(dictionary, null);
-    const cyclic: {
+    const fixture: {
       list: { value: string }[];
       dictionary: Record<string, unknown>;
-      self?: unknown;
     } = {
       list: [{ value: "original" }],
       dictionary,
     };
-    cyclic.self = cyclic;
     const scripted = createScriptedGitHubTransport([
       {
         kind: "rest",
@@ -93,19 +91,18 @@ describe("scripted GitHub transport", () => {
         method: "GET",
         path: "/user",
         status: 200,
-        data: cyclic,
+        data: fixture,
       },
     ]);
 
-    cyclic.list[0]!.value = "mutated";
-    cyclic.dictionary.key = "mutated";
-    const response = await scripted.transport.rest<typeof cyclic>(
+    fixture.list[0]!.value = "mutated";
+    fixture.dictionary.key = "mutated";
+    const response = await scripted.transport.rest<typeof fixture>(
       "getViewer",
       {},
     );
 
-    expect(response.data).not.toBe(cyclic);
-    expect(response.data.self).toBe(response.data);
+    expect(response.data).not.toBe(fixture);
     expect(response.data.list).toEqual([{ value: "original" }]);
     expect(response.data.dictionary).toEqual({ key: "value" });
     expect(Object.getPrototypeOf(response.data.dictionary)).toBe(null);
@@ -113,6 +110,23 @@ describe("scripted GitHub transport", () => {
     expect(Object.isFrozen(response.data.list)).toBe(true);
     expect(Object.isFrozen(response.data.list[0])).toBe(true);
     expect(Object.isFrozen(response.data.dictionary)).toBe(true);
+
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    expect(() =>
+      createScriptedGitHubTransport([
+        {
+          kind: "rest",
+          operation: "getViewer",
+          method: "GET",
+          path: "/user",
+          status: 200,
+          data: cyclic,
+        },
+      ]),
+    ).toThrow(
+      "Scripted GitHub transport accepts data properties on plain fixture values only",
+    );
   });
 
   it("rejects accessors, functions, custom prototypes, symbols, and extra step fields without evaluating or leaking them", () => {

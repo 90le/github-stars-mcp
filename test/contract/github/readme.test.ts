@@ -42,6 +42,12 @@ function errorTransport(error: AppError): GitHubTransport {
         new AppError("INTERNAL_ERROR", "unexpected GraphQL call"),
       );
     },
+    restMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected REST mutation"));
+    },
+    graphqlMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected GraphQL mutation"));
+    },
   };
 }
 
@@ -240,6 +246,12 @@ describe("GitHub README adapter", () => {
         return Promise.reject(
           new AppError("INTERNAL_ERROR", "unexpected GraphQL call"),
         );
+      },
+      restMutation(): Promise<never> {
+        return Promise.reject(new Error("unexpected REST mutation"));
+      },
+      graphqlMutation(): Promise<never> {
+        return Promise.reject(new Error("unexpected GraphQL mutation"));
       },
     };
 

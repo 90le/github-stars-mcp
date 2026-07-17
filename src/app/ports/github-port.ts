@@ -1,4 +1,8 @@
-import type { UserListId } from "../../domain/ids.js";
+import type {
+  RepositoryDatabaseId,
+  RepositoryId,
+  UserListId,
+} from "../../domain/ids.js";
 import type {
   AccountBinding,
   Repository,
@@ -75,6 +79,34 @@ export type GitHubSearchPage = Readonly<{
   rateLimit: RateLimitState | null;
 }>;
 
+export type MutationReceipt = Readonly<{
+  requestId: string | null;
+  clientMutationId: string | null;
+}>;
+
+export type RepositoryIdentity = Readonly<{
+  repositoryId: RepositoryId;
+  repositoryDatabaseId: RepositoryDatabaseId;
+  coordinates: RepositoryCoordinates;
+}>;
+
+export type CreateUserListInput = Readonly<{
+  name: string;
+  description: string | null;
+  isPrivate: boolean;
+}>;
+
+export type UpdateUserListInput = Readonly<{
+  name?: string;
+  description?: string | null;
+  isPrivate?: boolean;
+}>;
+
+export type UserListMutationResult = Readonly<{
+  list: GitHubUserList;
+  receipt: MutationReceipt;
+}>;
+
 export interface GitHubStatusReadPort {
   getViewer(signal?: AbortSignal): Promise<AccountBinding>;
   probeCapabilities(signal?: AbortSignal): Promise<GitHubCapabilities>;
@@ -116,5 +148,64 @@ export interface GitHubDiscoveryReadPort {
   ): Promise<GitHubSearchPage>;
 }
 
+export interface GitHubLiveReadPort {
+  getRepositoryIdentity(
+    repository: RepositoryCoordinates,
+    signal?: AbortSignal,
+  ): Promise<RepositoryIdentity | null>;
+  getUserList(
+    listId: UserListId,
+    signal?: AbortSignal,
+  ): Promise<GitHubUserList | null>;
+  checkStar(
+    repository: RepositoryCoordinates,
+    signal?: AbortSignal,
+  ): Promise<boolean>;
+  getRepositoryListIds(
+    repositoryId: RepositoryId,
+    signal?: AbortSignal,
+  ): Promise<readonly UserListId[]>;
+}
+
+export interface GitHubMutationPort {
+  star(
+    repository: RepositoryCoordinates,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt>;
+  unstar(
+    repository: RepositoryCoordinates,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt>;
+  createUserList(
+    input: CreateUserListInput,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<UserListMutationResult>;
+  updateUserList(
+    listId: UserListId,
+    input: UpdateUserListInput,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<UserListMutationResult>;
+  deleteUserList(
+    listId: UserListId,
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt>;
+  setRepositoryListIds(
+    repositoryId: RepositoryId,
+    listIds: readonly UserListId[],
+    operationId: string,
+    signal?: AbortSignal,
+  ): Promise<MutationReceipt>;
+}
+
 export interface GitHubPort
-  extends GitHubSyncReadPort, GitHubEvidenceReadPort, GitHubDiscoveryReadPort {}
+  extends
+    GitHubSyncReadPort,
+    GitHubEvidenceReadPort,
+    GitHubDiscoveryReadPort,
+    GitHubLiveReadPort,
+    GitHubMutationPort {}

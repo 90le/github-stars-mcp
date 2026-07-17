@@ -65,11 +65,17 @@ function customTransport(input: {
         } satisfies GraphqlTransportResponse<unknown>);
       return Promise.resolve(response as GraphqlTransportResponse<T>);
     },
+    restMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected REST mutation"));
+    },
+    graphqlMutation(): Promise<never> {
+      return Promise.reject(new Error("unexpected GraphQL mutation"));
+    },
   };
 }
 
 describe("GitHub identity and capability contracts", () => {
-  it("exposes the final read methods without mutation stubs", () => {
+  it("exposes only the approved named adapter methods", () => {
     expectTypeOf<GitHubStatusReadPort>().toHaveProperty("getViewer");
     expectTypeOf<GitHubStatusReadPort>().toHaveProperty("probeCapabilities");
     expectTypeOf<GitHubStarReadPort>().toHaveProperty(
@@ -82,13 +88,23 @@ describe("GitHub identity and capability contracts", () => {
     ).toEqual(
       [
         "constructor",
+        "checkStar",
+        "createUserList",
+        "deleteUserList",
         "getReadme",
+        "getRepositoryIdentity",
+        "getRepositoryListIds",
+        "getUserList",
         "getViewer",
         "listStarredRepositories",
         "listUserListItems",
         "listUserLists",
         "probeCapabilities",
         "searchRepositories",
+        "setRepositoryListIds",
+        "star",
+        "unstar",
+        "updateUserList",
       ].sort(),
     );
   });

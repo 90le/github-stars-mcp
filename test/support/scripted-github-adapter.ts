@@ -4,7 +4,6 @@ import {
   type ScriptedGitHubRequest,
   type ScriptedGitHubStep,
 } from "./scripted-github-transport.js";
-import type { GraphqlReadOperation } from "../../src/github/allowed-operations.js";
 
 export type { ScriptedGitHubRequest, ScriptedGitHubStep };
 
@@ -17,7 +16,7 @@ export function createScriptedGitHubAdapter(
     get requests(): readonly ScriptedGitHubRequest[] {
       return scripted.requests;
     },
-    graphqlVariables: (operation: GraphqlReadOperation, occurrence?: number) =>
+    graphqlVariables: (operation: string, occurrence?: number) =>
       scripted.graphqlVariables(operation, occurrence),
     graphqlDocuments: () => scripted.graphqlDocuments(),
     assertExhausted: () => scripted.assertExhausted(),
