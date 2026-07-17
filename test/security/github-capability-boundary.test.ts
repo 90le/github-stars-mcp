@@ -63,7 +63,7 @@ const APPROVED_ADAPTER_STATIC_MEMBERS = Object.freeze([] as string[]);
 const APPROVED_PORT_ALIAS_EXPORTS = Object.freeze([
   "AccountBinding",
   "RepositoryCoordinates",
-]);
+] as const);
 const APPROVED_PORT_INTERFACE_EXPORTS = Object.freeze([
   "GitHubDiscoveryReadPort",
   "GitHubEvidenceReadPort",
@@ -120,12 +120,17 @@ const GITHUB_PORT_FILE = fileURLToPath(
 const GITHUB_ADAPTER_FILE = fileURLToPath(
   new URL("../../src/github/octokit-github-adapter.ts", import.meta.url),
 );
+const DOMAIN_REPOSITORY_FILE = fileURLToPath(
+  new URL("../../src/domain/repository.ts", import.meta.url),
+);
 const ALLOWED_OPERATIONS_FILE = fileURLToPath(
   new URL("../../src/github/allowed-operations.ts", import.meta.url),
 );
 
 const GITHUB_PORT_SOURCE = readFileSync(GITHUB_PORT_FILE, "utf8");
 const GITHUB_ADAPTER_SOURCE = readFileSync(GITHUB_ADAPTER_FILE, "utf8");
+const DOMAIN_REPOSITORY_SOURCE = readFileSync(DOMAIN_REPOSITORY_FILE, "utf8");
+const ALLOWED_OPERATIONS_SOURCE = readFileSync(ALLOWED_OPERATIONS_FILE, "utf8");
 
 type BoundaryIssue =
   | "compiler-contract"
@@ -155,16 +160,30 @@ type ExportSymbolShape = Readonly<{
   flags: ts.SymbolFlags;
   declarationKind: ts.SyntaxKind;
   aliasedTarget?: Readonly<{
+    symbolName: string;
+    declarationFileName: string;
     flags: ts.SymbolFlags;
     declarationKind: ts.SyntaxKind;
   }>;
 }>;
 
+type ApprovedPortAliasExport = (typeof APPROVED_PORT_ALIAS_EXPORTS)[number];
+type FileNameSystem = Readonly<{
+  useCaseSensitiveFileNames: boolean;
+  realpath?: (fileName: string) => string;
+}>;
 type SourceOverrides = Readonly<Record<string, string>>;
 type ProofOptions = Readonly<{ forceCompiler?: boolean }>;
 
-function canonicalFileName(fileName: string): string {
-  return fileName.replaceAll("\\", "/").toLowerCase();
+function canonicalFileName(
+  fileName: string,
+  system: FileNameSystem = ts.sys,
+): string {
+  const realFileName = system.realpath?.(fileName) ?? fileName;
+  const normalized = realFileName.replaceAll("\\", "/");
+  return system.useCaseSensitiveFileNames
+    ? normalized
+    : normalized.toLowerCase();
 }
 
 function requiredReplacement(
@@ -283,14 +302,28 @@ function moduleExportNames(
   );
 }
 
-const ALIASED_INTERFACE_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
-  flags: ts.SymbolFlags.Alias,
-  declarationKind: ts.SyntaxKind.ExportSpecifier,
-  aliasedTarget: Object.freeze({
-    flags: ts.SymbolFlags.Interface,
-    declarationKind: ts.SyntaxKind.InterfaceDeclaration,
+const APPROVED_PORT_ALIAS_EXPORT_SHAPES = Object.freeze({
+  AccountBinding: Object.freeze({
+    flags: ts.SymbolFlags.Alias,
+    declarationKind: ts.SyntaxKind.ExportSpecifier,
+    aliasedTarget: Object.freeze({
+      symbolName: "AccountBinding",
+      declarationFileName: canonicalFileName(DOMAIN_REPOSITORY_FILE),
+      flags: ts.SymbolFlags.Interface,
+      declarationKind: ts.SyntaxKind.InterfaceDeclaration,
+    }),
   }),
-});
+  RepositoryCoordinates: Object.freeze({
+    flags: ts.SymbolFlags.Alias,
+    declarationKind: ts.SyntaxKind.ExportSpecifier,
+    aliasedTarget: Object.freeze({
+      symbolName: "RepositoryCoordinates",
+      declarationFileName: canonicalFileName(DOMAIN_REPOSITORY_FILE),
+      flags: ts.SymbolFlags.Interface,
+      declarationKind: ts.SyntaxKind.InterfaceDeclaration,
+    }),
+  }),
+} satisfies Record<ApprovedPortAliasExport, ExportSymbolShape>);
 const INTERFACE_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
   flags: ts.SymbolFlags.Interface,
   declarationKind: ts.SyntaxKind.InterfaceDeclaration,
@@ -304,11 +337,19 @@ const CLASS_EXPORT_SHAPE: ExportSymbolShape = Object.freeze({
   declarationKind: ts.SyntaxKind.ClassDeclaration,
 });
 
+function isApprovedPortAliasExport(
+  exportName: string,
+): exportName is ApprovedPortAliasExport {
+  return APPROVED_PORT_ALIAS_EXPORTS.some(
+    (approvedName) => approvedName === exportName,
+  );
+}
+
 function expectedPortExportShape(
   exportName: string,
 ): ExportSymbolShape | undefined {
-  if (APPROVED_PORT_ALIAS_EXPORTS.some((name) => name === exportName)) {
-    return ALIASED_INTERFACE_EXPORT_SHAPE;
+  if (isApprovedPortAliasExport(exportName)) {
+    return APPROVED_PORT_ALIAS_EXPORT_SHAPES[exportName];
   }
   if (APPROVED_PORT_INTERFACE_EXPORTS.some((name) => name === exportName)) {
     return INTERFACE_EXPORT_SHAPE;
@@ -350,10 +391,18 @@ function exportSymbolHasExactShape(
   }
   if (shape.aliasedTarget === undefined) return true;
   const target = checker.getAliasedSymbol(symbol);
-  return symbolHasExactDeclarationShape(
-    target,
-    shape.aliasedTarget.flags,
-    shape.aliasedTarget.declarationKind,
+  const targetDeclarations = target.getDeclarations() ?? [];
+  const targetDeclaration = targetDeclarations[0];
+  return (
+    target.getName() === shape.aliasedTarget.symbolName &&
+    symbolHasExactDeclarationShape(
+      target,
+      shape.aliasedTarget.flags,
+      shape.aliasedTarget.declarationKind,
+    ) &&
+    targetDeclaration !== undefined &&
+    canonicalFileName(targetDeclaration.getSourceFile().fileName) ===
+      shape.aliasedTarget.declarationFileName
   );
 }
 
@@ -779,6 +828,114 @@ function withAdapterSource(source: string): SourceOverrides {
   return { [GITHUB_ADAPTER_FILE]: source };
 }
 
+function adapterWithPortAccountBinding(): string {
+  return requiredReplacement(
+    requiredReplacement(
+      GITHUB_ADAPTER_SOURCE,
+      "import type {\n  CapabilityState,",
+      "import type {\n  AccountBinding,\n  CapabilityState,",
+    ),
+    "import type {\n  AccountBinding,\n  Repository,",
+    "import type {\n  Repository,",
+  );
+}
+
+function portWithoutDomainAccountBinding(): string {
+  return requiredReplacement(
+    GITHUB_PORT_SOURCE,
+    "import type {\n  AccountBinding,\n  Repository,",
+    "import type {\n  Repository,",
+  );
+}
+
+function localAccountBindingOverrides(): SourceOverrides {
+  const portSource = requiredReplacement(
+    portWithoutDomainAccountBinding(),
+    `export type {
+  AccountBinding,
+  RepositoryCoordinates,
+} from "../../domain/repository.js";`,
+    `interface AccountBinding {
+  readonly host: string;
+  readonly login: string;
+  readonly accountId: string;
+  readonly client?: import("../../github/allowed-operations.js").GitHubTransport;
+}
+
+export type { AccountBinding };
+export type { RepositoryCoordinates } from "../../domain/repository.js";`,
+  );
+  return {
+    [GITHUB_PORT_FILE]: portSource,
+    [GITHUB_ADAPTER_FILE]: adapterWithPortAccountBinding(),
+  };
+}
+
+function alternateFileAccountBindingOverrides(): SourceOverrides {
+  const portSource = requiredReplacement(
+    portWithoutDomainAccountBinding(),
+    `export type {
+  AccountBinding,
+  RepositoryCoordinates,
+} from "../../domain/repository.js";`,
+    `import type { AccountBinding } from "../../github/allowed-operations.js";
+
+export type { AccountBinding } from "../../github/allowed-operations.js";
+export type { RepositoryCoordinates } from "../../domain/repository.js";`,
+  );
+  const operationsSource = `${ALLOWED_OPERATIONS_SOURCE}
+
+export interface AccountBinding {
+  readonly host: string;
+  readonly login: string;
+  readonly accountId: string;
+  readonly client?: GitHubTransport;
+}
+`;
+  return {
+    [GITHUB_PORT_FILE]: portSource,
+    [GITHUB_ADAPTER_FILE]: adapterWithPortAccountBinding(),
+    [ALLOWED_OPERATIONS_FILE]: operationsSource,
+  };
+}
+
+function renamedAccountBindingOverrides(): SourceOverrides {
+  const repositorySource = requiredReplacement(
+    DOMAIN_REPOSITORY_SOURCE,
+    `export interface AccountBinding {
+  readonly host: string;
+  readonly login: string;
+  readonly accountId: string;
+}`,
+    `export interface BoundaryAccountBinding {
+  readonly host: string;
+  readonly login: string;
+  readonly accountId: string;
+  readonly client?: import("../github/allowed-operations.js").GitHubTransport;
+}`,
+  );
+  const portSource = requiredReplacement(
+    requiredReplacement(
+      GITHUB_PORT_SOURCE,
+      "  AccountBinding,\n  Repository,",
+      "  BoundaryAccountBinding as AccountBinding,\n  Repository,",
+    ),
+    `export type {
+  AccountBinding,
+  RepositoryCoordinates,
+} from "../../domain/repository.js";`,
+    `export type {
+  BoundaryAccountBinding as AccountBinding,
+  RepositoryCoordinates,
+} from "../../domain/repository.js";`,
+  );
+  return {
+    [GITHUB_PORT_FILE]: portSource,
+    [GITHUB_ADAPTER_FILE]: adapterWithPortAccountBinding(),
+    [DOMAIN_REPOSITORY_FILE]: repositorySource,
+  };
+}
+
 function withAdapterMembers(members: string): string {
   const classEnd = GITHUB_ADAPTER_SOURCE.lastIndexOf("\n}");
   if (classEnd < 0) throw new Error("Adapter class closing brace is missing");
@@ -805,6 +962,30 @@ describe("GitHub capability boundary", () => {
       "setRepositoryListIds",
     ]);
     expect(Object.isFrozen(GITHUB_MUTATION_METHOD_NAMES)).toBe(true);
+  });
+
+  it("canonicalizes declaration files through realpath with platform case rules", () => {
+    const insensitiveSystem = {
+      useCaseSensitiveFileNames: false,
+      realpath: (fileName: string): string =>
+        fileName.replaceAll("\\", "/").toLowerCase().includes("/link/")
+          ? "C:\\Real\\Repository.ts"
+          : "c:/real/repository.ts",
+    };
+    const sensitiveSystem = {
+      useCaseSensitiveFileNames: true,
+      realpath: (fileName: string): string => fileName,
+    };
+
+    expect(
+      canonicalFileName("C:\\Link\\Repository.ts", insensitiveSystem),
+    ).toBe(canonicalFileName("c:/real/repository.ts", insensitiveSystem));
+    expect(canonicalFileName("C:\\Real\\Repository.ts", sensitiveSystem)).toBe(
+      "C:/Real/Repository.ts",
+    );
+    expect(
+      canonicalFileName("C:/Real/Repository.ts", sensitiveSystem),
+    ).not.toBe(canonicalFileName("C:/real/repository.ts", sensitiveSystem));
   });
 
   it("proves the unchanged production contract, exports, and public members", () => {
@@ -931,6 +1112,28 @@ export namespace GitHubPort {
 
     expect(proof.issues).toContain("port-export-symbols");
   });
+
+  it.each([
+    ["same-name interface in the port module", localAccountBindingOverrides],
+    [
+      "same-name interface in another module",
+      alternateFileAccountBindingOverrides,
+    ],
+    [
+      "renamed interface in the approved declaration module",
+      renamedAccountBindingOverrides,
+    ],
+  ])(
+    "rejects a coordinated AccountBinding redirect to a %s",
+    (_label, overrides) => {
+      const proof = proveProductionBoundary(overrides(), {
+        forceCompiler: true,
+      });
+
+      expect(proof.diagnostics).toEqual([]);
+      expect(proof.issues).toContain("port-export-symbols");
+    },
+  );
 
   it.each([
     [
