@@ -1,4 +1,4 @@
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { AppError } from "../../../src/domain/errors.js";
 import {
   asPlanId,
@@ -251,6 +251,35 @@ test("canonical JSON rejects hostile, exotic, cyclic, and oversized values", () 
       "ghp_secret_should_not_leak",
     );
   }
+});
+
+test("rejects cumulative canonical output before attempting a large join", () => {
+  const repeatedLargeValue = "x".repeat(1_048_500);
+  const input = new Array<string>(65).fill(repeatedLargeValue);
+  const originalJoin = Array.prototype.join;
+  let largeJoinCalls = 0;
+  const joinSpy = vi
+    .spyOn(Array.prototype, "join")
+    .mockImplementation(function (this: unknown[], separator?: string) {
+      if (this.length >= input.length) {
+        largeJoinCalls += 1;
+        throw new Error("large join must not be attempted");
+      }
+      return originalJoin.call(this, separator);
+    });
+
+  let thrown: unknown;
+  try {
+    canonicalJson(input);
+  } catch (error) {
+    thrown = error;
+  } finally {
+    joinSpy.mockRestore();
+  }
+
+  expect(thrown).toBeInstanceOf(AppError);
+  expect((thrown as AppError).code).toBe("VALIDATION_ERROR");
+  expect(largeJoinCalls).toBe(0);
 });
 
 test("parses and freezes request actions while preserving request-time references", () => {

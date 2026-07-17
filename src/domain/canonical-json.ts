@@ -13,13 +13,22 @@ class CanonicalJsonFailure extends Error {}
 
 interface SerializationBudget {
   nodes: number;
+  remainingBytes: number;
 }
 
 function failCanonicalJson(): never {
   throw new CanonicalJsonFailure();
 }
 
-function inspectPlainObject(value: object): Readonly<Record<string, unknown>> {
+interface InspectedProperty {
+  readonly key: string;
+  readonly value: unknown;
+}
+
+function inspectPlainObject(
+  value: object,
+  budget: SerializationBudget,
+): readonly InspectedProperty[] {
   if (utilTypes.isProxy(value) || Array.isArray(value)) {
     return failCanonicalJson();
   }
@@ -28,18 +37,20 @@ function inspectPlainObject(value: object): Readonly<Record<string, unknown>> {
     return failCanonicalJson();
   }
 
-  const descriptors = Object.getOwnPropertyDescriptors(value);
-  const result: Record<string, unknown> = Object.create(null) as Record<
-    string,
-    unknown
-  >;
-  const keys = Reflect.ownKeys(descriptors);
+  const keys = Reflect.ownKeys(value);
+  if (
+    keys.length > MAX_NODES - budget.nodes ||
+    keys.length * 5 > budget.remainingBytes
+  ) {
+    return failCanonicalJson();
+  }
+  const result: InspectedProperty[] = [];
   for (let index = 0; index < keys.length; index += 1) {
     const key = keys[index];
     if (typeof key !== "string" || key.length > MAX_STRING_CODE_UNITS) {
       return failCanonicalJson();
     }
-    const descriptor = descriptors[key];
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, key);
     if (
       descriptor === undefined ||
       !Object.hasOwn(descriptor, "value") ||
@@ -47,12 +58,17 @@ function inspectPlainObject(value: object): Readonly<Record<string, unknown>> {
     ) {
       return failCanonicalJson();
     }
-    result[key] = descriptor.value as unknown;
+    result.push({ key, value: descriptor.value as unknown });
   }
-  return result;
+  return result.sort((left, right) =>
+    left.key < right.key ? -1 : left.key > right.key ? 1 : 0,
+  );
 }
 
-function inspectDenseArray(value: object): readonly unknown[] {
+function inspectDenseArray(
+  value: object,
+  budget: SerializationBudget,
+): readonly unknown[] {
   if (
     utilTypes.isProxy(value) ||
     !Array.isArray(value) ||
@@ -61,10 +77,7 @@ function inspectDenseArray(value: object): readonly unknown[] {
     return failCanonicalJson();
   }
 
-  const descriptors = Object.getOwnPropertyDescriptors(
-    value,
-  ) as unknown as PropertyDescriptorMap;
-  const lengthDescriptor = descriptors.length;
+  const lengthDescriptor = Reflect.getOwnPropertyDescriptor(value, "length");
   if (
     lengthDescriptor === undefined ||
     !Object.hasOwn(lengthDescriptor, "value") ||
@@ -75,7 +88,10 @@ function inspectDenseArray(value: object): readonly unknown[] {
     return failCanonicalJson();
   }
   const length = lengthDescriptor.value;
-  const keys = Reflect.ownKeys(descriptors);
+  if (length > MAX_NODES - budget.nodes || length * 2 > budget.remainingBytes) {
+    return failCanonicalJson();
+  }
+  const keys = Reflect.ownKeys(value);
   if (
     keys.length !== length + 1 ||
     keys.some((key) => typeof key !== "string")
@@ -85,7 +101,7 @@ function inspectDenseArray(value: object): readonly unknown[] {
 
   const result: unknown[] = [];
   for (let index = 0; index < length; index += 1) {
-    const descriptor = descriptors[String(index)];
+    const descriptor = Reflect.getOwnPropertyDescriptor(value, String(index));
     if (
       descriptor === undefined ||
       !Object.hasOwn(descriptor, "value") ||
@@ -98,26 +114,59 @@ function inspectDenseArray(value: object): readonly unknown[] {
   return result;
 }
 
+function consumeBytes(budget: SerializationBudget, count: number): void {
+  if (
+    !Number.isSafeInteger(count) ||
+    count < 0 ||
+    count > budget.remainingBytes
+  ) {
+    failCanonicalJson();
+  }
+  budget.remainingBytes -= count;
+}
+
+function appendText(
+  budget: SerializationBudget,
+  fragments: string[],
+  text: string,
+): void {
+  consumeBytes(budget, Buffer.byteLength(text, "utf8"));
+  fragments.push(text);
+}
+
 function serialize(
   value: unknown,
   ancestors: Set<object>,
   depth: number,
   budget: SerializationBudget,
-): string {
+  fragments: string[],
+): void {
   budget.nodes += 1;
   if (budget.nodes > MAX_NODES || depth > MAX_DEPTH) {
     return failCanonicalJson();
   }
 
-  if (value === null) return "null";
-  if (typeof value === "boolean") return value ? "true" : "false";
+  if (value === null) {
+    appendText(budget, fragments, "null");
+    return;
+  }
+  if (typeof value === "boolean") {
+    appendText(budget, fragments, value ? "true" : "false");
+    return;
+  }
   if (typeof value === "string") {
     if (value.length > MAX_STRING_CODE_UNITS) return failCanonicalJson();
-    return JSON.stringify(value);
+    appendText(budget, fragments, JSON.stringify(value));
+    return;
   }
   if (typeof value === "number") {
     if (!Number.isFinite(value)) return failCanonicalJson();
-    return Object.is(value, -0) ? "0" : JSON.stringify(value);
+    appendText(
+      budget,
+      fragments,
+      Object.is(value, -0) ? "0" : JSON.stringify(value),
+    );
+    return;
   }
   if (typeof value !== "object") return failCanonicalJson();
   if (ancestors.has(value)) return failCanonicalJson();
@@ -126,30 +175,27 @@ function serialize(
   try {
     if (utilTypes.isProxy(value)) return failCanonicalJson();
     if (Array.isArray(value)) {
-      const array = inspectDenseArray(value);
-      const serialized: string[] = [];
+      appendText(budget, fragments, "[");
+      const array = inspectDenseArray(value, budget);
       for (let index = 0; index < array.length; index += 1) {
-        serialized.push(serialize(array[index], ancestors, depth + 1, budget));
+        if (index > 0) appendText(budget, fragments, ",");
+        serialize(array[index], ancestors, depth + 1, budget, fragments);
       }
-      return `[${serialized.join(",")}]`;
+      appendText(budget, fragments, "]");
+      return;
     }
 
-    const record = inspectPlainObject(value);
-    const keys = Object.keys(record).sort();
-    const serialized: string[] = [];
-    for (let index = 0; index < keys.length; index += 1) {
-      const key = keys[index];
-      if (key === undefined) return failCanonicalJson();
-      serialized.push(
-        `${JSON.stringify(key)}:${serialize(
-          record[key],
-          ancestors,
-          depth + 1,
-          budget,
-        )}`,
-      );
+    appendText(budget, fragments, "{");
+    const properties = inspectPlainObject(value, budget);
+    for (let index = 0; index < properties.length; index += 1) {
+      const property = properties[index];
+      if (property === undefined) return failCanonicalJson();
+      if (index > 0) appendText(budget, fragments, ",");
+      appendText(budget, fragments, JSON.stringify(property.key));
+      appendText(budget, fragments, ":");
+      serialize(property.value, ancestors, depth + 1, budget, fragments);
     }
-    return `{${serialized.join(",")}}`;
+    appendText(budget, fragments, "}");
   } finally {
     ancestors.delete(value);
   }
@@ -161,8 +207,17 @@ function serialize(
  */
 export function canonicalJson(value: unknown): string {
   try {
-    const result = serialize(value, new Set<object>(), 0, { nodes: 0 });
-    if (Buffer.byteLength(result, "utf8") > MAX_CANONICAL_BYTES) {
+    const budget: SerializationBudget = {
+      nodes: 0,
+      remainingBytes: MAX_CANONICAL_BYTES,
+    };
+    const fragments: string[] = [];
+    serialize(value, new Set<object>(), 0, budget, fragments);
+    const result = fragments.join("");
+    if (
+      Buffer.byteLength(result, "utf8") !==
+      MAX_CANONICAL_BYTES - budget.remainingBytes
+    ) {
       return failCanonicalJson();
     }
     return result;
