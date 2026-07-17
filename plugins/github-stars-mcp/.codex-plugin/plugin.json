@@ -1,0 +1,35 @@
+{
+  "name": "github-stars-mcp",
+  "version": "1.0.0",
+  "description": "AI-native GitHub Stars and User Lists management with safe, reviewable change plans.",
+  "author": {
+    "name": "90le",
+    "url": "https://github.com/90le"
+  },
+  "homepage": "https://github.com/90le/github-stars-mcp#readme",
+  "repository": "https://github.com/90le/github-stars-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["github", "stars", "user-lists", "mcp", "codex", "ai-agent"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GitHub Stars MCP",
+    "shortDescription": "Let AI safely organize GitHub Stars and User Lists.",
+    "longDescription": "Search, sync, filter, classify, plan, inspect, apply, audit, and roll back GitHub Stars and User List changes through a local, least-privilege MCP server.",
+    "developerName": "90le",
+    "category": "Developer Tools",
+    "capabilities": [
+      "GitHub Stars",
+      "GitHub User Lists",
+      "Safe Change Plans",
+      "Audit and Rollback"
+    ],
+    "websiteURL": "https://github.com/90le/github-stars-mcp",
+    "defaultPrompt": [
+      "Sync my GitHub Stars, then show useful cleanup opportunities.",
+      "Find strong GitHub repositories for my topic and compare them.",
+      "Plan a safe reorganization of my Stars and User Lists."
+    ],
+    "brandColor": "#7C5CFC"
+  },
+  "mcpServers": "./.mcp.json"
+}

@@ -9,7 +9,7 @@
   },
   "files": [
     "dist",
-    "plugin",
+    "plugins",
     "README.md",
     "LICENSE"
   ],
@@ -39,6 +39,7 @@
     "format:check": "prettier --check .",
     "yaml:check": "node scripts/verify-yaml.mjs",
     "workflows:check": "node scripts/verify-workflows.mjs",
+    "plugin:validate": "node scripts/validate-plugin.mjs",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:coverage": "vitest run --coverage",
