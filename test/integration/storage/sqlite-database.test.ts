@@ -10,6 +10,7 @@ import {
   openSqliteDatabase,
   runInImmediateTransaction,
   runInNewImmediateTransaction,
+  SQLITE_MIGRATIONS,
   sqliteVersionAtLeast,
 } from "../../../src/storage/sqlite-database.js";
 
@@ -145,7 +146,7 @@ describe("SQLite connection hardening", () => {
     expect(second.pragma("foreign_keys", { simple: true })).toBe(1);
     expect(
       second.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(SQLITE_MIGRATIONS.length);
     second.close();
     first.close();
   });
@@ -189,7 +190,7 @@ describe("SQLite connection hardening", () => {
           .prepare("SELECT COUNT(*) FROM schema_migrations")
           .pluck()
           .get(),
-      ).toBe(1);
+      ).toBe(SQLITE_MIGRATIONS.length);
       expect(database.pragma("foreign_key_check")).toEqual([]);
       database.close();
     },

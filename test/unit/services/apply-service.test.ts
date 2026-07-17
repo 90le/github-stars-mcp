@@ -731,6 +731,35 @@ describe("ApplyService durable orchestration", () => {
       },
     ]);
     expect(fixture.github.mutationCalls).toEqual([]);
+
+    fixture.tracking.afterStartRunOperation = null;
+    const resumed = await fixture
+      .createService("cancelled-attempt-resume")
+      .apply(fixture.input);
+    const resumedRow = fixture.rawStorage.listRunOperations(resumed.run.id)[0]!;
+    expect(resumed.run.id).toBe(run.id);
+    expect(resumedRow).toMatchObject({
+      status: "succeeded",
+      attempts: 2,
+    });
+    expect(
+      fixture.rawStorage.listRunOperationReconciliationsPage({
+        runId: resumed.run.id,
+        operationId: resumedRow.operationId,
+        afterEventSequence: null,
+        pageSize: 10,
+      }).items,
+    ).toMatchObject([
+      {
+        status: "failed",
+        reconciliation: "confirmed_not_applied",
+        error: {
+          code: "RECONCILIATION_REQUIRED",
+          retryable: true,
+        },
+      },
+    ]);
+    expect(fixture.github.mutationCalls).toHaveLength(1);
   });
 
   it("recovers a successful remote mutation after its audit finish write fails", async () => {
@@ -908,8 +937,9 @@ describe("ApplyService durable orchestration", () => {
     )!;
 
     expect(rowById.get(create.operationId)).toMatchObject({
-      status: "failed",
-      error: { retryable: true },
+      status: "unresolved",
+      reconciliation: "unknown",
+      error: { retryable: false },
     });
     expect(rowById.get(independent.operationId)?.status).toBe("succeeded");
     expect(rowById.get(dependent.operationId)).toMatchObject({
@@ -1069,6 +1099,195 @@ describe("ApplyService durable orchestration", () => {
     });
   });
 
+  it("reconciles every recoverable row before the first resumed dispatch", async () => {
+    const fixture = await applyFixture();
+    const planned = await twoUnstars(fixture);
+    const failure = () =>
+      new AppError("GITHUB_UNAVAILABLE", "transport ended ambiguously", {
+        retryable: true,
+      });
+    fixture.github.failNextMutation(failure(), { kind: "unstar" });
+    fixture.github.failNextMutation(failure(), { kind: "unstar" });
+    const input = {
+      planId: planned.plan.id,
+      expectedHash: planned.plan.hash,
+      failureMode: "continue" as const,
+    };
+
+    const first = await fixture.service.apply(input);
+    const firstRows = fixture.rawStorage.listRunOperations(first.run.id);
+    expect(firstRows).toHaveLength(2);
+    expect(firstRows.every((row) => row.status === "unresolved")).toBe(true);
+    expect(fixture.github.mutationCalls).toHaveLength(2);
+
+    let checkedBeforeDispatch = false;
+    fixture.github.onMutation = () => {
+      if (checkedBeforeDispatch) return;
+      checkedBeforeDispatch = true;
+      const rows = fixture.rawStorage.listRunOperations(first.run.id);
+      for (const row of rows) {
+        expect(
+          fixture.rawStorage.listRunOperationReconciliationsPage({
+            runId: first.run.id,
+            operationId: row.operationId,
+            afterEventSequence: null,
+            pageSize: 10,
+          }).items,
+        ).toHaveLength(1);
+      }
+    };
+
+    const resumed = await fixture
+      .createService("reconcile-all-first")
+      .apply(input);
+    expect(checkedBeforeDispatch).toBe(true);
+    expect(resumed.run.id).toBe(first.run.id);
+    expect(resumed.run.state).toBe("completed");
+    expect(fixture.github.mutationCalls).toHaveLength(4);
+  });
+
+  it("honors a bounded persisted rate-limit delay only after confirmed-not-applied", async () => {
+    const fixture = await applyFixture();
+    fixture.github.failNextMutation(
+      new AppError("RATE_LIMITED", "primary rate limit", {
+        retryable: true,
+        details: {
+          reason: "primary_rate_limit",
+          retryAt: "2026-07-16T02:00:10.000Z",
+        },
+      }),
+      { kind: "unstar" },
+    );
+
+    const first = await fixture.service.apply(fixture.input);
+    expect(fixture.rawStorage.listRunOperations(first.run.id)[0]).toMatchObject(
+      {
+        status: "unresolved",
+        reconciliation: "unknown",
+      },
+    );
+    fixture.runtime.events.length = 0;
+    let delayObservedBeforeDispatch = false;
+    fixture.github.onMutation = () => {
+      delayObservedBeforeDispatch = fixture.runtime.events.some((event) => {
+        const delay = Number(event.slice("wait:".length));
+        return event.startsWith("wait:") && delay > 1_000;
+      });
+    };
+
+    const resumed = await fixture
+      .createService("rate-limit-resume")
+      .apply(fixture.input);
+    expect(resumed.run.state).toBe("completed");
+    expect(delayObservedBeforeDispatch).toBe(true);
+    expect(fixture.github.mutationCalls).toHaveLength(2);
+  });
+
+  it("ignores malformed persisted rate hints and cancels a valid retry wait before queueing", async () => {
+    const malformed = await applyFixture();
+    malformed.github.failNextMutation(
+      new AppError("SECONDARY_RATE_LIMITED", "secondary rate limit", {
+        retryable: true,
+        details: {
+          reason: "secondary_rate_limit",
+          retryAt: "raw-reset-secret",
+          retryAfterMs: -1,
+        },
+      }),
+      { kind: "unstar" },
+    );
+    await malformed.service.apply(malformed.input);
+    malformed.runtime.events.length = 0;
+    await malformed
+      .createService("malformed-rate-resume")
+      .apply(malformed.input);
+    expect(
+      malformed.runtime.events
+        .filter((event) => event.startsWith("wait:"))
+        .map((event) => Number(event.slice("wait:".length)))
+        .every((delay) => delay <= 1_000),
+    ).toBe(true);
+
+    const cancelled = await applyFixture();
+    cancelled.github.failNextMutation(
+      new AppError("RATE_LIMITED", "primary rate limit", {
+        retryable: true,
+        details: {
+          reason: "primary_rate_limit",
+          retryAfterMs: 5_000,
+        },
+      }),
+      { kind: "unstar" },
+    );
+    const first = await cancelled.service.apply(cancelled.input);
+    const controller = new AbortController();
+    cancelled.runtime.events.length = 0;
+    cancelled.runtime.onWait = () => {
+      const event = cancelled.runtime.events.at(-1) ?? "";
+      if (Number(event.slice("wait:".length)) > 1_000) controller.abort();
+    };
+
+    await expect(
+      cancelled
+        .createService("cancel-rate-resume")
+        .apply(cancelled.input, controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(cancelled.github.mutationCalls).toHaveLength(1);
+    expect(
+      cancelled.rawStorage.listRunOperations(first.run.id)[0],
+    ).toMatchObject({
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      attempts: 1,
+    });
+  });
+
+  it("reconciles at the attempt ceiling but never queues a fourth dispatch", async () => {
+    const fixture = await applyFixture();
+    fixture.github.failEveryMutation(
+      new AppError("GITHUB_UNAVAILABLE", "ambiguous transport failure", {
+        retryable: true,
+      }),
+      "unstar",
+    );
+
+    const first = await fixture.service.apply(fixture.input);
+    const second = await fixture
+      .createService("attempt-two")
+      .apply(fixture.input);
+    const third = await fixture
+      .createService("attempt-three")
+      .apply(fixture.input);
+    const fourth = await fixture
+      .createService("attempt-ceiling")
+      .apply(fixture.input);
+    const row = fixture.rawStorage.listRunOperations(fourth.run.id)[0]!;
+
+    expect([second.run.id, third.run.id, fourth.run.id]).toEqual([
+      first.run.id,
+      first.run.id,
+      first.run.id,
+    ]);
+    expect(fixture.github.mutationCalls).toHaveLength(3);
+    expect(row).toMatchObject({
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      attempts: 3,
+      error: {
+        code: "RECONCILIATION_REQUIRED",
+        retryable: true,
+      },
+    });
+    expect(
+      fixture.rawStorage.listRunOperationReconciliationsPage({
+        runId: fourth.run.id,
+        operationId: row.operationId,
+        afterEventSequence: null,
+        pageSize: 10,
+      }).total,
+    ).toBe(3);
+  });
+
   it("keeps an unresolved row partial when live reconciliation is unavailable", async () => {
     const fixture = await applyFixture();
     fixture.github.failNextMutation(
@@ -1099,6 +1318,35 @@ describe("ApplyService durable orchestration", () => {
       },
     });
     expect(fixture.github.mutationCalls).toHaveLength(1);
+  });
+
+  it("propagates caller cancellation during a reconciliation read without retry", async () => {
+    const fixture = await applyFixture();
+    fixture.github.failNextMutation(
+      new AppError("GITHUB_UNAVAILABLE", "ambiguous transport", {
+        retryable: true,
+      }),
+      { kind: "unstar" },
+    );
+    const first = await fixture.service.apply(fixture.input);
+    const controller = new AbortController();
+    fixture.github.checkStar = () => {
+      controller.abort();
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    };
+
+    await expect(
+      fixture
+        .createService("cancel-reconciliation-read")
+        .apply(fixture.input, controller.signal),
+    ).rejects.toMatchObject({ name: "AbortError" });
+    expect(fixture.github.mutationCalls).toHaveLength(1);
+    expect(fixture.rawStorage.listRunOperations(first.run.id)[0]).toMatchObject(
+      {
+        status: "unresolved",
+        attempts: 1,
+      },
+    );
   });
 
   it("audits abort after write-ahead and later rebuilds created IDs to resume the dependent mutation", async () => {
@@ -1146,6 +1394,87 @@ describe("ApplyService durable orchestration", () => {
         operationId: dependent.operationId,
       }),
     ).toMatchObject({ status: "succeeded", attempts: 1 });
+  });
+
+  it("discovers an ambiguously created List after restart and resumes its dependent membership", async () => {
+    const fixture = await applyFixture();
+    const planned = await dependentListPlan(fixture, false);
+    const input = {
+      planId: planned.plan.id,
+      expectedHash: planned.plan.hash,
+      failureMode: "continue" as const,
+    };
+    fixture.github.failNextMutation(
+      new AppError("GITHUB_UNAVAILABLE", "create response was lost", {
+        retryable: true,
+      }),
+      { kind: "createUserList", afterApply: true },
+    );
+
+    const first = await fixture.service.apply(input);
+    const create = planned.plan.operations.find(
+      (operation) => operation.kind === "list_create",
+    )!;
+    const membership = planned.plan.operations.find(
+      (operation) => operation.kind === "list_membership_set",
+    )!;
+    expect(
+      fixture.rawStorage.getRunOperation({
+        runId: first.run.id,
+        operationId: create.operationId,
+      }),
+    ).toMatchObject({
+      status: "unresolved",
+      attempts: 1,
+    });
+    expect(
+      fixture.rawStorage.getRunOperation({
+        runId: first.run.id,
+        operationId: membership.operationId,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      attempts: 0,
+    });
+
+    const resumed = await fixture
+      .createService("created-list-restart")
+      .apply(input);
+    expect(resumed.run.id).toBe(first.run.id);
+    expect(resumed.run.state).toBe("completed");
+    const createdRow = fixture.rawStorage.getRunOperation({
+      runId: resumed.run.id,
+      operationId: create.operationId,
+    });
+    expect(createdRow).toMatchObject({
+      status: "succeeded",
+      reconciliation: "confirmed_applied",
+      attempts: 1,
+    });
+    if (
+      createdRow?.after === null ||
+      typeof createdRow?.after !== "object" ||
+      Array.isArray(createdRow.after)
+    ) {
+      throw new Error("Expected reconciled List state");
+    }
+    expect(canonicalJson(createdRow.after)).toMatch(/"listId":"[^"]+"/u);
+    expect(
+      fixture.rawStorage.getRunOperation({
+        runId: resumed.run.id,
+        operationId: membership.operationId,
+      }),
+    ).toMatchObject({ status: "succeeded", attempts: 1 });
+    expect(
+      fixture.github.mutationCalls.filter(
+        (call) => call.kind === "createUserList",
+      ),
+    ).toHaveLength(1);
+    expect(
+      fixture.github.mutationCalls.filter(
+        (call) => call.kind === "setRepositoryListIds",
+      ),
+    ).toHaveLength(1);
   });
 
   it("uses targeted recovery after lease loss and resumes the same run through the same service", async () => {

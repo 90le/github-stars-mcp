@@ -149,6 +149,10 @@ export interface GitHubDiscoveryReadPort {
 }
 
 export interface GitHubLiveReadPort {
+  listUserLists(
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<Page<GitHubUserList>>;
   getRepositoryIdentity(
     repository: RepositoryCoordinates,
     signal?: AbortSignal,

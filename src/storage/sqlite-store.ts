@@ -478,7 +478,9 @@ export class SQLiteStore implements StoragePort {
           throw storageError("SQLite schema migration ledger is invalid");
         }
       }
-      return SQLITE_MIGRATIONS.length;
+      // This is the public storage contract version, not the number of
+      // internal forward-only SQLite migrations.
+      return 1;
     });
   }
 

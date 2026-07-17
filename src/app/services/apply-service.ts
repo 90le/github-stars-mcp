@@ -50,6 +50,7 @@ import {
   LeaseScope,
   type LeaseScheduler,
 } from "./lease-scope.js";
+import { reconcileOperation } from "./reconciliation.js";
 
 export type ApplyInput = Readonly<{
   planId: PlanId;
@@ -66,15 +67,11 @@ export type ApplyResult = Readonly<{
 }>;
 
 type ApplyRuntime = Clock & Pick<IdGenerator, "requestId" | "runId">;
-type ApplyExecutor = Pick<
-  MutationExecutor,
-  | "readCurrentState"
-  | "matchesBefore"
-  | "matchesAfter"
-  | "prepare"
-  | "dispatchPrepared"
+type ApplyExecutor = MutationExecutor;
+type ApplyPacer = Pick<
+  MutationPacer,
+  "run" | "waitForRetry" | "waitForSafetyWindow"
 >;
-type ApplyPacer = Pick<MutationPacer, "run" | "waitForSafetyWindow">;
 
 export type ApplyServiceOptions = Readonly<{
   github: GitHubStatusReadPort;
@@ -94,6 +91,7 @@ const BASE_LEASE_MS = 10 * 60_000;
 const LEASE_HEARTBEAT_MS = 60_000;
 const MAX_ERRORS = 20;
 const MAX_ATTEMPTS = 3;
+const MAX_RETRY_DELAY_MS = 15 * 60_000;
 
 type JsonRecord = Readonly<Record<string, JsonValue>>;
 
@@ -643,6 +641,7 @@ function retryableCancellation(): SerializedDomainError {
 function unknownDispatchError(error: unknown): SerializedDomainError & {
   readonly retryable: false;
 } {
+  const hints = retryHints(error);
   const serialized = serializeError(
     error instanceof AppError && error.code === "RECONCILIATION_REQUIRED"
       ? error
@@ -651,12 +650,101 @@ function unknownDispatchError(error: unknown): SerializedDomainError & {
           "The mutation outcome requires reconciliation",
           {
             retryable: false,
-            details: { reason: "dispatch_outcome_unknown" },
+            details: {
+              reason: "dispatch_outcome_unknown",
+              ...hints,
+            },
             cause: error,
           },
         ),
   );
   return Object.freeze({ ...serialized, retryable: false });
+}
+
+function retryHints(error: unknown): Readonly<Record<string, JsonValue>> {
+  let serialized: unknown;
+  if (error instanceof AppError) {
+    serialized = serializeError(error);
+  } else {
+    try {
+      serialized = canonicalJsonClone(error);
+    } catch {
+      return Object.freeze({});
+    }
+  }
+  if (
+    serialized === null ||
+    typeof serialized !== "object" ||
+    Array.isArray(serialized)
+  ) {
+    return Object.freeze({});
+  }
+  const record = serialized as Partial<SerializedDomainError>;
+  const details = record.details;
+  if (
+    details === null ||
+    typeof details !== "object" ||
+    Array.isArray(details)
+  ) {
+    return Object.freeze({});
+  }
+  const detailRecord = details as Readonly<Record<string, JsonValue>>;
+  const sourceCode =
+    record.code === "RATE_LIMITED" || record.code === "SECONDARY_RATE_LIMITED"
+      ? record.code
+      : detailRecord.sourceCode === "RATE_LIMITED" ||
+          detailRecord.sourceCode === "SECONDARY_RATE_LIMITED"
+        ? detailRecord.sourceCode
+        : null;
+  if (sourceCode === null) return Object.freeze({});
+  const result: Record<string, JsonValue> = { sourceCode };
+  const retryAt =
+    typeof detailRecord.retryAt === "string"
+      ? detailRecord.retryAt
+      : typeof detailRecord.resetAt === "string"
+        ? detailRecord.resetAt
+        : null;
+  if (retryAt !== null) {
+    try {
+      result.retryAt = canonicalUtcTimestamp(retryAt, "retryAt");
+    } catch {
+      // Malformed persisted hints are deliberately ignored.
+    }
+  }
+  if (
+    typeof detailRecord.retryAfterMs === "number" &&
+    Number.isSafeInteger(detailRecord.retryAfterMs) &&
+    detailRecord.retryAfterMs >= 0
+  ) {
+    result.retryAfterMs = Math.min(
+      detailRecord.retryAfterMs,
+      MAX_RETRY_DELAY_MS,
+    );
+  }
+  return Object.freeze(result);
+}
+
+function retryDelayMs(
+  error: SerializedDomainError | null,
+  runtime: ApplyRuntime,
+): number {
+  const hints = retryHints(error);
+  if (Object.keys(hints).length === 0) return 0;
+  if (typeof hints.retryAfterMs === "number") {
+    return Math.min(hints.retryAfterMs, MAX_RETRY_DELAY_MS);
+  }
+  if (typeof hints.retryAt !== "string") return 0;
+  let now: number;
+  let retryAt: number;
+  try {
+    now = Date.parse(safeNow(runtime));
+    retryAt = Date.parse(canonicalUtcTimestamp(hints.retryAt, "retryAt"));
+  } catch {
+    return 0;
+  }
+  const delay = retryAt - now;
+  if (!Number.isSafeInteger(delay) || delay <= 0) return 0;
+  return Math.min(delay, MAX_RETRY_DELAY_MS);
 }
 
 function isCancellation(error: unknown, signal: AbortSignal | undefined) {
@@ -811,6 +899,7 @@ async function executePendingOperation(input: {
     } else if (
       error instanceof AppError &&
       error.code !== "RECONCILIATION_REQUIRED" &&
+      error.retryable === false &&
       !cancelled
     ) {
       const guard = input.lease.freshGuard();
@@ -944,7 +1033,7 @@ function rebuildExecutionContext(
 }
 
 function reconciliationUnknown(
-  error: unknown,
+  reason = "reconciliation_inconclusive",
 ): SerializedDomainError & { readonly retryable: false } {
   const serialized = serializeError(
     new AppError(
@@ -952,34 +1041,31 @@ function reconciliationUnknown(
       "The live state could not confirm the previous mutation outcome",
       {
         retryable: false,
-        details: { reason: "reconciliation_inconclusive" },
-        cause: error,
+        details: { reason },
       },
     ),
   );
   return Object.freeze({ ...serialized, retryable: false });
 }
 
-function reconciliationNotApplied(): SerializedDomainError & {
+function reconciliationNotApplied(
+  previous: SerializedDomainError | null,
+): SerializedDomainError & {
   readonly retryable: true;
 } {
+  const hints = retryHints(previous);
   const serialized = serializeError(
     new AppError(
-      "GITHUB_UNAVAILABLE",
+      "RECONCILIATION_REQUIRED",
       "Reconciliation confirmed that the mutation was not applied",
       {
         retryable: true,
-        details: { reason: "reconciled_not_applied" },
+        details: { reason: "reconciled_not_applied", ...hints },
       },
     ),
   );
   return Object.freeze({ ...serialized, retryable: true });
 }
-
-type ResumeDecision = Readonly<{
-  row: RunOperation;
-  execute: boolean;
-}>;
 
 async function reconcileForResume(input: {
   storage: StoragePort;
@@ -991,124 +1077,72 @@ async function reconcileForResume(input: {
   row: RunOperation;
   context: ExecutionContext;
   callerSignal?: AbortSignal;
-}): Promise<ResumeDecision> {
-  if (
-    input.row.status !== "unresolved" &&
-    !(input.row.status === "failed" && input.row.error?.retryable === true)
-  ) {
-    return Object.freeze({ row: input.row, execute: false });
-  }
-  if (input.row.attempts >= MAX_ATTEMPTS) {
-    return Object.freeze({ row: input.row, execute: false });
-  }
+}): Promise<RunOperation> {
+  const shouldReconcile =
+    input.row.status === "unresolved" ||
+    (input.row.status === "failed" &&
+      input.row.reconciliation === "confirmed_not_applied" &&
+      input.row.error?.retryable === true &&
+      input.row.attempts >= 1);
+  if (!shouldReconcile) return input.row;
 
-  let state: JsonValue;
+  input.lease.assertActive();
+  let decision: Awaited<ReturnType<typeof reconcileOperation>>;
   try {
-    input.lease.assertActive();
-    state = await input.executor.readCurrentState(
+    decision = await reconcileOperation(
+      input.executor,
       input.operation,
       input.context,
       input.lease.signal,
     );
-    input.lease.assertActive();
   } catch (error) {
-    if (isCancellation(error, input.callerSignal)) throw fixedAbortError();
+    if (signalAborted(input.callerSignal)) throw fixedAbortError();
     input.lease.assertActive();
-    if (input.row.status === "unresolved") {
-      const guard = input.lease.freshGuard();
-      const row = storageCall(() =>
-        input.storage.reconcileRunOperation({
-          runId: input.run.id,
-          operationId: input.operation.operationId,
-          status: "unresolved",
-          reconciliation: "unknown",
-          after: input.row.after,
-          error: reconciliationUnknown(error),
-          observedAt: safeNow(input.runtime),
-          lease: guard,
-        }),
-      );
-      return Object.freeze({ row, execute: false });
-    }
-    return Object.freeze({ row: input.row, execute: false });
+    throw error;
   }
-
-  const matchesAfter = input.executor.matchesAfter(
-    input.operation,
-    state,
-    input.context,
-  );
-  const matchesBefore = input.executor.matchesBefore(
-    input.operation,
-    state,
-    input.context,
-  );
-  if (input.row.status === "unresolved") {
-    if (matchesAfter) {
-      const guard = input.lease.freshGuard();
-      const row = storageCall(() =>
-        input.storage.reconcileRunOperation({
-          runId: input.run.id,
-          operationId: input.operation.operationId,
-          status: "succeeded",
-          reconciliation: "confirmed_applied",
-          after: state,
-          error: null,
-          observedAt: safeNow(input.runtime),
-          lease: guard,
-        }),
-      );
-      return Object.freeze({ row, execute: false });
-    }
-    if (
-      !matchesBefore ||
-      (input.operation.kind === "list_create" &&
-        !input.context.createdListIdsByOperationId.has(
-          input.operation.operationId,
-        ))
-    ) {
-      const guard = input.lease.freshGuard();
-      const row = storageCall(() =>
-        input.storage.reconcileRunOperation({
-          runId: input.run.id,
-          operationId: input.operation.operationId,
-          status: "unresolved",
-          reconciliation: "unknown",
-          after: state,
-          error: reconciliationUnknown(input.row.error),
-          observedAt: safeNow(input.runtime),
-          lease: guard,
-        }),
-      );
-      return Object.freeze({ row, execute: false });
-    }
-    const guard = input.lease.freshGuard();
-    input.row = storageCall(() =>
+  input.lease.assertActive();
+  if (signalAborted(input.callerSignal)) throw fixedAbortError();
+  const guard = input.lease.freshGuard();
+  if (decision.kind === "confirmed_applied") {
+    return storageCall(() =>
+      input.storage.reconcileRunOperation({
+        runId: input.run.id,
+        operationId: input.operation.operationId,
+        status: "succeeded",
+        reconciliation: "confirmed_applied",
+        after: decision.state,
+        error: null,
+        observedAt: safeNow(input.runtime),
+        lease: guard,
+      }),
+    );
+  }
+  if (decision.kind === "confirmed_not_applied") {
+    return storageCall(() =>
       input.storage.reconcileRunOperation({
         runId: input.run.id,
         operationId: input.operation.operationId,
         status: "failed",
         reconciliation: "confirmed_not_applied",
-        after: state,
-        error: reconciliationNotApplied(),
+        after: decision.state,
+        error: reconciliationNotApplied(input.row.error),
         observedAt: safeNow(input.runtime),
         lease: guard,
       }),
     );
-  } else if (!matchesBefore && !matchesAfter) {
-    return Object.freeze({ row: input.row, execute: false });
   }
-
-  const guard = input.lease.freshGuard();
-  const queued = storageCall(() =>
-    input.storage.retryRunOperation({
+  return storageCall(() =>
+    input.storage.reconcileRunOperation({
       runId: input.run.id,
       operationId: input.operation.operationId,
-      maxAttempts: MAX_ATTEMPTS,
+      status: "unresolved",
+      reconciliation: "unknown",
+      after: decision.state,
+      error: reconciliationUnknown(),
+      observedAt: safeNow(input.runtime),
       lease: guard,
     }),
   );
-  return Object.freeze({ row: queued, execute: true });
 }
 
 function aggregateCounts(
@@ -1327,50 +1361,23 @@ export class ApplyService {
               sequence,
             ]),
           );
-          let operationFailure: unknown;
-          for (const operationId of topologicalOperationIds(
+          const orderedOperationIds = topologicalOperationIds(
             claim.plan.operations,
             claim.plan.dependencies,
-          )) {
-            const operation = byId.get(operationId);
-            const sequence = sequenceById.get(operationId);
-            if (operation === undefined || sequence === undefined) {
-              throw storageFailure("plan_operation_missing");
-            }
-            let current = rowsById.get(operation.operationId) ?? null;
-            if (
-              current?.status === "succeeded" ||
-              current?.status === "skipped"
-            ) {
-              continue;
-            }
-            const dependenciesComplete = operation.dependsOn.every(
-              (dependencyId) => {
-                const dependency = rowsById.get(dependencyId);
-                return (
-                  dependency?.status === "succeeded" ||
-                  dependency?.status === "skipped"
-                );
-              },
-            );
-            if (!dependenciesComplete) {
-              current = recordDependencyBlocked({
-                storage: this.#storage,
-                runtime: this.#runtime,
-                lease,
-                run: claim.run,
-                operation,
-                sequence,
-                existing: current,
-              });
-              rowsById.set(operation.operationId, current);
-              if (parsed.failureMode === "stop") break;
-              continue;
-            }
-
-            let createWriteAhead = current === null;
-            if (current !== null) {
-              const decision = await reconcileForResume({
+          );
+          let operationFailure: unknown;
+          try {
+            // Reconciliation is deliberately a separate phase. No new
+            // transport dispatch can begin until every recoverable row has
+            // received a fresh, persisted live-state decision.
+            for (const operationId of orderedOperationIds) {
+              const operation = byId.get(operationId);
+              if (operation === undefined) {
+                throw storageFailure("plan_operation_missing");
+              }
+              const current = rowsById.get(operation.operationId);
+              if (current === undefined) continue;
+              const reconciled = await reconcileForResume({
                 storage: this.#storage,
                 runtime: this.#runtime,
                 executor: this.#executor,
@@ -1381,21 +1388,96 @@ export class ApplyService {
                 context,
                 ...(signal === undefined ? {} : { callerSignal: signal }),
               });
-              current = decision.row;
-              rowsById.set(operation.operationId, current);
-              if (!decision.execute) {
-                if (
-                  parsed.failureMode === "stop" &&
-                  current.status !== "succeeded" &&
-                  current.status !== "skipped"
-                ) {
-                  break;
-                }
+              rowsById.set(operation.operationId, reconciled);
+            }
+
+            for (const operationId of orderedOperationIds) {
+              const operation = byId.get(operationId);
+              const sequence = sequenceById.get(operationId);
+              if (operation === undefined || sequence === undefined) {
+                throw storageFailure("plan_operation_missing");
+              }
+              let current = rowsById.get(operation.operationId) ?? null;
+              if (
+                current?.status === "succeeded" ||
+                current?.status === "skipped"
+              ) {
                 continue;
               }
-              createWriteAhead = false;
-            }
-            try {
+              const dependenciesComplete = operation.dependsOn.every(
+                (dependencyId) => {
+                  const dependency = rowsById.get(dependencyId);
+                  return (
+                    dependency?.status === "succeeded" ||
+                    dependency?.status === "skipped"
+                  );
+                },
+              );
+              if (!dependenciesComplete) {
+                current = recordDependencyBlocked({
+                  storage: this.#storage,
+                  runtime: this.#runtime,
+                  lease,
+                  run: claim.run,
+                  operation,
+                  sequence,
+                  existing: current,
+                });
+                rowsById.set(operation.operationId, current);
+                if (parsed.failureMode === "stop") break;
+                continue;
+              }
+
+              let createWriteAhead = current === null;
+              if (current !== null) {
+                const retryable =
+                  current.status === "failed" &&
+                  current.reconciliation === "confirmed_not_applied" &&
+                  current.error?.retryable === true &&
+                  current.attempts < MAX_ATTEMPTS;
+                if (!retryable) {
+                  if (parsed.failureMode === "stop") break;
+                  continue;
+                }
+                lease.assertActive();
+                assertNotAborted(signal);
+                const delayMs = retryDelayMs(current.error, this.#runtime);
+                if (delayMs > 0) {
+                  try {
+                    await this.#pacer.waitForRetry(delayMs, lease.signal);
+                  } catch (error) {
+                    if (isCancellation(error, signal)) {
+                      throw fixedAbortError();
+                    }
+                    throw error;
+                  }
+                  lease.assertActive();
+                  assertNotAborted(signal);
+                }
+                const dependenciesStillComplete = operation.dependsOn.every(
+                  (dependencyId) => {
+                    const dependency = rowsById.get(dependencyId);
+                    return (
+                      dependency?.status === "succeeded" ||
+                      dependency?.status === "skipped"
+                    );
+                  },
+                );
+                if (!dependenciesStillComplete) {
+                  if (parsed.failureMode === "stop") break;
+                  continue;
+                }
+                current = storageCall(() =>
+                  this.#storage.retryRunOperation({
+                    runId: claim.run.id,
+                    operationId: operation.operationId,
+                    maxAttempts: MAX_ATTEMPTS,
+                    lease: lease.freshGuard(),
+                  }),
+                );
+                rowsById.set(operation.operationId, current);
+                createWriteAhead = false;
+              }
               const finished = await executePendingOperation({
                 storage: this.#storage,
                 runtime: this.#runtime,
@@ -1417,10 +1499,9 @@ export class ApplyService {
               ) {
                 break;
               }
-            } catch (error) {
-              operationFailure = error;
-              break;
             }
+          } catch (error) {
+            operationFailure = error;
           }
           if (operationFailure !== undefined) {
             const interruptedRows = storageCall(() =>

@@ -7,6 +7,9 @@ import {
   type SqliteMigration,
 } from "../../../src/storage/sqlite-database.js";
 
+const CURRENT_MIGRATION_COUNT = SQLITE_MIGRATIONS.length;
+const NEXT_MIGRATION_VERSION = CURRENT_MIGRATION_COUNT + 1;
+
 function expectRollbackRemainsUsable(
   database: ReturnType<typeof openSqliteDatabase>,
 ): void {
@@ -93,9 +96,9 @@ describe("SQLite migrations", () => {
         .prepare(
           `INSERT INTO schema_migrations
              (version, name, checksum, applied_at)
-           VALUES (2, 'bad', ?, '2026-02-30T00:00:00.000Z')`,
+           VALUES (?, 'bad', ?, '2026-02-30T00:00:00.000Z')`,
         )
-        .run("a".repeat(64)),
+        .run(NEXT_MIGRATION_VERSION, "a".repeat(64)),
     ).toThrow();
     database.close();
   });
@@ -110,13 +113,41 @@ describe("SQLite migrations", () => {
           "SELECT version,name,checksum FROM schema_migrations ORDER BY version",
         )
         .all(),
-    ).toEqual([
-      {
-        version: 1,
-        name: SQLITE_MIGRATIONS[0]!.name,
-        checksum: migrationChecksum(SQLITE_MIGRATIONS[0]!),
-      },
-    ]);
+    ).toEqual(
+      SQLITE_MIGRATIONS.map((migration) => ({
+        version: migration.version,
+        name: migration.name,
+        checksum: migrationChecksum(migration),
+      })),
+    );
+    database.close();
+  });
+
+  test("upgrades an authenticated version-one database without checksum drift", () => {
+    const database = openSqliteDatabase(":memory:");
+    migrateSqliteDatabase(
+      database,
+      "2026-07-16T00:00:00.000Z",
+      SQLITE_MIGRATIONS.slice(0, 1),
+    );
+    expect(
+      database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
+    ).toBe(1);
+
+    migrateSqliteDatabase(database, "2026-07-16T00:00:01.000Z");
+    expect(
+      database
+        .prepare(
+          "SELECT version,name,checksum FROM schema_migrations ORDER BY version",
+        )
+        .all(),
+    ).toEqual(
+      SQLITE_MIGRATIONS.map((migration) => ({
+        version: migration.version,
+        name: migration.name,
+        checksum: migrationChecksum(migration),
+      })),
+    );
     database.close();
   });
 
@@ -147,9 +178,9 @@ describe("SQLite migrations", () => {
     database
       .prepare(
         `INSERT INTO schema_migrations(version,name,checksum,applied_at)
-         VALUES (2,'future',?,'2026-07-16T00:00:01.000Z')`,
+         VALUES (?,'future',?,'2026-07-16T00:00:01.000Z')`,
       )
-      .run("a".repeat(64));
+      .run(NEXT_MIGRATION_VERSION, "a".repeat(64));
     expect(() =>
       migrateSqliteDatabase(database, "2026-07-16T00:00:02.000Z"),
     ).toThrow(/newer/u);
@@ -184,7 +215,7 @@ describe("SQLite migrations", () => {
     const database = openSqliteDatabase(":memory:");
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     const broken: SqliteMigration = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "broken",
       sql: "CREATE TABLE partial(value TEXT) STRICT; SELECT no_such_function();",
     };
@@ -203,7 +234,7 @@ describe("SQLite migrations", () => {
     ).toBeUndefined();
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(CURRENT_MIGRATION_COUNT);
     database.close();
   });
 
@@ -218,7 +249,7 @@ describe("SQLite migrations", () => {
     const database = openSqliteDatabase(":memory:");
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     const escaping: SqliteMigration = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "transaction-escape",
       sql: `/* harmless leading comment */ -- another comment
             \uFEFF${control}; CREATE TABLE escaped(value TEXT) STRICT;`,
@@ -237,7 +268,7 @@ describe("SQLite migrations", () => {
     const database = openSqliteDatabase(":memory:");
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     const escaping: SqliteMigration = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "commit-escape",
       sql: `CREATE TABLE must_not_persist(value TEXT) STRICT;
             COMMIT;
@@ -261,7 +292,7 @@ describe("SQLite migrations", () => {
     ).toEqual([]);
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(CURRENT_MIGRATION_COUNT);
     expect(database.inTransaction).toBe(false);
     database.close();
   });
@@ -271,7 +302,7 @@ describe("SQLite migrations", () => {
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     let getterCalls = 0;
     const hostile = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "accessor-escape",
       get sql(): string {
         getterCalls += 1;
@@ -303,7 +334,7 @@ describe("SQLite migrations", () => {
     ).toEqual([]);
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(CURRENT_MIGRATION_COUNT);
     expectRollbackRemainsUsable(database);
     database.close();
   });
@@ -314,7 +345,7 @@ describe("SQLite migrations", () => {
     let trapCalls = 0;
     const proxied = new Proxy<SqliteMigration>(
       {
-        version: 2,
+        version: NEXT_MIGRATION_VERSION,
         name: "proxy-escape",
         sql: "CREATE TABLE proxy_payload(value TEXT) STRICT;",
       },
@@ -354,7 +385,7 @@ describe("SQLite migrations", () => {
     ).toBeUndefined();
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(CURRENT_MIGRATION_COUNT);
     expectRollbackRemainsUsable(database);
     database.close();
   });
@@ -367,7 +398,7 @@ describe("SQLite migrations", () => {
       [
         ...SQLITE_MIGRATIONS,
         {
-          version: 2,
+          version: NEXT_MIGRATION_VERSION,
           name: "proxy-array-escape",
           sql: "CREATE TABLE proxy_array_payload(value TEXT) STRICT;",
         },
@@ -398,7 +429,7 @@ describe("SQLite migrations", () => {
     expect(trapCalls).toBe(0);
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(CURRENT_MIGRATION_COUNT);
     expectRollbackRemainsUsable(database);
     database.close();
   });
@@ -407,7 +438,7 @@ describe("SQLite migrations", () => {
     const database = openSqliteDatabase(":memory:");
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     const migration = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "unknown-field",
       sql: "CREATE TABLE unknown_field_payload(value TEXT) STRICT;",
       source: "hostile",
@@ -428,7 +459,7 @@ describe("SQLite migrations", () => {
     ).toBeUndefined();
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(1);
+    ).toBe(CURRENT_MIGRATION_COUNT);
     expectRollbackRemainsUsable(database);
     database.close();
   });
@@ -437,7 +468,7 @@ describe("SQLite migrations", () => {
     const database = openSqliteDatabase(":memory:");
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     const migration = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "snapshot-reentry",
       sql: `CREATE TABLE reentry_snapshot(value TEXT) STRICT;
             SELECT mutate_migration_definition();`,
@@ -448,8 +479,8 @@ describe("SQLite migrations", () => {
       migration.name = "mutated-after-exec-started";
       migration.sql =
         "CREATE TABLE mutated_definition_payload(value TEXT) STRICT;";
-      migrations[1] = {
-        version: 2,
+      migrations[CURRENT_MIGRATION_COUNT] = {
+        version: NEXT_MIGRATION_VERSION,
         name: "replaced-after-exec-started",
         sql: "CREATE TABLE replaced_definition_payload(value TEXT) STRICT;",
       };
@@ -460,11 +491,11 @@ describe("SQLite migrations", () => {
     expect(
       database
         .prepare(
-          "SELECT version,name,checksum FROM schema_migrations WHERE version=2",
+          "SELECT version,name,checksum FROM schema_migrations WHERE version=?",
         )
-        .get(),
+        .get(NEXT_MIGRATION_VERSION),
     ).toEqual({
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "snapshot-reentry",
       checksum: expectedChecksum,
     });
@@ -483,7 +514,7 @@ describe("SQLite migrations", () => {
   test("rejects checksum accessors without invoking them", () => {
     let getterCalls = 0;
     const hostile = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "checksum-accessor",
       get sql(): string {
         getterCalls += 1;
@@ -499,7 +530,7 @@ describe("SQLite migrations", () => {
     const database = openSqliteDatabase(":memory:");
     migrateSqliteDatabase(database, "2026-07-16T00:00:00.000Z");
     const safe: SqliteMigration = {
-      version: 2,
+      version: NEXT_MIGRATION_VERSION,
       name: "lexical-safety",
       sql: `-- COMMIT and ROLLBACK are documentation here.
             /* BEGIN; SAVEPOINT ignored; RELEASE ignored; END; */
@@ -527,7 +558,7 @@ describe("SQLite migrations", () => {
     ).not.toThrow();
     expect(
       database.prepare("SELECT COUNT(*) FROM schema_migrations").pluck().get(),
-    ).toBe(2);
+    ).toBe(NEXT_MIGRATION_VERSION);
     database.close();
   });
 });

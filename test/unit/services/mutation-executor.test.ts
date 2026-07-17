@@ -4,6 +4,7 @@ import type {
   CreateUserListInput,
   GitHubLiveReadPort,
   GitHubMutationPort,
+  Page,
   MutationReceipt,
   RepositoryIdentity,
   UpdateUserListInput,
@@ -107,6 +108,21 @@ class StatefulGitHub implements GitHubLiveReadPort, GitHubMutationPort {
   getRepositoryIdentity(): Promise<RepositoryIdentity | null> {
     this.#read("getRepositoryIdentity");
     return Promise.resolve(this.identity);
+  }
+
+  listUserLists(cursor: string | null): Promise<Page<UserList>> {
+    this.#read(`listUserLists:${cursor ?? "first"}`);
+    return Promise.resolve(
+      Object.freeze({
+        items:
+          cursor === null
+            ? Object.freeze([...this.lists.values()])
+            : Object.freeze([]),
+        nextCursor: null,
+        rateLimit: null,
+        warnings: Object.freeze([]),
+      }),
+    );
   }
 
   getUserList(id: UserListId): Promise<UserList | null> {

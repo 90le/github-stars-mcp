@@ -24,6 +24,7 @@ export interface MutationPacerRuntime {
 }
 
 const DEFAULT_INTERVAL_MS = 1_000;
+const MAX_RETRY_DELAY_MS = 15 * 60_000;
 
 const DEFAULT_RUNTIME: MutationPacerRuntime = Object.freeze({
   monotonicMs: () => performance.now(),
@@ -117,6 +118,31 @@ export class MutationPacer {
 
   waitForSafetyWindow(): Promise<void> {
     const result = this.#tail.then(() => this.#waitForSafetyWindow());
+    this.#tail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  waitForRetry(delayMs: number, signal?: AbortSignal): Promise<void> {
+    if (
+      !Number.isSafeInteger(delayMs) ||
+      delayMs < 0 ||
+      delayMs > MAX_RETRY_DELAY_MS
+    ) {
+      return Promise.reject(
+        new AppError("VALIDATION_ERROR", "Retry delay is invalid", {
+          retryable: false,
+          details: { reason: "invalid_retry_delay" },
+        }),
+      );
+    }
+    const result = this.#tail.then(async () => {
+      this.#throwIfAborted(signal);
+      if (delayMs === 0) return;
+      await this.#waitUntil(this.#monotonicNow() + delayMs, signal);
+    });
     this.#tail = result.then(
       () => undefined,
       () => undefined,

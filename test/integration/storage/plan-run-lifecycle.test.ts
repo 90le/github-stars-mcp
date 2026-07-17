@@ -691,6 +691,90 @@ describe("PlanRunRepository operation and audit lifecycle", () => {
     ).toBe(0);
   });
 
+  test("appends a guarded reconciliation event for a retryable failed attempt", () => {
+    const context = beginRun();
+    startFirst(context);
+    context.repository.finishRunOperation({
+      phase: "after_dispatch",
+      runId: changeRunFixture.id,
+      operationId: "op_1",
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      externalRequestId: null,
+      after: { starred: true },
+      error: retryableError,
+      finishedAt: FINISH_1,
+      lease: context.fixture.guard,
+    });
+
+    const reconciled = context.repository.reconcileRunOperation({
+      runId: changeRunFixture.id,
+      operationId: "op_1",
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      after: { starred: true },
+      observedAt: OBSERVED_1,
+      error: retryableError,
+      lease: context.fixture.guard,
+    });
+    expect(reconciled).toMatchObject({
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      attempts: 1,
+      finishedAt: OBSERVED_1,
+    });
+    expect(
+      context.repository.listRunOperationReconciliationsPage({
+        runId: changeRunFixture.id,
+        operationId: "op_1",
+        afterEventSequence: null,
+        pageSize: 10,
+      }).items,
+    ).toMatchObject([
+      {
+        attempt: 1,
+        eventSequence: 1,
+        status: "failed",
+        reconciliation: "confirmed_not_applied",
+        observedAt: OBSERVED_1,
+      },
+    ]);
+    expect(
+      context.repository.retryRunOperation({
+        runId: changeRunFixture.id,
+        operationId: "op_1",
+        maxAttempts: 2,
+        lease: context.fixture.guard,
+      }).status,
+    ).toBe("pending");
+
+    const zeroAttempt = beginRun();
+    zeroAttempt.repository.finishRunOperation({
+      phase: "before_dispatch",
+      runId: changeRunFixture.id,
+      operationId: "op_1",
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      error: retryableError,
+      finishedAt: FINISH_1,
+      lease: zeroAttempt.fixture.guard,
+    });
+    expect(
+      errorCode(() =>
+        zeroAttempt.repository.reconcileRunOperation({
+          runId: changeRunFixture.id,
+          operationId: "op_1",
+          status: "failed",
+          reconciliation: "confirmed_not_applied",
+          after: { starred: true },
+          observedAt: OBSERVED_1,
+          error: retryableError,
+          lease: zeroAttempt.fixture.guard,
+        }),
+      ),
+    ).toBe("PRECONDITION_FAILED");
+  });
+
   test("preserves attempts, appends reconciliation history, and allows retry after confirmation", () => {
     const context = beginRun();
     startFirst(context);

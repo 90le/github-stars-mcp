@@ -37,6 +37,7 @@ import type {
   GitHubCapabilities,
   GitHubStatusReadPort,
   MutationReceipt,
+  Page,
   RepositoryIdentity,
   UserListMutationResult,
 } from "../../src/app/ports/github-port.js";
@@ -782,6 +783,24 @@ class ApplyGitHub implements GitHubStatusReadPort {
           owner: repository.owner,
           name: repository.name,
         }),
+      }),
+    );
+  }
+
+  listUserLists(
+    cursor: string | null,
+    signal?: AbortSignal,
+  ): Promise<Page<UserList>> {
+    aborted(signal);
+    return Promise.resolve(
+      Object.freeze({
+        items:
+          cursor === null
+            ? Object.freeze([...this.#lists.values()])
+            : Object.freeze([]),
+        nextCursor: null,
+        rateLimit: null,
+        warnings: Object.freeze([]),
       }),
     );
   }

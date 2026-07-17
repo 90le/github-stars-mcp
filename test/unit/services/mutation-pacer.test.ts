@@ -270,6 +270,54 @@ describe("MutationPacer", () => {
     expect(settled).toBe(true);
   });
 
+  it("serializes an interruptible bounded retry delay before later work", async () => {
+    const runtime = new AutoAdvanceRuntime();
+    const pacer = new MutationPacer(runtime);
+    const controller = new AbortController();
+
+    await expect(
+      pacer.waitForRetry(5_000, controller.signal),
+    ).resolves.toBeUndefined();
+    await expect(
+      pacer.run({
+        prepare: () => Promise.resolve(dispatchPreparation("after-retry")),
+        dispatch: () => Promise.resolve("after-retry"),
+      }),
+    ).resolves.toBe("after-retry");
+
+    expect(runtime.waits).toEqual([
+      { delayMs: 5_000, signal: controller.signal },
+    ]);
+    expect(runtime.monotonic).toBe(5_000);
+  });
+
+  it.each([-1, 900_001, 1.5, Number.NaN])(
+    "rejects an unsafe retry delay %s",
+    async (delayMs) => {
+      const runtime = new AutoAdvanceRuntime();
+      await expect(
+        new MutationPacer(runtime).waitForRetry(delayMs),
+      ).rejects.toMatchObject({
+        code: "VALIDATION_ERROR",
+        details: { reason: "invalid_retry_delay" },
+      });
+      expect(runtime.waits).toEqual([]);
+    },
+  );
+
+  it("cancels a retry delay through its caller signal", async () => {
+    const runtime = new ManualRuntime();
+    const pacer = new MutationPacer(runtime);
+    const controller = new AbortController();
+    const waiting = pacer.waitForRetry(5_000, controller.signal);
+    await vi.waitFor(() => expect(runtime.waits).toHaveLength(1));
+    controller.abort();
+    await expect(waiting).rejects.toMatchObject({
+      code: "GITHUB_UNAVAILABLE",
+      details: { reason: "cancelled" },
+    });
+  });
+
   it.each([
     ["non-finite clock", Number.NaN],
     ["negative clock", -1],

@@ -7,6 +7,7 @@ import {
   initialMigration,
   SCHEMA_MIGRATIONS_SQL,
 } from "./migrations/001-initial.js";
+import { reconcileRetryableFailedMigration } from "./migrations/002-reconcile-retryable-failed.js";
 import { runInNewImmediateTransaction } from "./sqlite-transaction.js";
 
 export interface SqliteMigration {
@@ -17,6 +18,7 @@ export interface SqliteMigration {
 
 export const SQLITE_MIGRATIONS: readonly SqliteMigration[] = Object.freeze([
   initialMigration,
+  reconcileRetryableFailedMigration,
 ]);
 
 const arrayIsArray = Array.isArray;

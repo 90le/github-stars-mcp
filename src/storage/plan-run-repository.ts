@@ -1776,10 +1776,18 @@ export class PlanRunRepository {
       const operation = this.#operationFromRow(
         this.#requireOperation(runId, operationId),
       );
-      if (operation.status !== "unresolved") {
+      const unresolved =
+        operation.status === "unresolved" &&
+        operation.reconciliation === "unknown";
+      const retryableFailed =
+        operation.status === "failed" &&
+        operation.reconciliation === "confirmed_not_applied" &&
+        operation.error?.retryable === true &&
+        operation.attempts >= 1;
+      if (!unresolved && !retryableFailed) {
         throw new AppError(
           "PRECONDITION_FAILED",
-          "only an unresolved operation can be reconciled",
+          "only a reconcilable operation can be reconciled",
         );
       }
       const attemptRow = this.#database
@@ -1797,13 +1805,18 @@ export class PlanRunRepository {
         );
       }
       const attempt = this.#attemptFromRow(attemptRow);
-      if (
-        attempt.status !== "unresolved" ||
-        attempt.reconciliation !== "unknown"
-      ) {
+      const matchingUnresolvedAttempt =
+        unresolved &&
+        attempt.status === "unresolved" &&
+        attempt.reconciliation === "unknown";
+      const matchingFailedAttempt =
+        retryableFailed &&
+        attempt.status === "failed" &&
+        attempt.reconciliation === "confirmed_not_applied";
+      if (!matchingUnresolvedAttempt && !matchingFailedAttempt) {
         throw new AppError(
           "PRECONDITION_FAILED",
-          "current unresolved attempt was not found",
+          "current reconcilable attempt was not found",
         );
       }
       if (
@@ -1873,7 +1886,11 @@ export class PlanRunRepository {
              status=@status,reconciliation=@reconciliation,
              after_json=@after,error_json=@error,finished_at=@observedAt
            WHERE run_id=@runId AND operation_id=@operationId
-             AND status='unresolved' AND reconciliation='unknown'
+             AND (
+               (status='unresolved' AND reconciliation='unknown')
+               OR
+               (status='failed' AND reconciliation='confirmed_not_applied')
+             )
            RETURNING ${OPERATION_COLUMNS}`,
         )
         .get({
@@ -1888,7 +1905,7 @@ export class PlanRunRepository {
       if (updated === undefined) {
         throw new AppError(
           "PRECONDITION_FAILED",
-          "only an unresolved operation can be reconciled",
+          "only a reconcilable operation can be reconciled",
         );
       }
       return this.#operationFromRow(updated);

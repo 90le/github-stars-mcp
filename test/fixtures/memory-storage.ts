@@ -2951,10 +2951,34 @@ export function createMemoryStorage(
       );
     }
     const operation = operationRecord(target, runId, operationId);
-    if (operation.status !== "unresolved") {
+    const unresolved =
+      operation.status === "unresolved" &&
+      operation.reconciliation === "unknown";
+    const retryableFailed =
+      operation.status === "failed" &&
+      operation.reconciliation === "confirmed_not_applied" &&
+      operation.error?.retryable === true &&
+      operation.attempts >= 1;
+    if (!unresolved && !retryableFailed) {
       return failure(
         "PRECONDITION_FAILED",
-        "only an unresolved operation can be reconciled",
+        "only a reconcilable operation can be reconciled",
+      );
+    }
+    const attempts = mapGet(target.attempts, operationKey(runId, operationId));
+    const attempt =
+      attempts === undefined ? undefined : mapGet(attempts, operation.attempts);
+    const matchingAttempt =
+      (unresolved &&
+        attempt?.status === "unresolved" &&
+        attempt.reconciliation === "unknown") ||
+      (retryableFailed &&
+        attempt?.status === "failed" &&
+        attempt.reconciliation === "confirmed_not_applied");
+    if (!matchingAttempt) {
+      return failure(
+        "PRECONDITION_FAILED",
+        "current reconcilable attempt was not found",
       );
     }
     const observedAt = canonicalUtcTimestamp(

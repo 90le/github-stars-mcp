@@ -3,7 +3,9 @@ import type {
   CreateUserListInput,
   GitHubLiveReadPort,
   GitHubMutationPort,
+  GitHubUserList,
   MutationReceipt,
+  Page,
   RepositoryIdentity,
   UpdateUserListInput,
   UserListMutationResult,
@@ -82,6 +84,17 @@ export type PrepareMutationResult =
     }>;
 
 type JsonObject = Readonly<{ [key: string]: JsonValue }>;
+type CompleteListJson = JsonObject &
+  Readonly<{
+    listId: string;
+    name: string;
+    slug: string;
+    description: string | null;
+    isPrivate: boolean;
+    createdAt: string;
+    updatedAt: string;
+    lastAddedAt: string | null;
+  }>;
 type ResolvedListMutationOperation = Extract<
   ResolvedOperation,
   { readonly listId: UserListId }
@@ -105,6 +118,8 @@ const MAX_MUTATION_DESCRIPTION = 1_024;
 const MAX_LIST_NAME = 255;
 const MAX_LIST_SLUG = 255;
 const MAX_LIST_DESCRIPTION = 8_192;
+const MAX_PAGE_ITEMS = 100;
+const MAX_CURSOR_LENGTH = 4_096;
 
 function validationError(reason: string): AppError {
   return new AppError("VALIDATION_ERROR", "Prepared mutation is invalid", {
@@ -259,6 +274,63 @@ function completeListState(list: UserList): JsonObject {
   });
 }
 
+function parsedListPage(value: Page<GitHubUserList>): Readonly<{
+  items: readonly GitHubUserList[];
+  nextCursor: string | null;
+}> {
+  let clone: JsonValue;
+  try {
+    clone = canonicalJsonClone(value);
+  } catch {
+    throw validationError("invalid_list_page");
+  }
+  const record = exactObject(clone, [
+    "items",
+    "nextCursor",
+    "rateLimit",
+    "warnings",
+  ]);
+  const items = record?.items;
+  const warnings = record?.warnings;
+  const nextCursor = record?.nextCursor;
+  if (
+    record === null ||
+    !Array.isArray(items) ||
+    items.length > MAX_PAGE_ITEMS ||
+    !Array.isArray(warnings) ||
+    warnings.length !== 0 ||
+    (nextCursor !== null &&
+      (typeof nextCursor !== "string" ||
+        nextCursor.length === 0 ||
+        nextCursor.length > MAX_CURSOR_LENGTH ||
+        nextCursor !== nextCursor.trim()))
+  ) {
+    throw validationError("invalid_list_page");
+  }
+  const parsed: GitHubUserList[] = [];
+  for (const item of items as readonly JsonValue[]) {
+    if (!validCompleteList(item)) {
+      throw validationError("invalid_list_page");
+    }
+    parsed.push(
+      Object.freeze({
+        listId: item.listId as UserListId,
+        name: item.name,
+        slug: item.slug,
+        description: item.description,
+        isPrivate: item.isPrivate,
+        createdAt: item.createdAt,
+        updatedAt: item.updatedAt,
+        lastAddedAt: item.lastAddedAt,
+      }),
+    );
+  }
+  return Object.freeze({
+    items: Object.freeze(parsed),
+    nextCursor,
+  });
+}
+
 function utf8Compare(left: string, right: string): number {
   return Buffer.compare(Buffer.from(left, "utf8"), Buffer.from(right, "utf8"));
 }
@@ -384,7 +456,9 @@ function validMetadata(
   );
 }
 
-function validCompleteList(value: JsonValue | undefined): boolean {
+function validCompleteList(
+  value: JsonValue | undefined,
+): value is CompleteListJson {
   const record = exactObject(value, [
     "listId",
     "name",
@@ -861,6 +935,39 @@ export class MutationExecutor {
   constructor(reads: GitHubLiveReadPort, mutations: GitHubMutationPort) {
     this.#reads = reads;
     this.#mutations = mutations;
+  }
+
+  async readAllUserLists(
+    signal?: AbortSignal,
+  ): Promise<readonly GitHubUserList[]> {
+    const lists: GitHubUserList[] = [];
+    const seenIds = new Set<UserListId>();
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    for (;;) {
+      throwIfAborted(signal);
+      const page = parsedListPage(
+        await this.#reads.listUserLists(cursor, signal),
+      );
+      throwIfAborted(signal);
+      for (const list of page.items) {
+        if (seenIds.has(list.listId) || lists.length >= MAX_IDS) {
+          throw validationError("invalid_list_collection");
+        }
+        seenIds.add(list.listId);
+        lists.push(list);
+      }
+      if (page.nextCursor === null) return Object.freeze(lists);
+      if (
+        page.nextCursor === cursor ||
+        seenCursors.has(page.nextCursor) ||
+        seenCursors.size >= MAX_IDS
+      ) {
+        throw validationError("invalid_list_collection");
+      }
+      seenCursors.add(page.nextCursor);
+      cursor = page.nextCursor;
+    }
   }
 
   async readCurrentState(
