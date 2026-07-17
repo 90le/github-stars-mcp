@@ -20,6 +20,33 @@ function failCanonicalJson(): never {
   throw new CanonicalJsonFailure();
 }
 
+function isRecognizableExotic(value: object): boolean {
+  try {
+    return (
+      utilTypes.isProxy(value) ||
+      utilTypes.isPromise(value) ||
+      utilTypes.isMap(value) ||
+      utilTypes.isSet(value) ||
+      utilTypes.isWeakMap(value) ||
+      utilTypes.isWeakSet(value) ||
+      utilTypes.isDate(value) ||
+      utilTypes.isRegExp(value) ||
+      utilTypes.isNativeError(value) ||
+      utilTypes.isAnyArrayBuffer(value) ||
+      utilTypes.isArrayBufferView(value) ||
+      utilTypes.isArgumentsObject(value) ||
+      utilTypes.isBoxedPrimitive(value) ||
+      utilTypes.isMapIterator(value) ||
+      utilTypes.isSetIterator(value) ||
+      utilTypes.isGeneratorObject(value) ||
+      utilTypes.isModuleNamespaceObject(value) ||
+      utilTypes.isExternal(value)
+    );
+  } catch {
+    return true;
+  }
+}
+
 interface InspectedProperty {
   readonly key: string;
   readonly value: unknown;
@@ -170,10 +197,10 @@ function serialize(
   }
   if (typeof value !== "object") return failCanonicalJson();
   if (ancestors.has(value)) return failCanonicalJson();
+  if (isRecognizableExotic(value)) return failCanonicalJson();
 
   ancestors.add(value);
   try {
-    if (utilTypes.isProxy(value)) return failCanonicalJson();
     if (Array.isArray(value)) {
       appendText(budget, fragments, "[");
       const array = inspectDenseArray(value, budget);

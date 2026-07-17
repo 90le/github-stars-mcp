@@ -413,29 +413,179 @@ describe("synchronous revocable transactions", () => {
     expect(proxyTrapCalls).toBe(0);
   });
 
-  test("accepts primitives and bounded canonical synchronous data", () => {
-    const results = [
-      undefined,
-      null,
-      true,
-      42,
-      "committed",
-      Object.assign(Object.create(null) as Record<string, unknown>, {
-        status: "committed",
-      }),
-      { nested: { status: "committed" } },
-      [{ status: "committed" }],
+  test("rejects recognizable exotics after prototype erasure without inspecting their contents", () => {
+    let proxyTrapCalls = 0;
+    const hiddenProxy = new Proxy(
+      {},
+      {
+        get() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getOwnPropertyDescriptor() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getPrototypeOf() {
+          proxyTrapCalls += 1;
+          return Object.prototype;
+        },
+        ownKeys() {
+          proxyTrapCalls += 1;
+          return [];
+        },
+      },
+    );
+    const hiddenPromise = Promise.resolve("hidden");
+    function erasePrototype<T extends object>(value: T): T {
+      Object.setPrototypeOf(value, null);
+      return value;
+    }
+    const weakKey = {};
+    const recognizableResults = [
+      erasePrototype(new Map<unknown, unknown>([["hidden", hiddenProxy]])),
+      erasePrototype(new Set<unknown>([hiddenPromise])),
+      erasePrototype(new WeakMap<object, unknown>([[weakKey, hiddenProxy]])),
+      erasePrototype(new WeakSet<object>([weakKey])),
+      erasePrototype(hiddenPromise),
+      erasePrototype(new Date("2026-07-16T00:00:00.000Z")),
+      erasePrototype(/hidden/gu),
+      erasePrototype(new Error("hidden")),
+      erasePrototype(new ArrayBuffer(8)),
+      erasePrototype(new SharedArrayBuffer(8)),
+      erasePrototype(new Uint8Array([1, 2, 3])),
+      erasePrototype(new DataView(new ArrayBuffer(8))),
     ] as const;
-    for (const result of results) {
+
+    for (const result of recognizableResults) {
       const store = openStore();
-      expect(
+      expect(() =>
         store.withTransaction((tx) => {
           tx.savePlan(changePlanFixture);
           return result;
         }),
-      ).toBe(result);
+      ).toThrow(/canonical|return|synchronous/iu);
+      expect(store.getPlan(changePlanFixture.id)).toBeNull();
+    }
+    expect(proxyTrapCalls).toBe(0);
+  });
+
+  test("discards undetectable private slots and returns only a frozen detached clone", () => {
+    let proxyTrapCalls = 0;
+    const hiddenProxy = new Proxy(
+      {},
+      {
+        get() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getOwnPropertyDescriptor() {
+          proxyTrapCalls += 1;
+          return undefined;
+        },
+        getPrototypeOf() {
+          proxyTrapCalls += 1;
+          return Object.prototype;
+        },
+        ownKeys() {
+          proxyTrapCalls += 1;
+          return [];
+        },
+      },
+    );
+    class HiddenResult {
+      readonly #proxy = hiddenProxy;
+      readonly #promise = Promise.resolve("hidden");
+
+      reveal(): readonly unknown[] {
+        return [this.#proxy, this.#promise];
+      }
+    }
+    const disguised = new HiddenResult();
+    Object.setPrototypeOf(disguised, null);
+    const store = openStore();
+
+    const returned = store.withTransaction((tx) => {
+      tx.savePlan(changePlanFixture);
+      return disguised;
+    });
+
+    expect(returned).toEqual({});
+    expect(returned).not.toBe(disguised);
+    expect(Object.isFrozen(returned)).toBe(true);
+    expect(Reflect.ownKeys(returned as object)).toEqual([]);
+    expect(Reflect.has(returned as object, "reveal")).toBe(false);
+    expect(proxyTrapCalls).toBe(0);
+    expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
+  });
+
+  test("returns primitives by value and canonical objects as frozen detached clones", () => {
+    const primitives = [undefined, null, true, 42, "committed"] as const;
+    for (const primitive of primitives) {
+      const store = openStore();
+      expect(
+        store.withTransaction((tx) => {
+          tx.savePlan(changePlanFixture);
+          return primitive;
+        }),
+      ).toBe(primitive);
       expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
     }
+
+    const nullPrototype = Object.assign(
+      Object.create(null) as Record<string, unknown>,
+      {
+        status: "committed",
+      },
+    );
+    const nullPrototypeStore = openStore();
+    const clonedNullPrototype = nullPrototypeStore.withTransaction((tx) => {
+      tx.savePlan(changePlanFixture);
+      return nullPrototype;
+    });
+    expect(clonedNullPrototype).toEqual({ status: "committed" });
+    expect(clonedNullPrototype).not.toBe(nullPrototype);
+    expect(Object.getPrototypeOf(clonedNullPrototype)).toBe(Object.prototype);
+    expect(Object.isFrozen(clonedNullPrototype)).toBe(true);
+
+    const arraySource = [{ status: "committed" }];
+    const arrayStore = openStore();
+    const clonedArray = arrayStore.withTransaction((tx) => {
+      tx.savePlan(changePlanFixture);
+      return arraySource;
+    });
+    expect(clonedArray).toEqual(arraySource);
+    expect(clonedArray).not.toBe(arraySource);
+    expect(clonedArray[0]).not.toBe(arraySource[0]);
+    expect(Object.isFrozen(clonedArray)).toBe(true);
+    expect(Object.isFrozen(clonedArray[0])).toBe(true);
+
+    const source = {
+      nested: { status: "committed" },
+      rows: [{ value: 1 }],
+    };
+    const store = openStore();
+    const returned = store.withTransaction((tx) => {
+      tx.savePlan(changePlanFixture);
+      return source;
+    });
+    expect(returned).toEqual(source);
+    expect(returned).not.toBe(source);
+    expect(returned.nested).not.toBe(source.nested);
+    expect(returned.rows).not.toBe(source.rows);
+    expect(returned.rows[0]).not.toBe(source.rows[0]);
+    expect(Object.isFrozen(returned)).toBe(true);
+    expect(Object.isFrozen(returned.nested)).toBe(true);
+    expect(Object.isFrozen(returned.rows)).toBe(true);
+    expect(Object.isFrozen(returned.rows[0])).toBe(true);
+    expect(Reflect.set(returned.nested, "status", "escaped")).toBe(false);
+    source.nested.status = "mutated";
+    source.rows[0] = { value: 2 };
+    expect(returned).toEqual({
+      nested: { status: "committed" },
+      rows: [{ value: 1 }],
+    });
+    expect(store.getPlan(changePlanFixture.id)).toEqual(changePlanFixture);
   });
 
   test("poisons caught root reentry and nested transactions", () => {

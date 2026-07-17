@@ -2429,13 +2429,21 @@ export function createMemoryStorage(
     return callCore(name, state, args);
   }
 
-  function rejectsNoncanonicalTransactionResult(value: unknown): boolean {
-    if (value === undefined) return false;
+  type PreparedTransactionResult =
+    | { readonly accepted: true; readonly value: unknown }
+    | { readonly accepted: false };
+
+  function prepareTransactionResult(value: unknown): PreparedTransactionResult {
+    if (value === undefined) {
+      return { accepted: true, value: undefined };
+    }
     try {
-      canonicalJson(value);
-      return false;
+      return {
+        accepted: true,
+        value: freezeJsonValue(canonicalJsonClone(value)),
+      };
     } catch {
-      return true;
+      return { accepted: false };
     }
   }
 
@@ -2491,21 +2499,21 @@ export function createMemoryStorage(
     });
     try {
       const result = fn(revocable.proxy as StorageTransaction);
-      const dangerousResult = rejectsNoncanonicalTransactionResult(result);
+      const preparedResult = prepareTransactionResult(result);
       if (transactionPoisoned) {
         return failure(
           "PRECONDITION_FAILED",
           "root storage reentry invalidated the transaction",
         );
       }
-      if (dangerousResult) {
+      if (!preparedResult.accepted) {
         return failure(
           "PRECONDITION_FAILED",
           "transaction return value must be bounded canonical synchronous data",
         );
       }
       state = working;
-      return result;
+      return preparedResult.value as T;
     } finally {
       token.active = false;
       revocable.revoke();

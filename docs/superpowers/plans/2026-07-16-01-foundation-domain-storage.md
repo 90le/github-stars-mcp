@@ -991,23 +991,34 @@ root `migrate`, `close`, or another `withTransaction` are likewise rejected.
 It supplies a revocable transaction facade.
 The callback may return `undefined`, another non-callable canonical primitive,
 or bounded canonical JSON data made only from descriptor-data
-plain/null-prototype objects and dense standard arrays. The same
-descriptor-safe canonical validator rejects functions, custom prototypes and
-class instances, Map/Set/WeakMap/WeakSet, Promise, Proxy, accessors, symbols,
-sparse arrays, exotic objects, and cycles without invoking getters, traps,
-iterators, or `toJSON`. Validation runs before a final poison-state check, so
-a caught reentry during validation cannot commit. Any rejection rolls back
-every Map/index/lease/attempt mutation. The facade is revoked before
-commit/rollback returns, so a captured
+plain/null-prototype objects and dense standard arrays. Recognizable runtime
+brands such as Map/Set/WeakMap/WeakSet, Promise, Proxy, Date, RegExp, native
+Error, ArrayBuffer, SharedArrayBuffer, and buffer views are rejected before
+prototype or descriptor reflection. The descriptor-safe canonical validator
+also rejects functions, ordinary custom-prototype/class instances, accessors,
+symbols, sparse arrays, and cycles without invoking getters, traps, iterators,
+or `toJSON`. Accepted objects and arrays are returned only after
+canonicalization into a detached, recursively frozen JSON clone; their input
+identity, prototype, class identity, and private/internal slots are not
+preserved. A prototype-erased object whose hidden brand cannot be recognized
+may canonicalize to only its enumerable data (often `{}`), but the original
+object never escapes. This does not claim that every disguised class is
+detectable. Validation and cloning run before a final poison-state check, so a
+caught reentry during validation cannot commit. Any rejection rolls back every
+Map/index/lease/attempt mutation. The facade is revoked before commit/rollback
+returns, so a captured
 `tx` cannot mutate later. It exposes no raw SQL, generic query, `execute`, or
 async transaction.
 
 - [ ] **Step 4: Verify exact structural compliance**
 Run `npm test -- test/unit/ports/storage-port.test.ts test/unit/domain/filter.test.ts test/unit/domain/plan-run.test.ts && npm run typecheck && npm run lint`; expect all tests pass, including:
 
-- commit/throw rollback; canonical primitive/plain/null-prototype/array
-  returns; rejected Promise/Proxy/function/class/container/accessor/symbol/
-  sparse/cyclic results with zero getter/trap calls; nested transaction;
+- commit/throw rollback; canonical primitives returned by value and
+  plain/null-prototype/array results returned as detached deep-frozen clones;
+  rejected recognizable prototype-erased exotics and
+  Promise/Proxy/function/class/container/accessor/symbol/sparse/cyclic results
+  with zero getter/trap calls; safe enumerable-only canonicalization of
+  undetectable prototype-erased private-slot instances; nested transaction;
   root-store reentry; and leaked facade calls after commit and rollback;
 - detached/deep-frozen reads after caller mutation, hostile
   accessor/proxy/symbol/sparse/custom-prototype input, and inert
@@ -1754,11 +1765,12 @@ secure state path -> open/verify SQLite -> migrate under BEGIN IMMEDIATE
 ```
 
 It delegates every port method, makes `close` idempotent, and implements
-`withTransaction` through an immediate transaction plus the same canonical
-return-value validation and revocable-facade semantics as the memory store. Nested
-transactions and root-store reentry (including migrate/close) are rejected
-while the callback is active. Callback writes roll back before an async result
-can escape; no transaction crosses `await`.
+`withTransaction` through an immediate transaction plus the same
+recognizable-exotic rejection, detached recursively frozen canonical return
+channel, final poison check, and revocable-facade semantics as the memory
+store. Nested transactions and root-store reentry (including migrate/close)
+are rejected while the callback is active. Callback writes roll back before
+an async result can escape; no transaction crosses `await`.
 
 - [ ] **Step 4: Run complete foundation and reopen verification**
 Run `npm test -- test/unit test/integration/storage && npm run test:coverage && npm run format:check && npm run lint && npm run typecheck && npm run build && git diff --check`; expect full success, coverage gates, and reopen tests proving one-time lease-aware recovery, one run per plan, attempt-history continuity, cursor continuity, transactional thenable rollback, no hash/before-state changes, timestamp-order CHECK rejection, initial-projection INSERT rejection, current-attempt-only reconciliation, matching-event projection updates, and append-only reconciliation events through raw SQL negative cases.
