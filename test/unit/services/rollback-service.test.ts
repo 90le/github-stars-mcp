@@ -4,6 +4,7 @@ import type {
   GitHubLiveReadPort,
   GitHubMutationPort,
   MutationReceipt,
+  Page,
   RepositoryIdentity,
   UserListMutationResult,
 } from "../../../src/app/ports/github-port.js";
@@ -335,6 +336,15 @@ class ExecutorShapeGitHub implements GitHubLiveReadPort, GitHubMutationPort {
 
   constructor(operation: ResolvedOperation) {
     this.#operation = operation;
+  }
+
+  listUserLists(): Promise<Page<UserList>> {
+    return Promise.resolve({
+      items: [],
+      nextCursor: null,
+      rateLimit: null,
+      warnings: [],
+    });
   }
 
   getRepositoryIdentity(): Promise<RepositoryIdentity | null> {
