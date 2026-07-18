@@ -323,6 +323,8 @@ test.skipIf(process.platform === "win32")(
       expect(statSync(dataDir).mode & 0o777).toBe(0o500);
       expect(statSync(databasePath).mode & 0o777).toBe(0o400);
     } finally {
+      chmodSync(join(root, "state"), 0o700);
+      chmodSync(join(root, "state", STATE_DATABASE_BASENAME), 0o600);
       chmodSync(root, 0o700);
       rmSync(root, { recursive: true, force: true });
     }
