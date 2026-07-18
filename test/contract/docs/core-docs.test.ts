@@ -162,6 +162,6 @@ describe("core documentation", () => {
     const readme = await readFile("README.md", "utf8");
     const requirements = await readFile("docs/requirements.md", "utf8");
     expect(readme).toContain("docs/tool-reference.md");
-    expect(requirements).not.toContain("verification-matrix.md");
+    expect(requirements).toContain("verification-matrix.md");
   });
 });

@@ -46,6 +46,7 @@
     "assets:check": "node scripts/verify-assets.mjs",
     "docs:generate": "npm run build && node scripts/generate-tool-reference.mjs",
     "docs:check": "npm run build && node scripts/verify-docs.mjs",
+    "verify:requirements": "node scripts/verify-requirements.mjs",
     "smoke:mcp": "node scripts/mcp-inspector-smoke.mjs",
     "smoke:codex-plugin": "node scripts/codex-plugin-smoke.mjs",
     "test": "vitest run",
