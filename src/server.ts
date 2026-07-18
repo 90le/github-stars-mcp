@@ -12,6 +12,7 @@ import { InspectService } from "./app/services/inspect-service.js";
 import { ListsQueryService } from "./app/services/lists-query-service.js";
 import { MutationExecutor } from "./app/services/mutation-executor.js";
 import { MutationPacer } from "./app/services/mutation-pacer.js";
+import { OperationCoordinator } from "./app/services/operation-coordinator.js";
 import { PlanService } from "./app/services/plan-service.js";
 import { QueryService } from "./app/services/query-service.js";
 import { RollbackService } from "./app/services/rollback-service.js";
@@ -27,6 +28,13 @@ import type { AccountBinding } from "./domain/repository.js";
 import { createOctokitTransport } from "./github/octokit-client.js";
 import { OctokitGitHubAdapter } from "./github/octokit-github-adapter.js";
 import { RateGate } from "./github/rate-gate.js";
+import {
+  StderrLogger,
+  safeErrorMessage,
+  type LogSink,
+} from "./logging/stderr-logger.js";
+import { createMcpServer } from "./mcp/create-server.js";
+import { SQLiteStore } from "./storage/sqlite-store.js";
 import { PACKAGE_VERSION } from "./version.js";
 
 export type GitHubSession = Readonly<{
@@ -121,3 +129,156 @@ export async function createServices(
     rollback: new RollbackService(storage, runtime, config),
   });
 }
+
+export interface SignalSource {
+  on(signal: NodeJS.Signals, listener: () => void): void;
+  off(signal: NodeJS.Signals, listener: () => void): void;
+}
+
+type ServerDependencies = Readonly<{
+  runtime?: Clock & IdGenerator;
+  signalSource?: SignalSource;
+  storeFactory?: (
+    dataDirectory: string,
+    runtime: Clock & IdGenerator,
+  ) => StoragePort;
+  serviceFactory?: typeof createServices;
+  serverFactory?: (
+    services: ServiceRegistry,
+    coordinator: OperationCoordinator,
+  ) => McpServer;
+  transportFactory?: (input: Readable, output: Writable) => Transport;
+  coordinatorFactory?: () => OperationCoordinator;
+}>;
+
+export type RunServerOptions = Readonly<{
+  config: AppConfig;
+  env?: Readonly<NodeJS.ProcessEnv>;
+  input?: Readable;
+  output?: Writable;
+  loggerSink?: LogSink;
+  dependencies?: ServerDependencies;
+}>;
+
+export async function runServer(options: RunServerOptions): Promise<void> {
+  const dependencies = options.dependencies ?? {};
+  const runtime = dependencies.runtime ?? new SystemRuntime();
+  const coordinator =
+    dependencies.coordinatorFactory?.() ?? new OperationCoordinator();
+  const signalSource = dependencies.signalSource ?? process;
+  const logger = new StderrLogger(
+    options.config.logLevel,
+    options.loggerSink ?? process.stderr,
+  );
+  const store = (dependencies.storeFactory ?? defaultStoreFactory)(
+    options.config.dataDir,
+    runtime,
+  );
+
+  let server: McpServer | undefined;
+  let serverClosed = false;
+  let storeClosed = false;
+  let shutdownPromise: Promise<void> | undefined;
+  let resolveClosed!: () => void;
+  const closed = new Promise<void>((resolve) => {
+    resolveClosed = resolve;
+  });
+
+  const performShutdown = async (): Promise<void> => {
+    coordinator.stopAccepting();
+    coordinator.abort();
+    await coordinator.drain();
+
+    let closeFailure: unknown;
+    if (server !== undefined && !serverClosed) {
+      serverClosed = true;
+      try {
+        await server.close();
+      } catch (error) {
+        closeFailure = error;
+      }
+    }
+    if (!storeClosed) {
+      storeClosed = true;
+      try {
+        store.close();
+      } catch (error) {
+        closeFailure ??= error;
+      }
+    }
+    resolveClosed();
+    if (closeFailure !== undefined) {
+      throw closeFailure instanceof Error
+        ? closeFailure
+        : new Error("Server shutdown failed", { cause: closeFailure });
+    }
+  };
+  const requestShutdown = (): Promise<void> => {
+    shutdownPromise ??= performShutdown();
+    return shutdownPromise;
+  };
+  const onSignal = (): void => {
+    void requestShutdown().catch((error: unknown) => {
+      logger.error("shutdown_failed", safeErrorMessage(error));
+    });
+  };
+
+  signalSource.on("SIGINT", onSignal);
+  signalSource.on("SIGTERM", onSignal);
+  try {
+    store.migrate();
+    store.recoverIncompleteSnapshots(runtime.now());
+    store.recoverInterruptedRuns(runtime.now());
+
+    const services = await (dependencies.serviceFactory ?? createServices)(
+      options.config,
+      store,
+      {
+        runtime,
+        env: options.env ?? process.env,
+      },
+    );
+    server = (dependencies.serverFactory ?? createMcpServer)(
+      services,
+      coordinator,
+    );
+    server.server.onerror = (error) => {
+      logger.error("transport_error", safeErrorMessage(error));
+    };
+    server.server.onclose = () => {
+      void requestShutdown().catch((error: unknown) => {
+        logger.error("shutdown_failed", safeErrorMessage(error));
+      });
+    };
+
+    const transport = (
+      dependencies.transportFactory ??
+      ((input, output) => new StdioServerTransport(input, output))
+    )(options.input ?? process.stdin, options.output ?? process.stdout);
+    await server.connect(transport);
+    logger.info("server_started", "GitHub Stars MCP server started.");
+    await closed;
+    await shutdownPromise;
+  } catch (error) {
+    try {
+      await requestShutdown();
+    } catch (shutdownError) {
+      logger.error("shutdown_failed", safeErrorMessage(shutdownError));
+    }
+    throw error;
+  } finally {
+    signalSource.off("SIGINT", onSignal);
+    signalSource.off("SIGTERM", onSignal);
+  }
+}
+
+function defaultStoreFactory(
+  dataDirectory: string,
+  runtime: Clock & IdGenerator,
+): StoragePort {
+  return new SQLiteStore(dataDirectory, runtime);
+}
+import type { Readable, Writable } from "node:stream";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
