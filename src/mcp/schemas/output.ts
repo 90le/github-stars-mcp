@@ -6,6 +6,7 @@ import {
 } from "../../domain/canonical-json.js";
 import { APP_ERROR_CODES } from "../../domain/errors.js";
 import type { JsonValue } from "../../domain/json.js";
+import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
 
 export const ToolNames = [
   "github_stars_status",
@@ -35,10 +36,18 @@ const CursorSchema = z
   .refine(
     (value) => Buffer.byteLength(value, "utf8") <= MAX_CURSOR_BYTES,
     "cursor must not exceed 4096 UTF-8 bytes",
-  );
+  )
+  .describe("Opaque cursor limited to 4096 UTF-8 bytes at runtime");
 const TimestampSchema = z
   .string()
-  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u);
+  .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/u)
+  .refine((value) => {
+    try {
+      return canonicalUtcTimestamp(value) === value;
+    } catch {
+      return false;
+    }
+  }, "timestamp must be a canonical valid UTC instant");
 const HashSchema = z.string().regex(/^[a-f0-9]{64}$/u);
 const BoundedTextSchema = z.string().max(2_000);
 const NullableTimestampSchema = TimestampSchema.nullable();
@@ -193,7 +202,10 @@ const SnapshotStatusOutputSchema = z
     counts: SnapshotCountsOutputSchema,
     warning_count: SafeIntegerSchema,
   })
-  .strict();
+  .strict()
+  .refine((value) => value.completed_at >= value.started_at, {
+    message: "snapshot completion cannot precede its start",
+  });
 
 const IncompleteRunOutputSchema = z
   .object({
@@ -204,7 +216,25 @@ const IncompleteRunOutputSchema = z
     finished_at: NullableTimestampSchema,
     counts: RunCountsOutputSchema,
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const unfinished = value.state === "pending" || value.state === "running";
+    if (
+      (unfinished && value.finished_at !== null) ||
+      (!unfinished && value.finished_at === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "incomplete run timestamps do not match its lifecycle state",
+      });
+    }
+    if (value.finished_at !== null && value.finished_at < value.started_at) {
+      context.addIssue({
+        code: "custom",
+        message: "incomplete run finish cannot precede its start",
+      });
+    }
+  });
 
 export const StatusOutputDataSchema = z
   .object({
@@ -267,6 +297,33 @@ const LanguageAggregateOutputSchema = z
   })
   .strict();
 
+function sqliteBinaryOrderedLanguages(
+  items: readonly { readonly language: string | null }[],
+): boolean {
+  let sawNull = false;
+  let previous: string | undefined;
+  for (let index = 0; index < items.length; index += 1) {
+    const language = items[index]?.language;
+    if (language === null) {
+      if (index !== 0 || sawNull) return false;
+      sawNull = true;
+      continue;
+    }
+    if (
+      language === undefined ||
+      (previous !== undefined &&
+        Buffer.compare(
+          Buffer.from(previous, "utf8"),
+          Buffer.from(language, "utf8"),
+        ) >= 0)
+    ) {
+      return false;
+    }
+    previous = language;
+  }
+  return true;
+}
+
 const ProjectionOutputSchema = z
   .object({
     repository_id: StableIdSchema.optional(),
@@ -322,8 +379,39 @@ export const StarsQueryOutputDataSchema = z
     evidence: z.array(EvidenceOutputSchema).max(20),
   })
   .strict()
-  .refine((value) => value.total >= value.items.length, {
-    message: "query total cannot be smaller than the returned page",
+  .superRefine((value, context) => {
+    if (value.total < value.items.length) {
+      context.addIssue({
+        code: "custom",
+        message: "query total cannot be smaller than the returned page",
+      });
+    }
+    if (
+      value.aggregates.archived > value.total ||
+      value.aggregates.forks > value.total
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "boolean aggregate counts cannot exceed query total",
+      });
+    }
+    if (!sqliteBinaryOrderedLanguages(value.aggregates.languages)) {
+      context.addIssue({
+        code: "custom",
+        message:
+          "language aggregates must be unique in null-first SQLite BINARY order",
+      });
+    }
+    const languageTotal = value.aggregates.languages.reduce(
+      (total, item) => total + item.count,
+      0,
+    );
+    if (languageTotal > value.total) {
+      context.addIssue({
+        code: "custom",
+        message: "visible language aggregate counts cannot exceed query total",
+      });
+    }
   });
 
 const ListSummaryOutputSchema = z
@@ -479,6 +567,12 @@ export const PlanOutputDataSchema = z
         message: "plan operation and risk counts are inconsistent",
       });
     }
+    if (value.expires_at <= value.created_at) {
+      context.addIssue({
+        code: "custom",
+        message: "plan expiry must be later than creation",
+      });
+    }
   });
 
 export const RollbackOutputDataSchema = PlanOutputDataSchema;
@@ -593,7 +687,10 @@ const PlanInspectionMetadataOutputSchema = z
     operation_count: SafeIntegerSchema.max(5_000),
     dependency_count: SafeIntegerSchema.max(100_000),
   })
-  .strict();
+  .strict()
+  .refine((value) => value.expires_at > value.created_at, {
+    message: "plan expiry must be later than creation",
+  });
 
 const PublicRunOutputSchema = z
   .object({
@@ -614,6 +711,12 @@ const PublicRunOutputSchema = z
       context.addIssue({
         code: "custom",
         message: "run timestamps do not match its lifecycle state",
+      });
+    }
+    if (value.finished_at !== null && value.finished_at < value.started_at) {
+      context.addIssue({
+        code: "custom",
+        message: "run finish cannot precede its start",
       });
     }
   });
@@ -648,6 +751,16 @@ const RunOperationOutputSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (
+      value.started_at !== null &&
+      value.finished_at !== null &&
+      value.finished_at < value.started_at
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "run operation finish cannot precede its start",
+      });
+    }
     const pending =
       value.status === "pending" &&
       value.reconciliation === "not_required" &&
@@ -740,6 +853,12 @@ const RunAttemptOutputSchema = z
   })
   .strict()
   .superRefine((value, context) => {
+    if (value.finished_at !== null && value.finished_at < value.started_at) {
+      context.addIssue({
+        code: "custom",
+        message: "attempt finish cannot precede its start",
+      });
+    }
     const valid =
       (value.status === "running" &&
         value.reconciliation === "pending" &&
@@ -882,9 +1001,50 @@ export const ApplyOutputDataSchema = z
     finished_at: NullableTimestampSchema,
     counts: RunCountsOutputSchema,
     errors: z.array(IdentityFreeSerializedErrorOutputSchema).max(20),
-    audit_cursor: CursorSchema.nullable(),
+    audit_cursor: StableIdSchema.nullable(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    const unfinished = value.state === "pending" || value.state === "running";
+    if (
+      (unfinished && value.finished_at !== null) ||
+      (!unfinished && value.finished_at === null)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "apply run timestamps do not match its lifecycle state",
+      });
+    }
+    if (value.finished_at !== null && value.finished_at < value.started_at) {
+      context.addIssue({
+        code: "custom",
+        message: "apply run finish cannot precede its start",
+      });
+    }
+    const expectedErrors = Math.min(
+      20,
+      value.counts.failed + value.counts.unresolved,
+    );
+    if (value.errors.length !== expectedErrors) {
+      context.addIssue({
+        code: "custom",
+        message: "apply error summaries do not match failed operations",
+      });
+    }
+    const operationTotal = Object.values(value.counts).reduce(
+      (total, count) => total + count,
+      0,
+    );
+    if (
+      (operationTotal === 0 && value.audit_cursor !== null) ||
+      (operationTotal > 0 && value.audit_cursor !== value.run_id)
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "apply audit cursor does not match operation count",
+      });
+    }
+  });
 
 const RepositoryOutputSchema = z
   .object({
@@ -930,7 +1090,7 @@ export const DiscoveryOutputDataSchema = z
   .superRefine((value, context) => {
     if (
       value.reported_total < value.items.length ||
-      value.capped_total > value.reported_total
+      value.capped_total !== Math.min(value.reported_total, 1_000)
     ) {
       context.addIssue({
         code: "custom",

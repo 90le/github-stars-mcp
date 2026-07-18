@@ -66,6 +66,7 @@ export type ToolServiceOutput = Readonly<{
 const MAX_WARNINGS = 20;
 const MAX_WARNING_LENGTH = 512;
 const MAX_CURSOR_LENGTH = 4_096;
+const MAX_LANGUAGE_AGGREGATES = 100;
 const COUNT_KEYS = [
   "pending",
   "running",
@@ -547,6 +548,39 @@ function mapProjection(input: JsonValue): PublicData {
   return result;
 }
 
+function sqliteBinaryOrderedLanguages(
+  items: readonly {
+    readonly language: string | null;
+    readonly count: number;
+  }[],
+): boolean {
+  let sawNull = false;
+  let previous: string | undefined;
+  for (let index = 0; index < items.length; index += 1) {
+    const language = items[index]?.language;
+    if (language === null) {
+      if (index !== 0 || sawNull) return false;
+      sawNull = true;
+      continue;
+    }
+    if (
+      language === undefined ||
+      language.length === 0 ||
+      language.length > 100 ||
+      language !== language.trim() ||
+      (previous !== undefined &&
+        Buffer.compare(
+          Buffer.from(previous, "utf8"),
+          Buffer.from(language, "utf8"),
+        ) >= 0)
+    ) {
+      return false;
+    }
+    previous = language;
+  }
+  return true;
+}
+
 export function toStarsQueryOutput(input: StarsQueryResult): ToolServiceOutput {
   const root = record(cloneValue(input, "Stars query result"), "Stars result");
   exactKeys(
@@ -570,13 +604,41 @@ export function toStarsQueryOutput(input: StarsQueryResult): ToolServiceOutput {
       count: nonnegative(item.count, "aggregate count"),
     };
   });
+  const total = nonnegative(root.total, "query total");
+  const archived = nonnegative(aggregates.archived, "archived aggregate");
+  const forks = nonnegative(aggregates.forks, "fork aggregate");
+  const languageTotal = languages.reduce(
+    (sum, language) => sum + language.count,
+    0,
+  );
+  if (
+    !sqliteBinaryOrderedLanguages(languages) ||
+    !Number.isSafeInteger(languageTotal) ||
+    languageTotal !== total ||
+    archived > total ||
+    forks > total
+  ) {
+    return invalid("query aggregates");
+  }
+  const omittedLanguages = Math.max(
+    0,
+    languages.length - MAX_LANGUAGE_AGGREGATES,
+  );
+  const warnings =
+    omittedLanguages === 0
+      ? []
+      : [
+          `language aggregates truncated; ${omittedLanguages} ${
+            omittedLanguages === 1 ? "group" : "groups"
+          } omitted`,
+        ];
   const data = {
     snapshot_id: stringValue(root.snapshotId, "snapshot ID"),
-    total: nonnegative(root.total, "query total"),
+    total,
     aggregates: {
-      languages,
-      archived: nonnegative(aggregates.archived, "archived aggregate"),
-      forks: nonnegative(aggregates.forks, "fork aggregate"),
+      languages: languages.slice(0, MAX_LANGUAGE_AGGREGATES),
+      archived,
+      forks,
     },
     items: array(root.items as JsonValue, "query items").map(mapProjection),
     evidence: array(root.evidence as JsonValue, "query evidence").map(
@@ -586,7 +648,7 @@ export function toStarsQueryOutput(input: StarsQueryResult): ToolServiceOutput {
   return output(
     StarsQueryOutputDataSchema,
     data,
-    [],
+    warnings,
     null,
     cursor(root.nextCursor),
   );
@@ -1272,7 +1334,7 @@ export function toApplyOutput(input: ApplyResult): ToolServiceOutput {
       finished_at: parsedRun.finishedAt,
       counts: mapRunCounts(root.counts as JsonValue, "apply counts"),
       errors,
-      audit_cursor: cursor(root.auditCursor),
+      audit_cursor: nullableString(root.auditCursor, "audit cursor"),
     },
     warnings as readonly string[],
     null,

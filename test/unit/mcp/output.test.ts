@@ -222,7 +222,7 @@ describe("MCP output schemas", () => {
     ).toBe(false);
   });
 
-  it("bounds next and audit cursors by 4096 UTF-8 bytes", () => {
+  it("bounds next cursors by 4096 UTF-8 bytes", () => {
     const atLimit = "\u00e9".repeat(2_048);
     const overLimit = "\u00e9".repeat(2_049);
     const queryData = {
@@ -243,6 +243,9 @@ describe("MCP output schemas", () => {
       ).success,
     ).toBe(false);
     expect(
+      JSON.stringify(z.toJSONSchema(ToolOutputSchemas.github_stars_query)),
+    ).toContain("4096 UTF-8 bytes");
+    expect(
       toStarsQueryOutput({
         snapshotId: "snap_1",
         total: 0,
@@ -262,11 +265,282 @@ describe("MCP output schemas", () => {
         nextCursor: overLimit,
       } as never),
     ).toThrow();
+  });
 
-    const applyData = {
+  it("rejects non-canonical timestamps and reversed lifecycle chronology", () => {
+    const validPlan = toPlanOutput(planResult() as never).data;
+    for (const invalid of [
+      "2026-13-01T00:00:00.000Z",
+      "2026-02-30T00:00:00.000Z",
+      "2026-07-16T24:00:00.000Z",
+    ]) {
+      expect(
+        PlanOutputDataSchema.safeParse({
+          ...validPlan,
+          created_at: invalid,
+        }).success,
+      ).toBe(false);
+    }
+    expect(
+      PlanOutputDataSchema.safeParse({
+        ...validPlan,
+        expires_at: NOW,
+      }).success,
+    ).toBe(false);
+
+    const statusData = {
+      server_version: "1.0.0",
+      host: "github.com",
+      login: "octocat",
+      credential_source: "gh",
+      capabilities: {
+        star_read: "available",
+        star_write: "available",
+        list_read: "available",
+        list_write: "available",
+      },
+      database_schema_version: 2,
+      latest_complete_snapshot: {
+        snapshot_id: "snap_1",
+        mode: "full",
+        list_coverage: "complete",
+        status: "complete",
+        started_at: LATER,
+        completed_at: NOW,
+        failed_at: null,
+        counts: { repositories: 0, stars: 0, lists: 0, memberships: 0 },
+        warning_count: 0,
+      },
+      incomplete_runs: { items: [], total: 0, truncated: false },
+    };
+    expect(StatusOutputDataSchema.safeParse(statusData).success).toBe(false);
+    expect(
+      StatusOutputDataSchema.safeParse({
+        ...statusData,
+        latest_complete_snapshot: null,
+        incomplete_runs: {
+          items: [
+            {
+              run_id: "run_1",
+              plan_id: "plan_1",
+              state: "partial",
+              started_at: LATER,
+              finished_at: NOW,
+              counts: {
+                pending: 0,
+                running: 0,
+                succeeded: 1,
+                skipped: 0,
+                failed: 0,
+                unresolved: 0,
+              },
+            },
+          ],
+          total: 1,
+          truncated: false,
+        },
+      }).success,
+    ).toBe(false);
+
+    const publicRun = {
       run_id: "run_1",
       plan_id: "plan_1",
       state: "completed",
+      failure_mode: "continue",
+      started_at: LATER,
+      finished_at: NOW,
+    };
+    expect(
+      InspectOutputDataSchema.safeParse({
+        kind: "run",
+        run: publicRun,
+        operations: [],
+        total: 0,
+      }).success,
+    ).toBe(false);
+    expect(
+      InspectOutputDataSchema.safeParse({
+        kind: "run",
+        run: {
+          ...publicRun,
+          started_at: NOW,
+          finished_at: LATER,
+        },
+        operations: [
+          {
+            run_id: "run_1",
+            operation_id: "op_1",
+            sequence: 0,
+            status: "succeeded",
+            reconciliation: "not_required",
+            attempts: 1,
+            before: {},
+            after: {},
+            external_request_id: null,
+            error: null,
+            started_at: LATER,
+            finished_at: NOW,
+          },
+        ],
+        total: 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      InspectOutputDataSchema.safeParse({
+        kind: "attempts",
+        run: {
+          ...publicRun,
+          started_at: NOW,
+          finished_at: LATER,
+        },
+        operation_id: "op_1",
+        attempts: [
+          {
+            run_id: "run_1",
+            operation_id: "op_1",
+            attempt: 1,
+            status: "succeeded",
+            reconciliation: "not_required",
+            before: {},
+            after: {},
+            external_request_id: null,
+            error: null,
+            started_at: LATER,
+            finished_at: NOW,
+          },
+        ],
+        total: 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      ApplyOutputDataSchema.safeParse({
+        ...publicRun,
+        counts: {
+          pending: 0,
+          running: 0,
+          succeeded: 0,
+          skipped: 0,
+          failed: 0,
+          unresolved: 0,
+        },
+        errors: [],
+        audit_cursor: null,
+      }).success,
+    ).toBe(false);
+  });
+
+  it("enforces service-derived aggregate, error, audit, and discovery totals", () => {
+    const starsData = {
+      snapshot_id: "snap_1",
+      total: 2,
+      aggregates: {
+        languages: [
+          { language: null, count: 1 },
+          { language: "TypeScript", count: 1 },
+        ],
+        archived: 1,
+        forks: 1,
+      },
+      items: [],
+      evidence: [],
+    };
+    expect(StarsQueryOutputDataSchema.safeParse(starsData).success).toBe(true);
+    expect(
+      StarsQueryOutputDataSchema.safeParse({
+        ...starsData,
+        aggregates: { ...starsData.aggregates, archived: 3 },
+      }).success,
+    ).toBe(false);
+    expect(
+      StarsQueryOutputDataSchema.safeParse({
+        ...starsData,
+        aggregates: {
+          ...starsData.aggregates,
+          languages: [
+            { language: "TypeScript", count: 1 },
+            { language: null, count: 1 },
+          ],
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      StarsQueryOutputDataSchema.safeParse({
+        ...starsData,
+        aggregates: {
+          ...starsData.aggregates,
+          languages: [
+            { language: "TypeScript", count: 1 },
+            { language: "TypeScript", count: 1 },
+          ],
+        },
+      }).success,
+    ).toBe(false);
+    expect(
+      StarsQueryOutputDataSchema.safeParse({
+        ...starsData,
+        aggregates: { ...starsData.aggregates, forks: 3 },
+      }).success,
+    ).toBe(false);
+    expect(
+      StarsQueryOutputDataSchema.safeParse({
+        ...starsData,
+        aggregates: {
+          ...starsData.aggregates,
+          languages: [{ language: "TypeScript", count: 1 }],
+        },
+      }).success,
+    ).toBe(true);
+    expect(() =>
+      toStarsQueryOutput({
+        snapshotId: "snap_1",
+        total: 2,
+        aggregates: {
+          languages: [{ language: "TypeScript", count: 1 }],
+          archived: 0,
+          forks: 0,
+        },
+        items: [],
+        evidence: [],
+        nextCursor: null,
+      } as never),
+    ).toThrow();
+    const allLanguages = Array.from({ length: 101 }, (_, index) => ({
+      language: `Language${String(index).padStart(3, "0")}`,
+      count: 1,
+    }));
+    const truncatedLanguages = toStarsQueryOutput({
+      snapshotId: "snap_1",
+      total: allLanguages.length,
+      aggregates: {
+        languages: allLanguages,
+        archived: 0,
+        forks: 0,
+      },
+      items: [],
+      evidence: [],
+      nextCursor: null,
+    } as never);
+    expect(
+      (
+        truncatedLanguages.data.aggregates as {
+          readonly languages: readonly unknown[];
+        }
+      ).languages,
+    ).toHaveLength(100);
+    expect(truncatedLanguages.warnings).toEqual([
+      "language aggregates truncated; 1 group omitted",
+    ]);
+
+    const error = {
+      code: "PRECONDITION_FAILED",
+      message: "operation failed",
+      retryable: false,
+      details: { operation_id: "op_1" },
+    } as const;
+    const applyData = {
+      run_id: "run_1",
+      plan_id: "plan_1",
+      state: "partial",
       failure_mode: "continue",
       started_at: NOW,
       finished_at: LATER,
@@ -275,37 +549,73 @@ describe("MCP output schemas", () => {
         running: 0,
         succeeded: 0,
         skipped: 0,
-        failed: 0,
+        failed: 1,
         unresolved: 0,
       },
-      errors: [],
-      audit_cursor: atLimit,
+      errors: [error],
+      audit_cursor: "run_1",
     };
     expect(ApplyOutputDataSchema.safeParse(applyData).success).toBe(true);
     expect(
+      ApplyOutputDataSchema.safeParse({ ...applyData, errors: [] }).success,
+    ).toBe(false);
+    expect(
       ApplyOutputDataSchema.safeParse({
         ...applyData,
-        audit_cursor: overLimit,
+        counts: {
+          pending: 0,
+          running: 0,
+          succeeded: 0,
+          skipped: 0,
+          failed: 0,
+          unresolved: 0,
+        },
+        errors: [],
       }).success,
     ).toBe(false);
     expect(
-      toApplyOutput({
-        run: run(),
-        warnings: ["run warning"],
-        counts: applyData.counts,
-        errors: [],
-        auditCursor: atLimit,
-      } as never).data,
-    ).toMatchObject({ audit_cursor: atLimit });
-    expect(() =>
-      toApplyOutput({
-        run: run(),
-        warnings: ["run warning"],
-        counts: applyData.counts,
-        errors: [],
-        auditCursor: overLimit,
-      } as never),
-    ).toThrow();
+      ApplyOutputDataSchema.safeParse({
+        ...applyData,
+        audit_cursor: null,
+      }).success,
+    ).toBe(false);
+    expect(
+      ApplyOutputDataSchema.safeParse({
+        ...applyData,
+        audit_cursor: "run_other",
+      }).success,
+    ).toBe(false);
+    expect(
+      ApplyOutputDataSchema.safeParse({
+        ...applyData,
+        counts: {
+          pending: 0,
+          running: 0,
+          succeeded: 0,
+          skipped: 0,
+          failed: 21,
+          unresolved: 0,
+        },
+        errors: Array.from({ length: 20 }, () => error),
+      }).success,
+    ).toBe(true);
+
+    const discoveryData = {
+      items: [],
+      evidence: [],
+      reported_total: 1_001,
+      capped_total: 1_000,
+      incomplete_results: false,
+    };
+    expect(DiscoveryOutputDataSchema.safeParse(discoveryData).success).toBe(
+      true,
+    );
+    expect(
+      DiscoveryOutputDataSchema.safeParse({
+        ...discoveryData,
+        capped_total: 999,
+      }).success,
+    ).toBe(false);
   });
 
   it("advertises a strict bounded failure envelope", () => {
@@ -404,7 +714,7 @@ describe("read-side output mappers", () => {
           {
             runId: "run_1",
             planId: "plan_1",
-            state: "partial",
+            state: "running",
             startedAt: NOW,
             finishedAt: null,
             counts: {
@@ -452,7 +762,7 @@ describe("read-side output mappers", () => {
             {
               run_id: "run_1",
               plan_id: "plan_1",
-              state: "partial",
+              state: "running",
               started_at: NOW,
               finished_at: null,
               counts: {
@@ -516,10 +826,7 @@ describe("read-side output mappers", () => {
       snapshotId: "snap_1",
       total: 1,
       aggregates: {
-        languages: [
-          { language: "TypeScript", count: 1 },
-          { language: null, count: 0 },
-        ],
+        languages: [{ language: "TypeScript", count: 1 }],
         archived: 0,
         forks: 0,
       },
@@ -545,10 +852,7 @@ describe("read-side output mappers", () => {
       snapshot_id: "snap_1",
       total: 1,
       aggregates: {
-        languages: [
-          { language: "TypeScript", count: 1 },
-          { language: null, count: 0 },
-        ],
+        languages: [{ language: "TypeScript", count: 1 }],
         archived: 0,
         forks: 0,
       },
@@ -1216,7 +1520,7 @@ describe("change-side output mappers", () => {
           details: { operation_id: "op_2" },
         },
       ],
-      auditCursor: "audit_2",
+      auditCursor: "run_1",
     } as never);
 
     expect(output.data).toEqual({
@@ -1242,7 +1546,7 @@ describe("change-side output mappers", () => {
           details: { operation_id: "op_2" },
         },
       ],
-      audit_cursor: "audit_2",
+      audit_cursor: "run_1",
     });
     expect(output.nextCursor).toBeNull();
     expect(output.warnings).toEqual(["apply warning"]);
