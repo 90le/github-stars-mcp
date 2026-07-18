@@ -1,18 +1,21 @@
 {
   "name": "github-stars-mcp",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "lockfileVersion": 3,
   "requires": true,
   "packages": {
     "": {
       "name": "github-stars-mcp",
-      "version": "0.1.0",
+      "version": "1.0.0",
       "license": "Apache-2.0",
       "dependencies": {
         "@modelcontextprotocol/sdk": "1.29.0",
         "better-sqlite3": "12.4.1",
         "octokit": "5.0.5",
         "zod": "4.1.12"
+      },
+      "bin": {
+        "github-stars-mcp": "dist/cli.js"
       },
       "devDependencies": {
         "@eslint/js": "9.39.2",

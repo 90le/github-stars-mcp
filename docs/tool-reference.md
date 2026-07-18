@@ -1,6 +1,6 @@
 # MCP Tool Reference
 
-Generated from the built `github-stars-mcp` 0.1.0 server. Do not edit by hand.
+Generated from the built `github-stars-mcp` 1.0.0 server. Do not edit by hand.
 
 Every tool below is part of the complete public MCP surface. Input and output schemas are strict; fields not present in a schema are rejected.
 

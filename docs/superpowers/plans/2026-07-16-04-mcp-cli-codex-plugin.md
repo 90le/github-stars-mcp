@@ -571,15 +571,14 @@ aggregates are ordered `{language,count}` arrays, evidence uses `.max(20)`,
 and apply error summaries use `.max(20)`. Attempt inspection exposes bounded
 per-dispatch rows and reconciliation inspection exposes append-only readback
 events without embedding either in run summaries. Every advertised
-`ToolOutputSchemas` member is deliberately a root `z.object`, because
-`@modelcontextprotocol/sdk` 1.29.0 `normalizeObjectSchema` ignores a root
-union. It advertises and validates the `ok:true` structured result. Failed
-calls still return the strict `ok:false` shape parsed by
-`ToolFailureStructuredContentSchema` and set MCP `isError:true`; the SDK
-intentionally skips advertised output validation for `isError` results.
-The common registration helper attaches the complete
-`outputSchema: ToolOutputSchemas[name]` to every
-`server.registerTool` call. Contract tests list all nine tools, assert both
+`ToolOutputSchemas` member remains a strict root success object. The
+registration layer converts the union of that success object and
+`ToolFailureStructuredContentSchema` to JSON Schema, preserves the SDK's
+required root `type:"object"`, and advertises the two branches under
+`anyOf`. Calls return either the strict `ok:true` branch or the strict
+`ok:false` branch with MCP `isError:true`. The low-level handler validates
+both branches before returning them. Contract tests list all nine tools,
+assert both
 `inputSchema` and `outputSchema` are non-empty JSON Schemas, call every tool,
 validate successful `structuredContent` with the matching advertised object
 schema, and validate every forced-error `structuredContent` with
@@ -1128,6 +1127,7 @@ Expected: FAIL because plugin metadata is absent.
         "GITHUB_STARS_MCP_MAX_PLAN_ACTIONS",
         "GITHUB_STARS_MCP_PLAN_TTL_MINUTES"
       ],
+      "startup_timeout_sec": 120,
       "tool_timeout_sec": 900
     }
   }
@@ -1154,7 +1154,8 @@ The skill must contain the workflow `status -> sync -> query -> plan -> inspect 
 `scripts/validate-plugin.mjs` supplies `npm run plugin:validate`. It parses the
 manifest, MCP configuration, marketplace entry, and skill frontmatter; verifies
 every referenced path; asserts the manifest links `./.mcp.json`; compares
-`env_vars` byte-for-byte with the documented configuration allowlist; rejects
+`env_vars` byte-for-byte with the documented configuration allowlist; requires
+the 120-second cold-start and 900-second tool bounds; rejects
 credentials/runtime source; and validates a copied plugin through a temporary
 `codex plugin marketplace add` plus `codex plugin add` when Codex is installed.
 Brand asset fields are intentionally absent here. Plan 05 Task 6 creates the

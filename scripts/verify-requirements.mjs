@@ -4,6 +4,7 @@ import {
   mkdir,
   readFile,
   realpath,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -94,6 +95,57 @@ function insideRepository(path) {
   );
 }
 
+function samePath(left, right) {
+  return process.platform === "win32"
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
+}
+
+async function optionalLstat(path) {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if (
+      error !== null &&
+      typeof error === "object" &&
+      error.code === "ENOENT"
+    ) {
+      return undefined;
+    }
+    throw error;
+  }
+}
+
+async function prepareArtifactOutput() {
+  const directory = resolve(ARTIFACT_PATH, "..");
+  const directoryMetadata = await optionalLstat(directory);
+  if (directoryMetadata === undefined) {
+    await mkdir(directory, { mode: 0o700 });
+  } else if (
+    directoryMetadata.isSymbolicLink() ||
+    !directoryMetadata.isDirectory()
+  ) {
+    fail("requirements artifact parent must be a real directory");
+  }
+  const canonicalDirectory = await realpath(directory);
+  if (
+    !insideRepository(canonicalDirectory) ||
+    !samePath(canonicalDirectory, directory)
+  ) {
+    fail("requirements artifact parent must not traverse a symbolic link");
+  }
+
+  const output = resolve(ARTIFACT_PATH);
+  const outputMetadata = await optionalLstat(output);
+  if (outputMetadata !== undefined) {
+    if (!outputMetadata.isFile() && !outputMetadata.isSymbolicLink()) {
+      fail("requirements artifact path must be a file");
+    }
+    await rm(output);
+  }
+  return output;
+}
+
 async function verifyEvidencePath(path, id, column) {
   if (
     isAbsolute(path) ||
@@ -161,12 +213,12 @@ export async function verifyRequirements({ releaseMode = false } = {}) {
     release_mode: releaseMode,
     requirements: ordered,
   });
-  await mkdir(resolve(ARTIFACT_PATH, ".."), { recursive: true });
-  await writeFile(
-    ARTIFACT_PATH,
-    `${JSON.stringify(artifact, null, 2)}\n`,
-    "utf8",
-  );
+  const output = await prepareArtifactOutput();
+  await writeFile(output, `${JSON.stringify(artifact, null, 2)}\n`, {
+    encoding: "utf8",
+    flag: "wx",
+    mode: 0o600,
+  });
   return artifact;
 }
 

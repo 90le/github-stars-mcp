@@ -1,5 +1,10 @@
 # GitHub Stars MCP
 
+[![CI](https://github.com/90le/github-stars-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/90le/github-stars-mcp/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/90le/github-stars-mcp/actions/workflows/codeql.yml/badge.svg)](https://github.com/90le/github-stars-mcp/actions/workflows/codeql.yml)
+[![Node.js 22 and 24](https://img.shields.io/badge/node-22%20%7C%2024-339933)](https://nodejs.org/)
+[![Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+
 GitHub Stars MCP gives an AI agent a local, structured interface for finding,
 auditing, classifying, starring, and unstarring GitHub repositories. It also
 manages GitHub User Lists. The server uses official GitHub APIs, communicates

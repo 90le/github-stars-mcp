@@ -46,6 +46,8 @@ describe("local Codex plugin smoke fixture", () => {
     expect(copiedServers["github-stars-mcp"]).toMatchObject({
       command: process.execPath,
       args: [join(installedPackageRoot, "dist/cli.js"), "--stdio"],
+      startup_timeout_sec: 120,
+      tool_timeout_sec: 900,
     });
     expect(fixture.marketplaceName).toBe("personal");
     expect(fixture.pluginSelector).toBe("github-stars-mcp@personal");
@@ -58,6 +60,8 @@ describe("local Codex plugin smoke fixture", () => {
     expect(committedServers["github-stars-mcp"]).toMatchObject({
       command: "npx",
       args: ["-y", "github-stars-mcp@1.0.0", "--stdio"],
+      startup_timeout_sec: 120,
+      tool_timeout_sec: 900,
     });
   });
 
@@ -72,6 +76,8 @@ describe("local Codex plugin smoke fixture", () => {
     expect(servers["github-stars-mcp"]).toEqual({
       command: "<node-executable>",
       args: ["<installed-package-root>/dist/cli.js", "--stdio"],
+      startup_timeout_sec: 120,
+      tool_timeout_sec: 900,
     });
   });
 });

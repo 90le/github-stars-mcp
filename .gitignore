@@ -4,6 +4,7 @@ node_modules/
 dist/
 coverage/
 artifacts/
+SHA256SUMS
 .env
 *.db
 *.db-shm

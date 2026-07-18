@@ -237,7 +237,7 @@ The architecture will keep transport, GitHub, and storage ports separate so late
 ### 7.10 Codex plugin
 
 - **PLUGIN-01:** The plugin shall contain `.codex-plugin/plugin.json`, `.mcp.json`, one workflow skill, and presentation assets.
-- **PLUGIN-02:** The plugin shall start a compatible, explicit MCP package version through `npx`; published configuration shall not use `@latest`.
+- **PLUGIN-02:** The plugin shall start a compatible, explicit MCP package version through `npx`; published configuration shall not use `@latest` and shall allow 120 seconds for a cold-cache package installation before the MCP startup deadline.
 - **PLUGIN-03:** The workflow skill shall teach `status -> sync -> query -> plan -> inspect -> apply -> audit`.
 - **PLUGIN-04:** The skill shall state the hard prohibition on repository administration and content changes.
 - **PLUGIN-05:** The plugin shall contain no GitHub token and no duplicated business logic.
@@ -293,12 +293,12 @@ Every failed tool shall set MCP `isError: true` and return:
 }
 ```
 
-The MCP SDK 1.29 advertised `outputSchema` for each tool shall be the strict
-root-object schema for its successful envelope. Failure structured content
-shall be validated by the server's shared strict failure schema and
-`isError:true`; it is not unioned into the advertised schema because the SDK
-only serializes object-root output schemas and deliberately skips output
-validation for error results.
+The MCP SDK 1.29 advertised `outputSchema` for each tool shall be a strict
+root-object `anyOf` with exactly two branches: that tool's successful envelope
+and the shared failure envelope. The branches shall be discriminated by
+`ok:true` and `ok:false`; both reject additional properties. Failure results
+shall also set `isError:true` and pass the shared failure parser before the
+server returns them.
 
 The text content shall summarize the result in a few lines. It shall never duplicate a large structured payload.
 
@@ -777,7 +777,7 @@ plugin/
     logo.png
 ```
 
-The version 1.0.0 plugin MCP configuration will start `npx -y github-stars-mcp@1.0.0`. Each later plugin release shall reference its matching exact package version. Development documentation will show how to point Codex at the local built executable without publishing.
+The version 1.0.0 plugin MCP configuration will start `npx -y github-stars-mcp@1.0.0`, allow 120 seconds for cold startup, and allow 900 seconds for an explicitly requested long-running tool call. Each later plugin release shall reference its matching exact package version. Development documentation will show how to point Codex at the local built executable without publishing.
 
 The repository will also include a local marketplace entry so contributors can install the plugin from the repository.
 

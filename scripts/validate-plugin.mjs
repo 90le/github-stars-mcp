@@ -56,6 +56,8 @@ const EXPECTED_PACKAGE_FILES = Object.freeze([
   "plugins/github-stars-mcp",
   "README.md",
   "LICENSE",
+  "SECURITY.md",
+  "npm-shrinkwrap.json",
 ]);
 const BUILD_CONFIG_KEYS = new Set([
   "compilerOptions",
@@ -379,7 +381,7 @@ async function validateMcpConfiguration() {
   const server = assertPlainObject(servers["github-stars-mcp"], "MCP_SERVER");
   assertExactKeys(
     server,
-    ["args", "command", "env_vars", "tool_timeout_sec"],
+    ["args", "command", "env_vars", "startup_timeout_sec", "tool_timeout_sec"],
     "MCP_SERVER_KEYS",
   );
   assert(server.command === "npx", "MCP_COMMAND");
@@ -389,6 +391,7 @@ async function validateMcpConfiguration() {
     "MCP_ARGS",
   );
   assertExactArray(server.env_vars, EXPECTED_ENV, "MCP_ENV");
+  assert(server.startup_timeout_sec === 120, "MCP_STARTUP_TIMEOUT");
   assert(server.tool_timeout_sec === 900, "MCP_TIMEOUT");
 }
 
@@ -1270,6 +1273,8 @@ async function validatePackageDryRun(staticOnly, expectedDistPaths, assets) {
           path === "package.json" ||
           path === "README.md" ||
           path === "LICENSE" ||
+          path === "SECURITY.md" ||
+          path === "npm-shrinkwrap.json" ||
           path.startsWith("dist/") ||
           path.startsWith("plugins/github-stars-mcp/")
         );
@@ -1453,6 +1458,7 @@ function validateCodexMcp(value) {
     code,
   );
   assertExactArray(transport.env_vars, EXPECTED_ENV, code);
+  assert(server.startup_timeout_sec === 120, code);
   assert(server.tool_timeout_sec === 900, code);
 }
 

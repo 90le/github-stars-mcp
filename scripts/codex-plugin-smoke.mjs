@@ -172,7 +172,9 @@ function assertMcpServer(value, fixture) {
     !Array.isArray(transport.args) ||
     transport.args.length !== 2 ||
     transport.args[0] !== fixture.cliPath ||
-    transport.args[1] !== "--stdio"
+    transport.args[1] !== "--stdio" ||
+    server.startup_timeout_sec !== 120 ||
+    server.tool_timeout_sec !== 900
   ) {
     throw new Error("Codex MCP server does not use the installed packed CLI");
   }

@@ -89,11 +89,25 @@ const RELEASE_COMMAND = `set -euo pipefail
 cd release-bundle
 VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
 TAG="v\${VERSION}"
+EXPECTED_ASSETS="$(printf '%s\\n' "$TARBALL" github-stars-mcp.cdx.json requirements.json release-manifest.json SHA256SUMS | LC_ALL=C sort)"
 if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+  RELEASE_JSON="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets,isDraft,isPrerelease)"
+  while IFS= read -r ASSET; do
+    case "$ASSET" in
+      "$TARBALL"|github-stars-mcp.cdx.json|requirements.json|release-manifest.json|SHA256SUMS) ;;
+      *) gh release delete-asset "$TAG" "$ASSET" --yes --repo "$GITHUB_REPOSITORY" ;;
+    esac
+  done < <(jq -r '.assets[].name' <<< "$RELEASE_JSON")
   gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
 else
   gh release create "$TAG" ./* --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
 fi
+gh release edit "$TAG" --draft=false --prerelease=false --repo "$GITHUB_REPOSITORY"
+FINAL_RELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets,isDraft,isPrerelease)"
+[ "$(jq -er '.isDraft' <<< "$FINAL_RELEASE")" = "false" ]
+[ "$(jq -er '.isPrerelease' <<< "$FINAL_RELEASE")" = "false" ]
+ACTUAL_ASSETS="$(jq -r '.assets[].name' <<< "$FINAL_RELEASE" | LC_ALL=C sort)"
+[ "$ACTUAL_ASSETS" = "$EXPECTED_ASSETS" ]
 `;
 const NPM_VERSION_COMMAND = `npm install --global npm@11.12.1
 test "$(npm --version)" = "11.12.1"

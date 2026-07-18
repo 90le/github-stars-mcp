@@ -2,7 +2,9 @@
   "mcpServers": {
     "github-stars-mcp": {
       "command": "<node-executable>",
-      "args": ["<installed-package-root>/dist/cli.js", "--stdio"]
+      "args": ["<installed-package-root>/dist/cli.js", "--stdio"],
+      "startup_timeout_sec": 120,
+      "tool_timeout_sec": 900
     }
   }
 }

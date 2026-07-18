@@ -323,7 +323,7 @@ const mcp = {
   },
   enabled_tools: null,
   disabled_tools: null,
-  startup_timeout_sec: null,
+  startup_timeout_sec: 120,
   tool_timeout_sec: 900,
 };
 
@@ -388,6 +388,8 @@ if (args[0] === "plugin" && args[1] === "list") {
     };
   } else if (configured.mcpMode === "wrong-timeout") {
     output = { ...mcp, tool_timeout_sec: 1 };
+  } else if (configured.mcpMode === "wrong-startup-timeout") {
+    output = { ...mcp, startup_timeout_sec: 10 };
   } else {
     output = configured.mcp ?? mcp;
   }
@@ -768,6 +770,7 @@ describe("Codex plugin package", () => {
         command: string;
         args: readonly string[];
         env_vars: readonly string[];
+        startup_timeout_sec: number;
         tool_timeout_sec: number;
       }
     >;
@@ -789,6 +792,7 @@ describe("Codex plugin package", () => {
       command: "npx",
       args: ["-y", "github-stars-mcp@1.0.0", "--stdio"],
       env_vars: ENV_ALLOWLIST,
+      startup_timeout_sec: 120,
       tool_timeout_sec: 900,
     });
     expect(entry).toEqual({
@@ -870,13 +874,13 @@ describe("Codex plugin package", () => {
         cwd: process.cwd(),
         encoding: "utf8",
         env: {},
-        timeout: 10_000,
+        timeout: 60_000,
         windowsHide: true,
       },
     );
     expect(result).toMatchObject({ status: 0, stderr: "" });
     expect(result.stdout).toBe("Validated Codex plugin github-stars-mcp\n");
-  }, 15_000);
+  }, 75_000);
 
   it.each([
     ["runtime source", "payload.py", "print('unexpected')"],
@@ -1352,6 +1356,8 @@ describe("Codex plugin package", () => {
           "plugins/github-stars-mcp",
           "README.md",
           "LICENSE",
+          "SECURITY.md",
+          "npm-shrinkwrap.json",
           "test",
         ];
       });
@@ -1848,6 +1854,7 @@ describe("Codex plugin package", () => {
     ["command", "wrong-command"],
     ["complete argument list", "extra-arg"],
     ["ordered environment allowlist", "short-env"],
+    ["startup timeout", "wrong-startup-timeout"],
     ["tool timeout", "wrong-timeout"],
   ])("rejects a Codex MCP response with the wrong %s", async (_name, mode) => {
     await withPluginFixture(async (root) => {

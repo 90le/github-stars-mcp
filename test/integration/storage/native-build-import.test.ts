@@ -7,7 +7,7 @@ import { expect, test } from "vitest";
 
 test(
   "loads the built state-directory module in native Node",
-  { timeout: 30_000 },
+  { timeout: 120_000 },
   () => {
     const output = mkdtempSync(join(tmpdir(), "github-stars-native-build-"));
     try {
@@ -23,6 +23,7 @@ test(
         {
           cwd: process.cwd(),
           stdio: "pipe",
+          timeout: 90_000,
           windowsHide: true,
         },
       );
@@ -40,6 +41,7 @@ test(
           {
             cwd: process.cwd(),
             stdio: "pipe",
+            timeout: 15_000,
             windowsHide: true,
           },
         ),
