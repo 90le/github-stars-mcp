@@ -41,6 +41,7 @@ const FINISH_2 = "2026-07-16T02:04:00.000Z";
 const OBSERVED_1 = "2026-07-16T02:05:00.000Z";
 const OBSERVED_1B = "2026-07-16T02:05:30.000Z";
 const OBSERVED_2 = "2026-07-16T02:06:00.000Z";
+const OBSERVED_3 = "2026-07-16T02:07:00.000Z";
 
 const retryableError = Object.freeze({
   code: "GITHUB_UNAVAILABLE" as const,
@@ -872,8 +873,16 @@ describe("PlanRunRepository operation and audit lifecycle", () => {
       "failed",
     );
     expect(
-      errorCode(() => context.repository.reconcileRunOperation(confirmed)),
-    ).toBe("PRECONDITION_FAILED");
+      context.repository.reconcileRunOperation({
+        ...confirmed,
+        observedAt: OBSERVED_3,
+      }),
+    ).toMatchObject({
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      attempts: 2,
+      finishedAt: OBSERVED_3,
+    });
     expect(
       context.repository.getRunOperationAttempt({
         runId: changeRunFixture.id,
@@ -890,7 +899,7 @@ describe("PlanRunRepository operation and audit lifecycle", () => {
           pageSize: 10,
         })
         .items.map(({ eventSequence }) => eventSequence),
-    ).toEqual([1, 2, 3]);
+    ).toEqual([1, 2, 3, 4]);
     expect(
       errorCode(() =>
         context.repository.retryRunOperation({

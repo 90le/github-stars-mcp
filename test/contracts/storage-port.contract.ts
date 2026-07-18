@@ -2458,6 +2458,23 @@ export function defineStoragePortContract(
           marker: "[REDACTED]",
         });
         expect(
+          store.reconcileRunOperation({
+            runId: prepared.run.id,
+            operationId: prepared.operation.operationId,
+            status: "failed",
+            reconciliation: "confirmed_not_applied",
+            after: { starred: true, marker: "[REDACTED]" },
+            error: RETRYABLE_ERROR,
+            observedAt: "2026-07-16T02:09:00.000Z",
+            lease: prepared.lease,
+          }),
+        ).toMatchObject({
+          status: "failed",
+          reconciliation: "confirmed_not_applied",
+          attempts: 2,
+          finishedAt: "2026-07-16T02:09:00.000Z",
+        });
+        expect(
           errorCode(() =>
             store.retryRunOperation({
               runId: prepared.run.id,
@@ -2509,7 +2526,7 @@ export function defineStoragePortContract(
           afterEventSequence: null,
           pageSize: 2,
         });
-        expect(events.total).toBe(3);
+        expect(events.total).toBe(4);
         expect(events.nextEventSequence).toBe(2);
         expect(events.items.map(({ eventSequence }) => eventSequence)).toEqual([
           1, 2,
@@ -2524,9 +2541,9 @@ export function defineStoragePortContract(
           pageSize: 2,
         });
         expect(finalEvents).toMatchObject({
-          total: 3,
+          total: 4,
           nextEventSequence: null,
-          items: [{ eventSequence: 3 }],
+          items: [{ eventSequence: 3 }, { eventSequence: 4 }],
         });
         expect(Object.isFrozen(finalEvents)).toBe(true);
         expect(Object.isFrozen(finalEvents.items)).toBe(true);
@@ -2568,7 +2585,7 @@ export function defineStoragePortContract(
             store.listRunOperationReconciliationsPage({
               runId: prepared.run.id,
               operationId: prepared.operation.operationId,
-              afterEventSequence: 4,
+              afterEventSequence: 5,
               pageSize: 1,
             }),
           ),

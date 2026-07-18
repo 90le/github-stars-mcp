@@ -28,8 +28,15 @@ BEGIN
         (
           ro.status='failed'
           AND ro.reconciliation='confirmed_not_applied'
-          AND a.status='failed'
-          AND a.reconciliation='confirmed_not_applied'
+          AND CASE WHEN json_valid(ro.error_json)=1 THEN COALESCE(
+            json_type(ro.error_json)='object'
+            AND json_type(ro.error_json,'$.retryable')='true',0
+          ) ELSE 0 END
+          AND (
+            (a.status='unresolved' AND a.reconciliation='unknown')
+            OR
+            (a.status='failed' AND a.reconciliation='confirmed_not_applied')
+          )
         )
       )
   ) THEN RAISE(ABORT,'reconciliation requires current reconcilable attempt') END;

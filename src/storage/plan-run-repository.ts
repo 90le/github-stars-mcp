@@ -1809,11 +1809,13 @@ export class PlanRunRepository {
         unresolved &&
         attempt.status === "unresolved" &&
         attempt.reconciliation === "unknown";
-      const matchingFailedAttempt =
+      const matchingRetryableFailedAttempt =
         retryableFailed &&
-        attempt.status === "failed" &&
-        attempt.reconciliation === "confirmed_not_applied";
-      if (!matchingUnresolvedAttempt && !matchingFailedAttempt) {
+        ((attempt.status === "unresolved" &&
+          attempt.reconciliation === "unknown") ||
+          (attempt.status === "failed" &&
+            attempt.reconciliation === "confirmed_not_applied"));
+      if (!matchingUnresolvedAttempt && !matchingRetryableFailedAttempt) {
         throw new AppError(
           "PRECONDITION_FAILED",
           "current reconcilable attempt was not found",

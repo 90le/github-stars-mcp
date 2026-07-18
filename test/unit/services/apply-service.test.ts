@@ -1183,7 +1183,7 @@ describe("ApplyService durable orchestration", () => {
     expect(fixture.github.mutationCalls).toHaveLength(2);
   });
 
-  it("ignores malformed persisted rate hints and cancels a valid retry wait before queueing", async () => {
+  it("ignores malformed persisted rate hints and resumes after cancellation before retry queueing", async () => {
     const malformed = await applyFixture();
     malformed.github.failNextMutation(
       new AppError("SECONDARY_RATE_LIMITED", "secondary rate limit", {
@@ -1240,9 +1240,43 @@ describe("ApplyService durable orchestration", () => {
       reconciliation: "confirmed_not_applied",
       attempts: 1,
     });
+
+    cancelled.runtime.onWait = null;
+    const restarted = await cancelled
+      .createService("restart-after-cancelled-rate-wait")
+      .apply(cancelled.input);
+    const restartedRow = cancelled.rawStorage.listRunOperations(
+      restarted.run.id,
+    )[0]!;
+    expect(restarted.run.id).toBe(first.run.id);
+    expect(restarted.run.state).toBe("completed");
+    expect(cancelled.github.mutationCalls).toHaveLength(2);
+    expect(restartedRow).toMatchObject({
+      status: "succeeded",
+      reconciliation: "not_required",
+      attempts: 2,
+    });
+    expect(
+      cancelled.rawStorage.getRunOperationAttempt({
+        runId: restarted.run.id,
+        operationId: restartedRow.operationId,
+        attempt: 1,
+      }),
+    ).toMatchObject({
+      status: "unresolved",
+      reconciliation: "unknown",
+    });
+    expect(
+      cancelled.rawStorage.listRunOperationReconciliationsPage({
+        runId: restarted.run.id,
+        operationId: restartedRow.operationId,
+        afterEventSequence: null,
+        pageSize: 10,
+      }).total,
+    ).toBe(2);
   });
 
-  it("reconciles at the attempt ceiling but never queues a fourth dispatch", async () => {
+  it("repeatedly reconciles at the attempt ceiling but never queues another dispatch", async () => {
     const fixture = await applyFixture();
     fixture.github.failEveryMutation(
       new AppError("GITHUB_UNAVAILABLE", "ambiguous transport failure", {
@@ -1261,14 +1295,33 @@ describe("ApplyService durable orchestration", () => {
     const fourth = await fixture
       .createService("attempt-ceiling")
       .apply(fixture.input);
-    const row = fixture.rawStorage.listRunOperations(fourth.run.id)[0]!;
+    const fifth = await fixture
+      .createService("attempt-ceiling-repeat-1")
+      .apply(fixture.input);
+    const sixth = await fixture
+      .createService("attempt-ceiling-repeat-2")
+      .apply(fixture.input);
+    const row = fixture.rawStorage.listRunOperations(sixth.run.id)[0]!;
 
-    expect([second.run.id, third.run.id, fourth.run.id]).toEqual([
+    expect([
+      second.run.id,
+      third.run.id,
+      fourth.run.id,
+      fifth.run.id,
+      sixth.run.id,
+    ]).toEqual([
+      first.run.id,
+      first.run.id,
       first.run.id,
       first.run.id,
       first.run.id,
     ]);
     expect(fixture.github.mutationCalls).toHaveLength(3);
+    expect([fourth.run.state, fifth.run.state, sixth.run.state]).toEqual([
+      "partial",
+      "partial",
+      "partial",
+    ]);
     expect(row).toMatchObject({
       status: "failed",
       reconciliation: "confirmed_not_applied",
@@ -1280,12 +1333,12 @@ describe("ApplyService durable orchestration", () => {
     });
     expect(
       fixture.rawStorage.listRunOperationReconciliationsPage({
-        runId: fourth.run.id,
+        runId: sixth.run.id,
         operationId: row.operationId,
         afterEventSequence: null,
         pageSize: 10,
       }).total,
-    ).toBe(3);
+    ).toBe(5);
   });
 
   it("keeps an unresolved row partial when live reconciliation is unavailable", async () => {

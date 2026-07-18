@@ -584,4 +584,148 @@ describe("run attempt and reconciliation triggers", () => {
     ).toThrow(/append-only/u);
     database.close();
   });
+
+  test("reconciles a retryable failed projection against its preserved ambiguous attempt only", () => {
+    const database = migrated();
+    insertPlanRunGraph(database);
+    database
+      .prepare(
+        `UPDATE run_operations SET
+           status='running',reconciliation='pending',attempts=1,started_at=?
+         WHERE run_id='run_1' AND operation_id='op_1'`,
+      )
+      .run(time);
+    database
+      .prepare(
+        `INSERT INTO run_operation_attempts(
+           run_id,operation_id,attempt,status,reconciliation,before_json,
+           after_json,external_request_id,error_json,started_at,finished_at
+         ) VALUES (
+           'run_1','op_1',1,'running','pending','{}','null',
+           NULL,NULL,?,NULL
+         )`,
+      )
+      .run(time);
+    const ambiguousError = JSON.stringify({
+      code: "RECONCILIATION_REQUIRED",
+      message: "ambiguous",
+      retryable: false,
+      details: {},
+    });
+    const retryableError = JSON.stringify({
+      code: "RECONCILIATION_REQUIRED",
+      message: "confirmed not applied",
+      retryable: true,
+      details: {},
+    });
+    database
+      .prepare(
+        `UPDATE run_operation_attempts SET
+           status='unresolved',reconciliation='unknown',after_json='null',
+           error_json=?,finished_at=?
+         WHERE run_id='run_1' AND operation_id='op_1' AND attempt=1`,
+      )
+      .run(ambiguousError, later);
+    database
+      .prepare(
+        `UPDATE run_operations SET
+           status='unresolved',reconciliation='unknown',after_json='null',
+           error_json=?,finished_at=?
+         WHERE run_id='run_1' AND operation_id='op_1'`,
+      )
+      .run(ambiguousError, later);
+
+    const insertEvent = database.prepare(
+      `INSERT INTO run_operation_reconciliations(
+         run_id,operation_id,attempt,event_sequence,status,reconciliation,
+         after_json,error_json,observed_at
+       ) VALUES (
+         'run_1','op_1',1,@eventSequence,'failed','confirmed_not_applied',
+         '{}',@error,@observedAt
+       )`,
+    );
+    database.exec("BEGIN");
+    insertEvent.run({
+      eventSequence: 1,
+      error: retryableError,
+      observedAt: "2026-07-16T00:02:00.000Z",
+    });
+    database
+      .prepare(
+        `UPDATE run_operations SET
+           status='failed',reconciliation='confirmed_not_applied',
+           after_json='{}',error_json=?,finished_at=?
+         WHERE run_id='run_1' AND operation_id='op_1'`,
+      )
+      .run(retryableError, "2026-07-16T00:02:00.000Z");
+    database.exec("COMMIT");
+
+    expect(() =>
+      insertEvent.run({
+        eventSequence: 2,
+        error: retryableError,
+        observedAt: "2026-07-16T00:03:00.000Z",
+      }),
+    ).not.toThrow();
+    expect(
+      database
+        .prepare(
+          `SELECT status,reconciliation FROM run_operation_attempts
+           WHERE run_id='run_1' AND operation_id='op_1' AND attempt=1`,
+        )
+        .get(),
+    ).toEqual({ status: "unresolved", reconciliation: "unknown" });
+    database.close();
+
+    const nonretryable = migrated();
+    insertPlanRunGraph(nonretryable);
+    nonretryable
+      .prepare(
+        `UPDATE run_operations SET
+           status='running',reconciliation='pending',attempts=1,started_at=?
+         WHERE run_id='run_1' AND operation_id='op_1'`,
+      )
+      .run(time);
+    nonretryable
+      .prepare(
+        `INSERT INTO run_operation_attempts(
+           run_id,operation_id,attempt,status,reconciliation,before_json,
+           after_json,external_request_id,error_json,started_at,finished_at
+         ) VALUES (
+           'run_1','op_1',1,'running','pending','{}','null',
+           NULL,NULL,?,NULL
+         )`,
+      )
+      .run(time);
+    nonretryable
+      .prepare(
+        `UPDATE run_operation_attempts SET
+           status='failed',reconciliation='confirmed_not_applied',
+           after_json='{}',error_json=?,finished_at=?
+         WHERE run_id='run_1' AND operation_id='op_1' AND attempt=1`,
+      )
+      .run(ambiguousError, later);
+    nonretryable
+      .prepare(
+        `UPDATE run_operations SET
+           status='failed',reconciliation='confirmed_not_applied',
+           after_json='{}',error_json=?,finished_at=?
+         WHERE run_id='run_1' AND operation_id='op_1'`,
+      )
+      .run(ambiguousError, later);
+    expect(() =>
+      nonretryable
+        .prepare(
+          `INSERT INTO run_operation_reconciliations(
+             run_id,operation_id,attempt,event_sequence,status,reconciliation,
+             after_json,error_json,observed_at
+           ) VALUES (
+             'run_1','op_1',1,1,'failed','confirmed_not_applied',
+             '{}',?,?
+           )`,
+        )
+        .run(retryableError, "2026-07-16T00:02:00.000Z"),
+    ).toThrow(/current reconcilable attempt/u);
+    nonretryable.close();
+  });
 });

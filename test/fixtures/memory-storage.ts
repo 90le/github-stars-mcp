@@ -2973,8 +2973,10 @@ export function createMemoryStorage(
         attempt?.status === "unresolved" &&
         attempt.reconciliation === "unknown") ||
       (retryableFailed &&
-        attempt?.status === "failed" &&
-        attempt.reconciliation === "confirmed_not_applied");
+        ((attempt?.status === "unresolved" &&
+          attempt.reconciliation === "unknown") ||
+          (attempt?.status === "failed" &&
+            attempt.reconciliation === "confirmed_not_applied")));
     if (!matchingAttempt) {
       return failure(
         "PRECONDITION_FAILED",
@@ -2987,7 +2989,8 @@ export function createMemoryStorage(
     );
     if (
       observedAt < guard.now ||
-      (operation.finishedAt !== null && observedAt < operation.finishedAt)
+      (operation.finishedAt !== null && observedAt < operation.finishedAt) ||
+      (attempt.finishedAt !== null && observedAt < attempt.finishedAt)
     ) {
       return failure(
         "PRECONDITION_FAILED",
