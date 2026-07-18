@@ -7,7 +7,12 @@ import type {
   StorageTransaction,
 } from "../../../src/app/ports/storage-port.js";
 import { AppError } from "../../../src/domain/errors.js";
-import { asSnapshotId, asUserListId } from "../../../src/domain/ids.js";
+import {
+  asRepositoryDatabaseId,
+  asRepositoryId,
+  asSnapshotId,
+  asUserListId,
+} from "../../../src/domain/ids.js";
 import { parseSnapshotBatch } from "../../../src/domain/snapshot.js";
 import {
   migrateSqliteDatabase,
@@ -24,6 +29,7 @@ import {
   changePlanFixture,
   changeRunFixture,
   pendingOperationFixture,
+  repositoryInputFixture,
   snapshotBatchFixture,
   snapshotDraftFixture,
 } from "../../fixtures/domain.js";
@@ -582,6 +588,38 @@ describe("SQLiteStore migration lifecycle", () => {
       store.recoverIncompleteSnapshots("2026-07-16T00:03:00.000Z"),
     ).toEqual([asSnapshotId("snap_unrecovered")]);
     store.close();
+  });
+});
+
+describe("discovery candidates", () => {
+  test("persists candidate metadata without changing Star snapshot counts", () => {
+    const store = readyStore();
+    const snapshot = seedCompleteSnapshot(store);
+    store.saveDiscoveredCandidate({
+      binding: accountBindingFixture,
+      repository: {
+        ...repositoryInputFixture,
+        repositoryId: asRepositoryId("R_candidate"),
+        repositoryDatabaseId: asRepositoryDatabaseId("4242"),
+        fullName: "OpenAI/Candidate",
+        name: "Candidate",
+      },
+      query: "agent",
+      discoveredAt: "2026-07-17T00:00:00.000Z",
+    });
+
+    expect(
+      store.getRepositoryMetadata(asRepositoryId("R_candidate"))?.repository
+        .fullName,
+    ).toBe("OpenAI/Candidate");
+    expect(
+      store.queryDiscoveryCandidates({
+        binding: accountBindingFixture,
+        pageSize: 10,
+        cursor: null,
+      }),
+    ).toMatchObject({ total: 1, nextCursor: null });
+    expect(store.getCompleteSnapshot(snapshot.id)?.counts.stars).toBe(1);
   });
 });
 

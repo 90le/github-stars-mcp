@@ -35,14 +35,14 @@ describe("generated MCP tool reference", () => {
     }
     expect(
       [...committed.matchAll(/^## `github_[a-z_]+`$/gmu)],
-    ).toHaveLength(9);
+    ).toHaveLength(10);
   });
 
   it("documents strict input, output, and safety metadata for every tool", async () => {
     const committed = await readFile("docs/tool-reference.md", "utf8");
-    expect(committed.match(/### Input schema/gu)).toHaveLength(9);
-    expect(committed.match(/### Output schema/gu)).toHaveLength(9);
-    expect(committed.match(/### Annotations/gu)).toHaveLength(9);
+    expect(committed.match(/### Input schema/gu)).toHaveLength(10);
+    expect(committed.match(/### Output schema/gu)).toHaveLength(10);
+    expect(committed.match(/### Annotations/gu)).toHaveLength(10);
     expect(committed).toContain('"additionalProperties": false');
     expect(committed).toContain('"taskSupport": "forbidden"');
   });

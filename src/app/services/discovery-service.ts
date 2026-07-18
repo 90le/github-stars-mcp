@@ -3,7 +3,10 @@ import type {
   GitHubSearchPage,
   RateLimitState,
 } from "../ports/github-port.js";
-import type { StoragePort } from "../ports/storage-port.js";
+import type {
+  DiscoveryCandidateStorage,
+  StoragePort,
+} from "../ports/storage-port.js";
 import { canonicalJsonClone } from "../../domain/canonical-json.js";
 import { AppError } from "../../domain/errors.js";
 import type { JsonValue } from "../../domain/json.js";
@@ -20,7 +23,8 @@ import { copyQueryBinding, type EvidenceReader } from "./query-service.js";
 export type DiscoveryStoragePort = Pick<
   StoragePort,
   "getLatestCompleteSnapshot" | "hasStar"
->;
+> &
+  Pick<DiscoveryCandidateStorage, "saveDiscoveredCandidate">;
 
 export type DiscoveryQualifiers = Readonly<{
   language?: string;
@@ -615,6 +619,14 @@ export class DiscoveryService {
         }),
       ),
     );
+    for (const repository of remote.items) {
+      this.#storage.saveDiscoveredCandidate({
+        binding: this.#binding,
+        repository,
+        query: parsed.query,
+        discoveredAt: new Date().toISOString(),
+      });
+    }
     const evidence =
       parsed.evidence === "none"
         ? EMPTY_EVIDENCE

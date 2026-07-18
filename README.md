@@ -15,31 +15,32 @@ It gives Codex, Claude, Cursor, and other MCP hosts a bounded tool surface over 
 
 - Syncs a complete, auditable snapshot of Stars and User Lists.
 - Searches and filters repositories by stars, language, license, activity, archive state, fork status, and more.
-- Discovers new repositories without starring them automatically.
+- Discovers new repositories, persists candidates locally, and feeds them into reviewable plans without starring them automatically.
 - Creates, updates, deletes, and populates GitHub User Lists.
 - Stars or unstars repositories through an explicit, hash-bound change plan.
 - Records runs, attempts, failures, remote readbacks, and compensating rollback plans.
 
-## The nine MCP tools
+## The ten MCP tools
 
-| Tool                           | Purpose                                                    | GitHub mutation |
-| ------------------------------ | ---------------------------------------------------------- | --------------- |
-| `github_stars_status`          | Identity, capabilities, local state, and rate limits       | No              |
-| `github_stars_sync`            | Publish a complete Stars/Lists snapshot                    | No              |
-| `github_stars_query`           | Filter, sort, aggregate, and page Stars                    | No              |
-| `github_lists_query`           | Read List metadata and memberships                         | No              |
-| `github_repositories_discover` | Find bounded repository candidates and evidence            | No              |
-| `github_changes_plan`          | Resolve requested changes into an immutable plan           | No              |
-| `github_changes_inspect`       | Inspect plans, runs, attempts, and reconciliation          | No              |
-| `github_changes_apply`         | Apply one inspected and authorized plan                    | Yes             |
-| `github_changes_rollback`      | Create a compensating plan from a completed or partial run | No              |
+| Tool                             | Purpose                                                    | GitHub mutation |
+| -------------------------------- | ---------------------------------------------------------- | --------------- |
+| `github_stars_status`            | Identity, capabilities, local state, and rate limits       | No              |
+| `github_stars_sync`              | Publish a complete Stars/Lists snapshot                    | No              |
+| `github_stars_query`             | Filter, sort, aggregate, and page Stars                    | No              |
+| `github_lists_query`             | Read List metadata and memberships                         | No              |
+| `github_repositories_discover`   | Find bounded repository candidates and evidence            | No              |
+| `github_repositories_candidates` | Query persisted discovery candidates for planning          | No              |
+| `github_changes_plan`            | Resolve requested changes into an immutable plan           | No              |
+| `github_changes_inspect`         | Inspect plans, runs, attempts, and reconciliation          | No              |
+| `github_changes_apply`           | Apply one inspected and authorized plan                    | Yes             |
+| `github_changes_rollback`        | Create a compensating plan from a completed or partial run | No              |
 
 ## Safe by design
 
 Mutation follows one path:
 
 ```text
-sync → plan → inspect → authorize → apply → audit
+discover → candidates → plan → inspect → authorize → apply → audit
 ```
 
 The server defaults to read-only mode. Every write plan has a stable ID and SHA-256 hash, protected repository/List IDs, expiry, preconditions, bounded operation count, ordered dependencies, and resumable audit records. Ambiguous writes are read back from GitHub before any retry.
@@ -100,7 +101,7 @@ An agent can safely handle a cleanup request such as “find repositories with f
 5. Calling `github_changes_apply` only after explicit authorization.
 6. Calling `github_changes_inspect` again to report results or generate rollback.
 
-Discovery never stars a result by itself. A discovered repository becomes a Star only through the same plan and authorization flow.
+Discovery persists candidates locally but never stars a result by itself. Agents can query `github_repositories_candidates`, resolve those stable repository IDs in `github_changes_plan`, and then use the same inspect/authorize/apply flow.
 
 The public change contract uses `operations`, stable repository IDs, and an exact plan hash:
 

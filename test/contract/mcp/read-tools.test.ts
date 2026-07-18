@@ -24,6 +24,7 @@ const READ_TOOL_NAMES = [
   "github_stars_query",
   "github_lists_query",
   "github_repositories_discover",
+  "github_repositories_candidates",
 ] as const;
 
 async function connectReadServer() {
@@ -64,7 +65,7 @@ function expectShortSummary(result: CallToolResult) {
 }
 
 describe("read-side MCP registration", () => {
-  it("advertises and calls exactly five typed read/local-write tools", async () => {
+  it("advertises and calls exactly six typed read/local-write tools", async () => {
     const { client, server, services } = await connectReadServer();
     try {
       const listed = await client.listTools();
@@ -105,6 +106,12 @@ describe("read-side MCP registration", () => {
           idempotentHint: true,
           openWorldHint: true,
         },
+        {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
       ]);
 
       const calls = [
@@ -122,6 +129,10 @@ describe("read-side MCP registration", () => {
             evidence: "readme",
             evidence_limit: 1,
           },
+        },
+        {
+          name: "github_repositories_candidates",
+          arguments: {},
         },
       ] as const;
       for (const call of calls) {

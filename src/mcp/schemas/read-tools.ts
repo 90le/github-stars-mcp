@@ -214,8 +214,20 @@ export const DiscoverInputSchema = z
     }
   });
 
+export const CandidatesQueryInputSchema = z
+  .object({
+    state: z
+      .enum(["discovered", "selected", "dismissed", "starred"])
+      .optional(),
+    query: SearchQuerySchema.optional(),
+    limit: PageSizeSchema,
+    cursor: CursorSchema.optional(),
+  })
+  .strict();
+
 export type StatusInput = z.infer<typeof StatusInputSchema>;
 export type SyncInput = z.infer<typeof SyncInputSchema>;
 export type StarsQueryInput = z.infer<typeof StarsQueryInputSchema>;
 export type ListsQueryInput = z.infer<typeof ListsQueryInputSchema>;
 export type DiscoverInput = z.infer<typeof DiscoverInputSchema>;
+export type CandidatesQueryInput = z.infer<typeof CandidatesQueryInputSchema>;

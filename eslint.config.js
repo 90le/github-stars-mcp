@@ -3,7 +3,13 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["coverage/**", "dist/**", "node_modules/**", "scripts/*.d.mts"],
+    ignores: [
+      "coverage/**",
+      "dist/**",
+      "node_modules/**",
+      ".worktrees/**",
+      "scripts/*.d.mts",
+    ],
   },
   js.configs.recommended,
   ...tseslint.configs.recommendedTypeChecked,

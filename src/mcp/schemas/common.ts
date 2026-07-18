@@ -12,6 +12,7 @@ export const ToolNames = [
   "github_changes_apply",
   "github_changes_rollback",
   "github_repositories_discover",
+  "github_repositories_candidates",
 ] as const;
 
 export type ToolName = (typeof ToolNames)[number];

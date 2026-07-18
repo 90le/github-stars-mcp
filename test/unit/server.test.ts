@@ -40,6 +40,7 @@ describe("createServices", () => {
     expect(Object.keys(services).sort()).toEqual(
       [
         "apply",
+        "candidates",
         "clock",
         "discover",
         "inspect",

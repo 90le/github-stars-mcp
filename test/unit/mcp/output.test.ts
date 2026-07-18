@@ -26,6 +26,7 @@ import {
   normalizeOutputWarnings,
   toApplyOutput,
   toDiscoveryOutput,
+  toCandidatesOutput,
   toInspectOutput,
   toListsQueryOutput,
   toPlanOutput,
@@ -181,7 +182,7 @@ function envelope(data: unknown, options?: Readonly<Record<string, unknown>>) {
 }
 
 describe("MCP output schemas", () => {
-  it("publishes strict root-object contracts for exactly nine tools", () => {
+  it("publishes strict root-object contracts for exactly ten tools", () => {
     expect(ToolNames).toEqual([
       "github_stars_status",
       "github_stars_sync",
@@ -192,6 +193,7 @@ describe("MCP output schemas", () => {
       "github_changes_apply",
       "github_changes_rollback",
       "github_repositories_discover",
+      "github_repositories_candidates",
     ]);
     expect(Object.keys(ToolOutputSchemas).sort()).toEqual(
       [...ToolNames].sort(),
@@ -1741,6 +1743,11 @@ describe("output boundary rejection", () => {
       github_changes_apply: apply,
       github_changes_rollback: rollback,
       github_repositories_discover: discovery,
+      github_repositories_candidates: toCandidatesOutput({
+        items: [],
+        total: 0,
+        nextCursor: null,
+      }),
     } as const;
 
     for (const name of ToolNames) {

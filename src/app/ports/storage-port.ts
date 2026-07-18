@@ -317,7 +317,8 @@ export interface StorageTransaction {
   }): void;
 }
 
-export interface StoragePort extends StorageTransaction {
+export interface StoragePort
+  extends StorageTransaction, DiscoveryCandidateStorage {
   migrate(): void;
   getSchemaVersion(): number;
   withTransaction<T>(fn: (tx: StorageTransaction) => T): T;
@@ -332,6 +333,36 @@ export interface StoragePort extends StorageTransaction {
   recoverIncompleteSnapshots(now: string): readonly SnapshotId[];
   recoverInterruptedRuns(now: string): readonly RunId[];
   close(): void;
+}
+
+export interface DiscoveryCandidateInput {
+  readonly binding: AccountBinding;
+  readonly repository: import("../../domain/repository.js").Repository;
+  readonly query: string;
+  readonly discoveredAt: string;
+}
+
+export interface DiscoveryCandidatePage {
+  readonly items: readonly {
+    readonly repository: import("../../domain/repository.js").Repository;
+    readonly query: string;
+    readonly state: "discovered" | "selected" | "dismissed" | "starred";
+    readonly firstDiscoveredAt: string;
+    readonly lastDiscoveredAt: string;
+  }[];
+  readonly total: number;
+  readonly nextCursor: string | null;
+}
+
+export interface DiscoveryCandidateStorage {
+  saveDiscoveredCandidate(input: DiscoveryCandidateInput): void;
+  queryDiscoveryCandidates(input: {
+    readonly binding: AccountBinding;
+    readonly state?: "discovered" | "selected" | "dismissed" | "starred";
+    readonly query?: string;
+    readonly pageSize: number;
+    readonly cursor: string | null;
+  }): DiscoveryCandidatePage;
 }
 
 export type {

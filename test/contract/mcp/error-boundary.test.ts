@@ -28,6 +28,7 @@ const TOOL_TITLES = {
   github_changes_apply: "Apply GitHub Changes",
   github_changes_rollback: "Create GitHub Rollback Plan",
   github_repositories_discover: "Discover GitHub Repositories",
+  github_repositories_candidates: "Query Discovered GitHub Candidates",
 } as const satisfies Record<ToolName, string>;
 
 const VALID_CALLS = [
@@ -55,6 +56,7 @@ const VALID_CALLS = [
     name: "github_repositories_discover",
     arguments: { query: "model context protocol" },
   },
+  { name: "github_repositories_candidates", arguments: {} },
 ] as const satisfies readonly CallToolRequest["params"][];
 
 type ConnectedServer = Readonly<{
@@ -127,6 +129,11 @@ function rejectNext(
       return;
     case "github_repositories_discover":
       vi.mocked(services.discover.discover).mockRejectedValueOnce(error);
+      return;
+    case "github_repositories_candidates":
+      vi.mocked(services.candidates.query).mockImplementationOnce(() => {
+        throw error;
+      });
       return;
   }
 }

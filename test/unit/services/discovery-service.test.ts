@@ -133,13 +133,16 @@ function storage(
   const hasStar = vi.fn((_snapshotId: SnapshotId, repositoryId: RepositoryId) =>
     (options.starred ?? []).includes(repositoryId),
   );
+  const saveDiscoveredCandidate = vi.fn();
   return {
     port: {
       getLatestCompleteSnapshot,
       hasStar,
+      saveDiscoveredCandidate,
     } as DiscoveryStoragePort,
     getLatestCompleteSnapshot,
     hasStar,
+    saveDiscoveredCandidate,
   };
 }
 
@@ -292,6 +295,26 @@ describe("Search query grammar", () => {
 });
 
 describe("DiscoveryService", () => {
+  it("persists every discovered repository for later planning", async () => {
+    const remote = github();
+    const local = storage();
+    const service = new DiscoveryService(
+      remote.port,
+      local.port,
+      binding,
+      evidence().port,
+    );
+
+    await service.discover(baseInput());
+
+    expect(local.saveDiscoveredCandidate).toHaveBeenCalledTimes(2);
+    expect(local.saveDiscoveredCandidate.mock.calls[0]?.[0]).toMatchObject({
+      binding,
+      repository: repository("1"),
+      query: "mcp",
+    });
+  });
+
   it("searches once, marks current Stars, preserves cap flags, and freezes output", async () => {
     const remote = github();
     const local = storage({ starred: ["R_2"] });

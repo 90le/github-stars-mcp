@@ -45,11 +45,13 @@ import type {
 } from "./schemas/common.js";
 import type {
   DiscoverInput,
+  CandidatesQueryInput,
   ListsQueryInput,
   StarsQueryInput,
   StatusInput,
   SyncInput,
 } from "./schemas/read-tools.js";
+import type { CandidateQueryInput } from "../app/services/candidate-query-service.js";
 
 function requestClock(clock: Pick<Clock, "now">): Pick<Clock, "now"> {
   let read = false;
@@ -326,6 +328,17 @@ export function toDiscoverInput(input: DiscoverInput): DiscoveryServiceInput {
     cursor: input.cursor ?? null,
     evidence: input.evidence,
     evidenceLimit: input.evidence_limit,
+  };
+}
+
+export function toCandidatesQueryInput(
+  input: CandidatesQueryInput,
+): CandidateQueryInput {
+  return {
+    state: input.state ?? null,
+    query: input.query ?? null,
+    limit: input.limit,
+    cursor: input.cursor ?? null,
   };
 }
 

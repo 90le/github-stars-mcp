@@ -5148,6 +5148,442 @@ Read Lists or List memberships from the selected local snapshot. This tool perfo
 }
 ```
 
+## `github_repositories_candidates`
+
+**Query Discovered GitHub Candidates**
+
+Read locally persisted repository discovery candidates for the authenticated account.
+
+### Annotations
+
+- `destructiveHint`: `false`
+- `idempotentHint`: `true`
+- `openWorldHint`: `false`
+- `readOnlyHint`: `true`
+
+### Execution
+
+```json
+{
+  "taskSupport": "forbidden"
+}
+```
+
+### Input schema
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "properties": {
+    "cursor": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "limit": {
+      "default": 50,
+      "maximum": 100,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "query": {
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "state": {
+      "enum": [
+        "discovered",
+        "selected",
+        "dismissed",
+        "starred"
+      ],
+      "type": "string"
+    }
+  },
+  "type": "object"
+}
+```
+
+### Output schema
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "anyOf": [
+    {
+      "additionalProperties": false,
+      "properties": {
+        "data": {
+          "additionalProperties": false,
+          "properties": {
+            "items": {
+              "items": {
+                "additionalProperties": false,
+                "properties": {
+                  "first_discovered_at": {
+                    "type": "string"
+                  },
+                  "last_discovered_at": {
+                    "type": "string"
+                  },
+                  "query": {
+                    "type": "string"
+                  },
+                  "repository": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "archived": {
+                        "type": "boolean"
+                      },
+                      "description": {
+                        "anyOf": [
+                          {
+                            "maxLength": 8192,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "disabled": {
+                        "type": "boolean"
+                      },
+                      "fork": {
+                        "type": "boolean"
+                      },
+                      "is_private": {
+                        "type": "boolean"
+                      },
+                      "language": {
+                        "anyOf": [
+                          {
+                            "maxLength": 100,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "license": {
+                        "anyOf": [
+                          {
+                            "maxLength": 100,
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "name": {
+                        "maxLength": 100,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "name_with_owner": {
+                        "maxLength": 201,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "owner": {
+                        "maxLength": 100,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "pushed_at": {
+                        "anyOf": [
+                          {
+                            "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "repository_database_id": {
+                        "pattern": "^(?:0|[1-9]\\d*)$",
+                        "type": "string"
+                      },
+                      "repository_id": {
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "stargazers_count": {
+                        "maximum": 9007199254740991,
+                        "minimum": -9007199254740991,
+                        "type": "integer"
+                      },
+                      "topics": {
+                        "items": {
+                          "maxLength": 100,
+                          "type": "string"
+                        },
+                        "maxItems": 100,
+                        "type": "array"
+                      },
+                      "updated_at": {
+                        "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                        "type": "string"
+                      },
+                      "url": {
+                        "format": "uri",
+                        "maxLength": 2048,
+                        "type": "string"
+                      },
+                      "visibility": {
+                        "enum": [
+                          "public",
+                          "private",
+                          "internal"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "repository_id",
+                      "repository_database_id",
+                      "owner",
+                      "name",
+                      "name_with_owner",
+                      "description",
+                      "url",
+                      "stargazers_count",
+                      "fork",
+                      "archived",
+                      "disabled",
+                      "is_private",
+                      "visibility",
+                      "language",
+                      "topics",
+                      "license",
+                      "pushed_at",
+                      "updated_at"
+                    ],
+                    "type": "object"
+                  },
+                  "state": {
+                    "enum": [
+                      "discovered",
+                      "selected",
+                      "dismissed",
+                      "starred"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "repository",
+                  "query",
+                  "state",
+                  "first_discovered_at",
+                  "last_discovered_at"
+                ],
+                "type": "object"
+              },
+              "maxItems": 100,
+              "type": "array"
+            },
+            "total": {
+              "maximum": 9007199254740991,
+              "minimum": -9007199254740991,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "items",
+            "total"
+          ],
+          "type": "object"
+        },
+        "next_cursor": {
+          "anyOf": [
+            {
+              "description": "Opaque cursor limited to 4096 UTF-8 bytes at runtime",
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ok": {
+          "const": true,
+          "type": "boolean"
+        },
+        "rate_limit": {
+          "anyOf": [
+            {
+              "additionalProperties": false,
+              "properties": {
+                "remaining": {
+                  "maximum": 9007199254740991,
+                  "minimum": -9007199254740991,
+                  "type": "integer"
+                },
+                "reset_at": {
+                  "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "remaining",
+                "reset_at"
+              ],
+              "type": "object"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "request_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "maxItems": 20,
+          "type": "array"
+        }
+      },
+      "required": [
+        "schema_version",
+        "ok",
+        "request_id",
+        "warnings",
+        "rate_limit",
+        "next_cursor",
+        "data"
+      ],
+      "type": "object"
+    },
+    {
+      "additionalProperties": false,
+      "properties": {
+        "error": {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "enum": [
+                "AUTH_REQUIRED",
+                "INSUFFICIENT_PERMISSION",
+                "CAPABILITY_UNAVAILABLE",
+                "VALIDATION_ERROR",
+                "NOT_FOUND",
+                "RATE_LIMITED",
+                "SECONDARY_RATE_LIMITED",
+                "GITHUB_UNAVAILABLE",
+                "STALE_SNAPSHOT",
+                "PLAN_EXPIRED",
+                "PLAN_HASH_MISMATCH",
+                "PLAN_ACCOUNT_MISMATCH",
+                "PLAN_TOO_LARGE",
+                "PRECONDITION_FAILED",
+                "PARTIAL_FAILURE",
+                "RECONCILIATION_REQUIRED",
+                "STORAGE_ERROR",
+                "INTERNAL_ERROR"
+              ],
+              "type": "string"
+            },
+            "details": {
+              "allOf": [
+                {
+                  "$ref": "#/definitions/__schema0"
+                }
+              ]
+            },
+            "message": {
+              "maxLength": 2048,
+              "type": "string"
+            },
+            "retryable": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "code",
+            "message",
+            "retryable",
+            "details"
+          ],
+          "type": "object"
+        },
+        "ok": {
+          "const": false,
+          "type": "boolean"
+        },
+        "request_id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": "1",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "ok",
+        "request_id",
+        "error"
+      ],
+      "type": "object"
+    }
+  ],
+  "definitions": {
+    "__schema0": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        },
+        {
+          "items": {
+            "$ref": "#/definitions/__schema0"
+          },
+          "type": "array"
+        },
+        {
+          "additionalProperties": {
+            "$ref": "#/definitions/__schema0"
+          },
+          "propertyNames": {
+            "type": "string"
+          },
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "type": "object"
+}
+```
+
 ## `github_repositories_discover`
 
 **Discover GitHub Repositories**

@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import type { RateLimitState } from "../app/ports/github-port.js";
 import type { ApplyResult } from "../app/services/apply-service.js";
 import type { DiscoveryResult } from "../app/services/discovery-service.js";
+import type { DiscoveryCandidatePage } from "../app/ports/storage-port.js";
 import type { EvidenceRecord } from "../app/services/evidence-service.js";
 import type { InspectResult } from "../app/services/inspect-service.js";
 import type { ListsQueryResult } from "../app/services/lists-query-service.js";
@@ -36,6 +37,7 @@ import { parseSnapshot, type Snapshot } from "../domain/snapshot.js";
 import { canonicalUtcTimestamp } from "../domain/timestamp.js";
 import {
   ApplyOutputDataSchema,
+  CandidatesOutputDataSchema,
   DiscoveryOutputDataSchema,
   InspectOutputDataSchema,
   ListsQueryOutputDataSchema,
@@ -847,6 +849,27 @@ export function toDiscoveryOutput(input: DiscoveryResult): ToolServiceOutput {
     [],
     rateLimit(root.rateLimit),
     cursor(root.nextCursor),
+  );
+}
+
+export function toCandidatesOutput(
+  input: DiscoveryCandidatePage,
+): ToolServiceOutput {
+  return output(
+    CandidatesOutputDataSchema,
+    {
+      items: input.items.map((item) => ({
+        repository: mapRepository(item.repository),
+        query: item.query,
+        state: item.state,
+        first_discovered_at: item.firstDiscoveredAt,
+        last_discovered_at: item.lastDiscoveredAt,
+      })),
+      total: input.total,
+    },
+    [],
+    null,
+    input.nextCursor,
   );
 }
 

@@ -50,7 +50,7 @@ function stringSet(prefix: string, size: number): string[] {
 }
 
 describe("MCP common schemas", () => {
-  it("publishes the exact nine-tool allowlist", () => {
+  it("publishes the exact ten-tool allowlist", () => {
     expect(ToolNames).toEqual([
       "github_stars_status",
       "github_stars_sync",
@@ -61,6 +61,7 @@ describe("MCP common schemas", () => {
       "github_changes_apply",
       "github_changes_rollback",
       "github_repositories_discover",
+      "github_repositories_candidates",
     ]);
   });
 

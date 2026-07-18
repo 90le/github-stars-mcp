@@ -29,7 +29,7 @@ function propertyNames(
   return output;
 }
 
-it("exposes exactly nine bounded tools and no generic GitHub capability", async () => {
+it("exposes exactly ten bounded tools and no generic GitHub capability", async () => {
   const server = new McpServer({
     name: "surface-contract",
     version: "0.0.0",
@@ -49,7 +49,7 @@ it("exposes exactly nine bounded tools and no generic GitHub capability", async 
     expect(listed.tools.map((tool) => tool.name).sort()).toEqual(
       [...ToolNames].sort(),
     );
-    expect(listed.tools).toHaveLength(9);
+    expect(listed.tools).toHaveLength(10);
     for (const tool of listed.tools) {
       expect(tool.inputSchema.type).toBe("object");
       expect(tool.outputSchema?.type).toBe("object");

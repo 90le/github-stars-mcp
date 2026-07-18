@@ -1,5 +1,6 @@
 import type { Clock } from "../ports/runtime-port.js";
 import type { ApplyService } from "./apply-service.js";
+import type { CandidateQueryService } from "./candidate-query-service.js";
 import type { DiscoveryService } from "./discovery-service.js";
 import type { InspectService } from "./inspect-service.js";
 import type { ListsQueryService } from "./lists-query-service.js";
@@ -16,6 +17,7 @@ export type ServiceRegistry = Readonly<{
   query: Pick<QueryService, "query">;
   listsQuery: Pick<ListsQueryService, "query">;
   discover: Pick<DiscoveryService, "discover">;
+  candidates: Pick<CandidateQueryService, "query">;
   plan: Pick<PlanService, "create">;
   inspect: Pick<InspectService, "inspect">;
   apply: Pick<ApplyService, "apply">;

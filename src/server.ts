@@ -7,6 +7,7 @@ import {
 import type { StoragePort } from "./app/ports/storage-port.js";
 import { ApplyService } from "./app/services/apply-service.js";
 import { DiscoveryService } from "./app/services/discovery-service.js";
+import { CandidateQueryService } from "./app/services/candidate-query-service.js";
 import { EvidenceService } from "./app/services/evidence-service.js";
 import { InspectService } from "./app/services/inspect-service.js";
 import { ListsQueryService } from "./app/services/lists-query-service.js";
@@ -119,6 +120,7 @@ export async function createServices(
       session.binding,
       evidence,
     ),
+    candidates: new CandidateQueryService(storage, session.binding),
     plan: new PlanService(storage, runtime, config),
     inspect: new InspectService(storage),
     apply: new ApplyService({

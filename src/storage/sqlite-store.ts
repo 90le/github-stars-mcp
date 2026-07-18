@@ -686,6 +686,22 @@ export class SQLiteStore implements StoragePort {
     >;
   }
 
+  saveDiscoveredCandidate(
+    input: Parameters<StoragePort["saveDiscoveredCandidate"]>[0],
+  ): void {
+    this.#repositoryOperation(() =>
+      this.#snapshotRepository!.saveDiscoveredCandidate(input),
+    );
+  }
+
+  queryDiscoveryCandidates(
+    input: Parameters<StoragePort["queryDiscoveryCandidates"]>[0],
+  ): ReturnType<StoragePort["queryDiscoveryCandidates"]> {
+    return this.#repositoryOperation(() =>
+      this.#snapshotRepository!.queryDiscoveryCandidates(input),
+    );
+  }
+
   getSnapshotRepository(
     snapshotId: Parameters<StorageTransaction["getSnapshotRepository"]>[0],
     repositoryId: Parameters<StorageTransaction["getSnapshotRepository"]>[1],

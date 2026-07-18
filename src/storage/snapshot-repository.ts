@@ -1,6 +1,8 @@
 import type Database from "better-sqlite3";
 import type {
   CompleteSnapshotInput,
+  DiscoveryCandidateInput,
+  DiscoveryCandidatePage,
   FailSnapshotInput,
   LeaseGuard,
 } from "../app/ports/storage-port.js";
@@ -391,6 +393,22 @@ export class SnapshotRepository {
     snapshotId: SnapshotId,
     observation: ObservedRepositoryMetadata,
   ): void {
+    const versionHash = this.#saveRepositoryMetadata(observation);
+    this.#database
+      .prepare(
+        `INSERT INTO snapshot_repositories(
+           snapshot_id,repository_id,version_hash,observed_at
+         ) VALUES (?,?,?,?)`,
+      )
+      .run(
+        snapshotId,
+        observation.repository.repositoryId,
+        versionHash,
+        observation.observedAt,
+      );
+  }
+
+  #saveRepositoryMetadata(observation: ObservedRepositoryMetadata): string {
     const repository = observation.repository;
     const versionHash = sha256Hex(canonicalJson(repository));
     const existingIdentity = this.#database
@@ -493,18 +511,7 @@ export class SnapshotRepository {
         )
         .run(versionHash, observation.observedAt, repository.repositoryId);
     }
-    this.#database
-      .prepare(
-        `INSERT INTO snapshot_repositories(
-           snapshot_id,repository_id,version_hash,observed_at
-         ) VALUES (?,?,?,?)`,
-      )
-      .run(
-        snapshotId,
-        repository.repositoryId,
-        versionHash,
-        observation.observedAt,
-      );
+    return versionHash;
   }
 
   createSnapshot(input: {
@@ -1065,6 +1072,106 @@ export class SnapshotRepository {
       | SnapshotRow
       | undefined;
     return row === undefined ? null : snapshotFromRow(row);
+  }
+
+  saveDiscoveredCandidate(input: DiscoveryCandidateInput): void {
+    runInImmediateTransaction(this.#database, () => {
+      const binding = stableBinding(input.binding);
+      const repository = repositorySchema.parse(input.repository);
+      const discoveredAt = canonicalUtcTimestamp(
+        input.discoveredAt,
+        "candidate discoveredAt",
+      );
+      this.#saveRepositoryMetadata({
+        repository,
+        observedAt: discoveredAt,
+      });
+      this.#database
+        .prepare(
+          `INSERT INTO discovery_candidates(
+           host,login,account_id,repository_id,query,state,
+           first_discovered_at,last_discovered_at
+         ) VALUES (@host,@login,@accountId,@repositoryId,@query,'discovered',@discoveredAt,@discoveredAt)
+         ON CONFLICT(host,login,account_id,repository_id) DO UPDATE SET
+           query=excluded.query,
+           last_discovered_at=excluded.last_discovered_at,
+           state=CASE WHEN discovery_candidates.state='dismissed' THEN 'dismissed' ELSE 'discovered' END`,
+        )
+        .run({
+          host: binding.host,
+          login: binding.login,
+          accountId: binding.accountId,
+          repositoryId: repository.repositoryId,
+          query: input.query,
+          discoveredAt,
+        });
+    });
+  }
+
+  queryDiscoveryCandidates(input: {
+    readonly binding: AccountBinding;
+    readonly state?: "discovered" | "selected" | "dismissed" | "starred";
+    readonly query?: string;
+    readonly pageSize: number;
+    readonly cursor: string | null;
+  }): DiscoveryCandidatePage {
+    const binding = stableBinding(input.binding);
+    const offset = input.cursor === null ? 0 : Number(input.cursor);
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new AppError("VALIDATION_ERROR", "candidate cursor is invalid", {
+        retryable: false,
+      });
+    }
+    const clauses = ["c.host=?", "c.login=?", "c.account_id=?"];
+    const params: unknown[] = [binding.host, binding.login, binding.accountId];
+    if (input.state !== undefined) {
+      clauses.push("c.state=?");
+      params.push(input.state);
+    }
+    if (input.query !== undefined) {
+      clauses.push("c.query=?");
+      params.push(input.query);
+    }
+    const where = clauses.join(" AND ");
+    const rows = this.#database
+      .prepare(
+        `SELECT ${REPOSITORY_COLUMNS},c.query,c.state,c.first_discovered_at,c.last_discovered_at
+       FROM discovery_candidates c
+       JOIN repositories r ON r.repository_id=c.repository_id
+       JOIN repository_versions rv ON rv.repository_id=r.repository_id AND rv.version_hash=r.current_version_hash
+       WHERE ${where}
+       ORDER BY c.last_discovered_at DESC,c.repository_id COLLATE BINARY ASC
+       LIMIT ? OFFSET ?`,
+      )
+      .all(...params, input.pageSize, offset) as (RepositoryRow & {
+      query: string;
+      state: "discovered" | "selected" | "dismissed" | "starred";
+      first_discovered_at: string;
+      last_discovered_at: string;
+    })[];
+    const total = (
+      this.#database
+        .prepare(
+          `SELECT COUNT(*) AS value FROM discovery_candidates c WHERE ${where}`,
+        )
+        .get(...params) as { value: number }
+    ).value;
+    return Object.freeze({
+      items: Object.freeze(
+        rows.map((row) =>
+          Object.freeze({
+            repository: repositoryFromRow(row),
+            query: row.query,
+            state: row.state,
+            firstDiscoveredAt: row.first_discovered_at,
+            lastDiscoveredAt: row.last_discovered_at,
+          }),
+        ),
+      ),
+      total,
+      nextCursor:
+        offset + rows.length < total ? String(offset + rows.length) : null,
+    });
   }
 
   getRepositoryMetadata(

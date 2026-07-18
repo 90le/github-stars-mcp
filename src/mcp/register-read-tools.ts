@@ -2,6 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { OperationCoordinator } from "../app/services/operation-coordinator.js";
 import type { ServiceRegistry } from "../app/services/service-registry.js";
 import {
+  toCandidatesQueryInput,
   toDiscoverInput,
   toListsQueryInput,
   toStarsQueryInput,
@@ -9,6 +10,7 @@ import {
   toSyncInput,
 } from "./mappers.js";
 import {
+  toCandidatesOutput,
   toDiscoveryOutput,
   toListsQueryOutput,
   toStarsQueryOutput,
@@ -18,6 +20,7 @@ import {
 import { registerMappedTool } from "./register-tool.js";
 import {
   DiscoverInputSchema,
+  CandidatesQueryInputSchema,
   ListsQueryInputSchema,
   StarsQueryInputSchema,
   StatusInputSchema,
@@ -140,6 +143,29 @@ export function registerReadTools(
         services.discover.discover(toDiscoverInput(input), signal),
       mapOutput: toDiscoveryOutput,
       summary: "GitHub repository discovery completed.",
+    },
+    coordinator,
+  );
+
+  registerMappedTool(
+    server,
+    {
+      name: "github_repositories_candidates",
+      title: "Query Discovered GitHub Candidates",
+      description:
+        "Read locally persisted repository discovery candidates for the authenticated account.",
+      inputSchema: CandidatesQueryInputSchema,
+      outputSchema: ToolOutputSchemas.github_repositories_candidates,
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+      execute: (input) =>
+        services.candidates.query(toCandidatesQueryInput(input)),
+      mapOutput: toCandidatesOutput,
+      summary: "GitHub discovery candidate query completed.",
     },
     coordinator,
   );

@@ -1088,6 +1088,25 @@ export const DiscoveryOutputDataSchema = z
     }
   });
 
+export const CandidatesOutputDataSchema = z
+  .object({
+    items: z
+      .array(
+        z
+          .object({
+            repository: RepositoryOutputSchema,
+            query: z.string(),
+            state: z.enum(["discovered", "selected", "dismissed", "starred"]),
+            first_discovered_at: z.string(),
+            last_discovered_at: z.string(),
+          })
+          .strict(),
+      )
+      .max(100),
+    total: SafeIntegerSchema,
+  })
+  .strict();
+
 export const ToolOutputSchemas = {
   github_stars_status: successOutput(StatusOutputDataSchema),
   github_stars_sync: successOutput(SyncOutputDataSchema),
@@ -1098,4 +1117,5 @@ export const ToolOutputSchemas = {
   github_changes_apply: successOutput(ApplyOutputDataSchema),
   github_changes_rollback: successOutput(RollbackOutputDataSchema),
   github_repositories_discover: successOutput(DiscoveryOutputDataSchema),
+  github_repositories_candidates: successOutput(CandidatesOutputDataSchema),
 } as const satisfies Record<ToolName, z.ZodObject<z.ZodRawShape>>;

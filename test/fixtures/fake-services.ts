@@ -416,6 +416,9 @@ export function fakeServices(): ServiceRegistry {
           await Promise.resolve(discoveryResult(input)),
       ),
     },
+    candidates: {
+      query: vi.fn(() => ({ items: [], total: 0, nextCursor: null })),
+    },
     plan: {
       create: vi.fn(async () => await Promise.resolve(PLAN_RESULT)),
     },

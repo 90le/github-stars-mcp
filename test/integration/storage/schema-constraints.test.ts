@@ -6,6 +6,7 @@ import {
 
 const expectedTables = [
   "accounts",
+  "discovery_candidates",
   "leases",
   "list_membership_staging",
   "list_memberships",
@@ -39,7 +40,7 @@ function migrated() {
 }
 
 describe("migrated schema constraints", () => {
-  test("creates exactly the 25 approved STRICT tables", () => {
+  test("creates exactly the 26 approved STRICT tables", () => {
     const database = migrated();
     const rows = database
       .prepare(
@@ -64,6 +65,7 @@ describe("migrated schema constraints", () => {
       .all();
     expect(indexes).toEqual([
       "dependencies_reverse",
+      "discovery_candidates_page",
       "memberships_reverse",
       "reconciliations_attempt",
       "repository_evidence_expiry",
