@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
+import { deflateSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
 
 const PLUGIN_ROOT = "plugins/github-stars-mcp";
@@ -109,15 +110,20 @@ async function rewriteJson(
   await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 }
 
-async function addReferencedPng(root: string, contents: Buffer): Promise<void> {
+async function addReferencedPng(
+  root: string,
+  contents: Buffer,
+  field: "composerIcon" | "logo" = "logo",
+  filename = field === "composerIcon" ? "icon.png" : "logo.png",
+): Promise<void> {
   const assets = join(root, PLUGIN_ROOT, "assets");
   await mkdir(assets, { recursive: true });
-  await writeFile(join(assets, "logo.png"), contents);
+  await writeFile(join(assets, filename), contents);
   await rewriteJson(
     join(root, PLUGIN_ROOT, ".codex-plugin/plugin.json"),
     (manifest) => {
       const interfaceMetadata = manifest.interface as Record<string, unknown>;
-      interfaceMetadata.logo = "./assets/logo.png";
+      interfaceMetadata[field] = `./assets/${filename}`;
     },
   );
 }
@@ -162,6 +168,32 @@ function pngChunk(type: string, data: Buffer): Buffer {
     8 + data.length,
   );
   return result;
+}
+
+function rgbaPng(
+  width: number,
+  height: number,
+  extraChunks: readonly Buffer[] = [],
+): Buffer {
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+
+  const stride = width * 4;
+  const row = Buffer.alloc(stride + 1);
+  for (let x = 0; x < width; x += 1) row[x * 4 + 4] = 0xff;
+  const pixels = Buffer.alloc(row.length * height);
+  for (let y = 0; y < height; y += 1) row.copy(pixels, y * row.length);
+
+  return Buffer.concat([
+    PNG_SIGNATURE,
+    pngChunk("IHDR", header),
+    ...extraChunks,
+    pngChunk("IDAT", deflateSync(pixels)),
+    pngChunk("IEND", Buffer.alloc(0)),
+  ]);
 }
 
 async function fakeNpmPackCommand(
@@ -868,6 +900,30 @@ describe("Codex plugin package", () => {
     });
   });
 
+  it.each([
+    [
+      "a NUL-delimited GitHub token",
+      Buffer.concat([
+        Buffer.from([0]),
+        Buffer.from("ghp_AAAAAAAAAAAAAAAA\n", "utf8"),
+      ]),
+    ],
+    ["invalid UTF-8", Buffer.from([0xff])],
+  ])("rejects %s appended to workflow text", async (_name, suffix) => {
+    await withPluginFixture(async (root) => {
+      const skill = join(
+        root,
+        PLUGIN_ROOT,
+        "skills/manage-github-stars/SKILL.md",
+      );
+      await writeFile(skill, Buffer.concat([await readFile(skill), suffix]));
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PLUGIN_TEXT_ENCODING");
+    });
+  });
+
   it("rejects a second workflow skill", async () => {
     await withPluginFixture(async (root) => {
       const skillDirectory = join(root, PLUGIN_ROOT, "skills/second-skill");
@@ -985,16 +1041,92 @@ describe("Codex plugin package", () => {
 
       const result = runFixtureValidator(root);
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain("PLUGIN_TREE");
+      expect(result.stderr).toContain("PLUGIN_RUNTIME_SOURCE");
     });
   });
 
-  it("accepts a structurally valid PNG referenced under assets", async () => {
+  it.each([
+    ["composerIcon", "icon.png", 256],
+    ["logo", "logo.png", 512],
+  ] as const)(
+    "accepts the fixed %s PNG reference with exact dimensions",
+    async (field, filename, dimension) => {
+      await withPluginFixture(async (root) => {
+        await addReferencedPng(
+          root,
+          rgbaPng(dimension, dimension),
+          field,
+          filename,
+        );
+
+        const result = runFixtureValidator(root);
+        expect(result).toMatchObject({ status: 0, stderr: "" });
+      });
+    },
+  );
+
+  it("rejects an alternate PNG path even when the manifest references it", async () => {
     await withPluginFixture(async (root) => {
-      await addReferencedPng(root, VALID_PNG);
+      await addReferencedPng(
+        root,
+        rgbaPng(256, 256),
+        "composerIcon",
+        "alternate.png",
+      );
 
       const result = runFixtureValidator(root);
-      expect(result).toMatchObject({ status: 0, stderr: "" });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("MANIFEST_ASSET");
+    });
+  });
+
+  it("rejects a fixed PNG with the wrong dimensions", async () => {
+    await withPluginFixture(async (root) => {
+      await addReferencedPng(root, rgbaPng(1, 1));
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PLUGIN_ASSET_FORMAT");
+    });
+  });
+
+  it("rejects a fixed PNG above the asset size limit", async () => {
+    await withPluginFixture(async (root) => {
+      await addReferencedPng(root, Buffer.alloc(1_500_001));
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PLUGIN_FILE_TOO_LARGE");
+    });
+  });
+
+  it("rejects a referenced PNG containing a text chunk", async () => {
+    await withPluginFixture(async (root) => {
+      const textChunk = pngChunk(
+        "tEXt",
+        Buffer.from("credential\0ghp_AAAAAAAAAAAAAAAA", "utf8"),
+      );
+      await addReferencedPng(root, rgbaPng(512, 512, [textChunk]));
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PLUGIN_ASSET_FORMAT");
+    });
+  });
+
+  it("rejects a valid fixed PNG followed by credential bytes", async () => {
+    await withPluginFixture(async (root) => {
+      await addReferencedPng(
+        root,
+        Buffer.concat([
+          rgbaPng(512, 512),
+          Buffer.from("\0ghp_AAAAAAAAAAAAAAAA", "utf8"),
+        ]),
+      );
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PLUGIN_ASSET_FORMAT");
     });
   });
 
@@ -1020,6 +1152,24 @@ describe("Codex plugin package", () => {
       invalid.writeUInt8(
         invalid.readUInt8(invalid.length - 1) ^ 0xff,
         invalid.length - 1,
+      );
+      await addReferencedPng(root, invalid);
+
+      const result = runFixtureValidator(root);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PLUGIN_ASSET_FORMAT");
+    });
+  });
+
+  it("rejects non-ASCII PNG chunk type bytes", async () => {
+    await withPluginFixture(async (root) => {
+      const invalid = Buffer.from(rgbaPng(512, 512));
+      const typeStart = PNG_SIGNATURE.length + 4;
+      const dataEnd = typeStart + 4 + 13;
+      invalid[typeStart] = (invalid[typeStart] ?? 0) | 0x80;
+      invalid.writeUInt32BE(
+        pngCrc32(invalid.subarray(typeStart, dataEnd)),
+        dataEnd,
       );
       await addReferencedPng(root, invalid);
 
@@ -1428,6 +1578,36 @@ describe("Codex plugin package", () => {
       });
     },
   );
+
+  it.each([
+    [
+      "a NUL-delimited credential",
+      Buffer.from("export {};\0ghp_AAAAAAAAAAAAAAAA\n", "utf8"),
+    ],
+    [
+      "invalid UTF-8",
+      Buffer.concat([Buffer.from("export {};\n", "utf8"), Buffer.from([0xff])]),
+    ],
+  ])("rejects packed JavaScript containing %s", async (_name, contents) => {
+    await withPluginFixture(async (root) => {
+      const outputs = await addGeneratedModule(
+        root,
+        "generated/invalid-text.ts",
+      );
+      await writeFile(join(root, outputs[0]), contents);
+      const npmEntry = await fakeNpmPackCommand(root, [
+        ...PACKED_PLUGIN_PATHS,
+        ...outputs,
+      ]);
+
+      const result = runFixtureValidator(root, {
+        staticOnly: false,
+        env: { npm_execpath: npmEntry, PATH: "" },
+      });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("PACKAGE_DRY_RUN_TEXT_ENCODING");
+    });
+  });
 
   it.each(WAVE4_BEARER_ENCODINGS)(
     "rejects a complete Bearer credential in %s syntax without echoing it",

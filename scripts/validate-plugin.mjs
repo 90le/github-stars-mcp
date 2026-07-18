@@ -15,6 +15,11 @@ import { delimiter, extname, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { TextDecoder } from "node:util";
 import ts from "typescript";
+import {
+  inspectRgbaPng,
+  MAX_PNG_BYTES,
+  PLUGIN_BRAND_ASSETS,
+} from "./png-assets.mjs";
 
 const REPOSITORY_ROOT = resolve(".");
 const PLUGIN_ROOT = resolve("plugins/github-stars-mcp");
@@ -40,11 +45,7 @@ const EXPECTED_ENV = Object.freeze([
   "GITHUB_STARS_MCP_PLAN_TTL_MINUTES",
 ]);
 const PRESENTATION_EXTENSIONS = new Set([".json", ".md", ".yaml", ".yml"]);
-const ASSET_EXTENSIONS = new Set([".png"]);
-const ALLOWED_PLUGIN_EXTENSIONS = new Set([
-  ...PRESENTATION_EXTENSIONS,
-  ...ASSET_EXTENSIONS,
-]);
+const MAX_TEXT_BYTES = 1_048_576;
 const REQUIRED_PLUGIN_FILES = new Set([
   ".codex-plugin/plugin.json",
   ".mcp.json",
@@ -248,16 +249,14 @@ async function assertPluginReference(reference, expectedKind, code) {
   );
 }
 
-async function assertManifestAssetReference(reference, code) {
-  assert(
-    typeof reference === "string" &&
-      reference.startsWith("./assets/") &&
-      reference.toLowerCase().endsWith(".png"),
-    `${code}_FORMAT`,
-  );
+async function assertManifestAssetReference(reference, asset, code) {
+  assert(reference === asset.reference, `${code}_FORMAT`);
   const target = resolve(PLUGIN_ROOT, reference);
   const relativePath = relative(PLUGIN_ROOT, target).replaceAll("\\", "/");
-  assert(reference === `./${relativePath}`, `${code}_FORMAT`);
+  assert(
+    relativePath === asset.relativePath && reference === `./${relativePath}`,
+    `${code}_FORMAT`,
+  );
   await assertPluginReference(reference, "file", code);
   return relativePath;
 }
@@ -265,7 +264,7 @@ async function assertManifestAssetReference(reference, code) {
 async function assertPluginFile(path, code) {
   const metadata = await assertPluginPath(path, code);
   assert(metadata.isFile(), `${code}_KIND`);
-  assert(metadata.size <= 1_048_576, `${code}_SIZE`);
+  assert(metadata.size <= MAX_TEXT_BYTES, `${code}_SIZE`);
 }
 
 async function collectPluginTree(directory = PLUGIN_ROOT) {
@@ -289,7 +288,7 @@ async function collectPluginTree(directory = PLUGIN_ROOT) {
       directories.push(...nested.directories);
     } else {
       assert(metadata.isFile(), "PLUGIN_TREE_ENTRY_KIND");
-      assert(metadata.size <= 1_048_576, "PLUGIN_FILE_TOO_LARGE");
+      assert(metadata.size <= MAX_PNG_BYTES, "PLUGIN_FILE_TOO_LARGE");
       files.push(path);
     }
   }
@@ -351,32 +350,22 @@ async function validateManifest() {
     INTERFACE_KEYS,
     "MANIFEST_INTERFACE_KEYS",
   );
-  const assets = new Set();
-  for (const key of ["composerIcon", "logo", "logoDark"]) {
+  const assets = new Map();
+  for (const [key, asset] of Object.entries(PLUGIN_BRAND_ASSETS)) {
     if (interfaceMetadata[key] !== undefined) {
-      assets.add(
-        await assertManifestAssetReference(
-          interfaceMetadata[key],
-          `MANIFEST_ASSET_${key.toUpperCase()}`,
-        ),
+      const relativePath = await assertManifestAssetReference(
+        interfaceMetadata[key],
+        asset,
+        `MANIFEST_ASSET_${key.toUpperCase()}`,
       );
+      assets.set(relativePath, asset);
     }
   }
-  if (interfaceMetadata.screenshots !== undefined) {
-    assert(
-      Array.isArray(interfaceMetadata.screenshots) &&
-        interfaceMetadata.screenshots.length <= 20,
-      "MANIFEST_ASSET_SCREENSHOTS",
-    );
-    for (const screenshot of interfaceMetadata.screenshots) {
-      assets.add(
-        await assertManifestAssetReference(
-          screenshot,
-          "MANIFEST_ASSET_SCREENSHOT",
-        ),
-      );
-    }
-  }
+  assert(
+    interfaceMetadata.logoDark === undefined &&
+      interfaceMetadata.screenshots === undefined,
+    "MANIFEST_ASSET_UNSUPPORTED",
+  );
   return assets;
 }
 
@@ -489,74 +478,13 @@ async function validateSkill() {
   );
 }
 
-function hasBytes(contents, offset, expected) {
-  return expected.every((value, index) => contents[offset + index] === value);
-}
-
-function pngCrc32(contents, start, end) {
-  let crc = 0xffffffff;
-  for (let offset = start; offset < end; offset += 1) {
-    crc ^= contents[offset];
-    for (let bit = 0; bit < 8; bit += 1) {
-      crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
-    }
-  }
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
-function validPng(contents) {
-  if (
-    !hasBytes(contents, 0, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
-  ) {
+function validAsset(contents, asset) {
+  try {
+    inspectRgbaPng(contents, asset);
+    return true;
+  } catch {
     return false;
   }
-
-  let offset = 8;
-  let chunkIndex = 0;
-  let seenIhdr = false;
-  let seenIdat = false;
-  let seenIend = false;
-  while (offset < contents.length) {
-    if (seenIend || contents.length - offset < 12) return false;
-    const length = contents.readUInt32BE(offset);
-    if (length > contents.length - offset - 12) return false;
-
-    const typeStart = offset + 4;
-    const dataStart = offset + 8;
-    const crcStart = dataStart + length;
-    const nextOffset = crcStart + 4;
-    const type = contents.subarray(typeStart, dataStart).toString("ascii");
-    if (
-      !/^[A-Za-z]{4}$/u.test(type) ||
-      pngCrc32(contents, typeStart, crcStart) !==
-        contents.readUInt32BE(crcStart)
-    ) {
-      return false;
-    }
-
-    if (type === "IHDR") {
-      if (chunkIndex !== 0 || seenIhdr || length !== 13) return false;
-      seenIhdr = true;
-    } else if (chunkIndex === 0) {
-      return false;
-    }
-
-    if (type === "IDAT") seenIdat = true;
-    if (type === "IEND") {
-      if (seenIend || length !== 0 || nextOffset !== contents.length) {
-        return false;
-      }
-      seenIend = true;
-    }
-
-    offset = nextOffset;
-    chunkIndex += 1;
-  }
-  return seenIhdr && seenIdat && seenIend;
-}
-
-function validAsset(contents, extension) {
-  return extension === ".png" && validPng(contents);
 }
 
 function pluginRelativePath(path) {
@@ -581,16 +509,25 @@ async function validatePluginTree(assets) {
   const { directories, files } = await collectPluginTree();
   assert(files.length > 0, "PLUGIN_EMPTY");
   for (const path of files) {
+    const relativePath = pluginRelativePath(path);
+    const asset = assets.get(relativePath);
     const extension = extname(path).toLowerCase();
     const metadata = await fileMetadata(path, "PLUGIN_FILE");
     const contents = await readFile(path);
-    const source = contents.toString("utf8");
+    if (asset !== undefined) {
+      assert(
+        extension === ".png" &&
+          metadata.size <= MAX_PNG_BYTES &&
+          (metadata.mode & 0o111) === 0 &&
+          validAsset(contents, asset),
+        "PLUGIN_ASSET_FORMAT",
+      );
+      continue;
+    }
+
     assert(
-      !containsCredentialMaterial(contents, path),
-      "PLUGIN_CREDENTIAL_VALUE",
-    );
-    assert(
-      ALLOWED_PLUGIN_EXTENSIONS.has(extension) &&
+      PRESENTATION_EXTENSIONS.has(extension) &&
+        metadata.size <= MAX_TEXT_BYTES &&
         (metadata.mode & 0o111) === 0 &&
         !(contents[0] === 0x23 && contents[1] === 0x21) &&
         !(contents[0] === 0x4d && contents[1] === 0x5a) &&
@@ -608,15 +545,15 @@ async function validatePluginTree(assets) {
         ),
       "PLUGIN_RUNTIME_SOURCE",
     );
-    if (ASSET_EXTENSIONS.has(extension)) {
-      assert(validAsset(contents, extension), "PLUGIN_ASSET_FORMAT");
-    }
-    if (PRESENTATION_EXTENSIONS.has(extension)) {
-      assert(!/\b(?:TODO|TBD)\b/u.test(source), "PLUGIN_PLACEHOLDER");
-    }
+    const source = decodeCredentialText(contents, "PLUGIN_TEXT_ENCODING");
+    assert(
+      !containsCredentialMaterial(source, path),
+      "PLUGIN_CREDENTIAL_VALUE",
+    );
+    assert(!/\b(?:TODO|TBD)\b/u.test(source), "PLUGIN_PLACEHOLDER");
   }
 
-  const expectedFiles = new Set([...REQUIRED_PLUGIN_FILES, ...assets]);
+  const expectedFiles = new Set([...REQUIRED_PLUGIN_FILES, ...assets.keys()]);
   const actualFiles = files.map(pluginRelativePath);
   assert(
     actualFiles.length === expectedFiles.size &&
@@ -1232,14 +1169,18 @@ function commentBearerValue(source, path) {
   return false;
 }
 
-function containsCredentialMaterial(contents, path = "") {
+function decodeCredentialText(contents, code) {
   let source;
   try {
     source = new TextDecoder("utf-8", { fatal: true }).decode(contents);
   } catch {
-    return false;
+    fail(code);
   }
-  if (source.includes("\0")) return false;
+  assert(!source.includes("\0"), code);
+  return source;
+}
+
+function containsCredentialMaterial(source, path = "") {
   return (
     /github_pat_[A-Za-z0-9_]{4,}/u.test(source) ||
     /gh[pousr]_[A-Za-z0-9_]{4,}/u.test(source) ||
@@ -1292,7 +1233,7 @@ function runExternal(command, arguments_, options, code) {
   return result.stdout;
 }
 
-async function validatePackageDryRun(staticOnly, expectedDistPaths) {
+async function validatePackageDryRun(staticOnly, expectedDistPaths, assets) {
   if (staticOnly) return;
   const npmEntry = process.env.npm_execpath;
   if (typeof npmEntry !== "string" || npmEntry.length === 0) return;
@@ -1342,21 +1283,37 @@ async function validatePackageDryRun(staticOnly, expectedDistPaths) {
     ),
     "PACKAGE_DRY_RUN_DIST_CONTENTS",
   );
+  const pluginPrefix = "plugins/github-stars-mcp/";
+  const expectedPluginPaths = [...REQUIRED_PLUGIN_FILES, ...assets.keys()].map(
+    (path) => `${pluginPrefix}${path}`,
+  );
+  assert(
+    exactPathSet(
+      paths.filter((path) => path.startsWith(pluginPrefix)),
+      expectedPluginPaths,
+    ),
+    "PACKAGE_DRY_RUN_PLUGIN_CONTENTS",
+  );
   for (const path of paths) {
     const contents = await readPackedFileIfPresent(path);
     if (contents !== null) {
+      const relativeAssetPath = path.startsWith(pluginPrefix)
+        ? path.slice(pluginPrefix.length)
+        : "";
+      const asset = assets.get(relativeAssetPath);
+      if (asset !== undefined) {
+        assert(validAsset(contents, asset), "PACKAGE_DRY_RUN_ASSET_FORMAT");
+        continue;
+      }
+      const text = decodeCredentialText(
+        contents,
+        "PACKAGE_DRY_RUN_TEXT_ENCODING",
+      );
       assert(
-        !containsCredentialMaterial(contents, path),
+        !containsCredentialMaterial(text, path),
         "PACKAGE_DRY_RUN_SENSITIVE_CONTENT",
       );
     }
-  }
-  for (const expected of [
-    "plugins/github-stars-mcp/.codex-plugin/plugin.json",
-    "plugins/github-stars-mcp/.mcp.json",
-    "plugins/github-stars-mcp/skills/manage-github-stars/SKILL.md",
-  ]) {
-    assert(paths.includes(expected), "PACKAGE_DRY_RUN_CONTENTS");
   }
 }
 
@@ -1569,7 +1526,7 @@ async function main() {
   const expectedDistPaths = await validateGeneratedOutputManifest();
   await validateSkill();
   await validatePluginTree(assets);
-  await validatePackageDryRun(staticOnly, expectedDistPaths);
+  await validatePackageDryRun(staticOnly, expectedDistPaths, assets);
   await validateWithCodex(staticOnly);
   process.stdout.write("Validated Codex plugin github-stars-mcp\n");
 }
