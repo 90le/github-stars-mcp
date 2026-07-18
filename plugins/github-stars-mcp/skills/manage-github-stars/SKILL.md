@@ -9,7 +9,7 @@ Operate only GitHub Stars and GitHub User Lists. Treat every remote change as a 
 
 ## Required workflow
 
-1. Call `github_stars_status` to check identity, capabilities, read-only state, synchronization age, and incomplete runs.
+1. Call `github_stars_status` to check identity, credential source, capabilities, synchronization age, and incomplete runs.
 2. Call `github_stars_sync` before decisions that depend on the complete current collection.
 3. Read bounded pages with `github_stars_query` and `github_lists_query`; continue until `next_cursor` is null. Use `github_repositories_discover` only to find new public candidates. Never invent fields or parameters.
 4. Translate the user's rule exactly. Use `pushed_at` for repository activity; do not substitute `updated_at`. Resolve subjective exceptions into explicit repository IDs and place them in `protected_repository_ids`. Protect List IDs the user excludes too.
