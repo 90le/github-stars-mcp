@@ -44,6 +44,8 @@ const GITHUB_OBJECT_FILTER_CONTEXT = /\bgithub\s*\.\s*\*/iu;
 const COMPLETE_GITHUB_CONTEXT = /\bgithub\b(?!\s*(?:\.|\[))/iu;
 const RELEASE_COMMAND =
   'gh release create "${{ github.ref_name }}" --verify-tag';
+const NPM_PUBLISH_COMMAND =
+  "npm publish artifacts/package.tgz --provenance --access public";
 const RELEASE_STEP_KEYS = new Set(["name", "env", "run"]);
 const RELEASE_ROOT_PERMISSIONS = Object.freeze({
   attestations: "write",
@@ -181,6 +183,54 @@ function sameMapping(node, expected) {
     if (scalarText(pairAt(node, key)?.value) !== value) return false;
   }
   return true;
+}
+
+function validateKeyContract(context, node, required, optional, code) {
+  const keys = mappingKeys(node);
+  const allowed = new Set([...required, ...optional]);
+  if (
+    keys === undefined ||
+    required.some((key) => !keys.includes(key)) ||
+    keys.some((key) => !allowed.has(key))
+  ) {
+    issueAt(context, node, code);
+    return false;
+  }
+  return true;
+}
+
+function exactStepMaps(context, jobName, count, code) {
+  const steps = nodeAt(context.root, ["jobs", jobName, "steps"]);
+  if (
+    !isSeq(steps) ||
+    steps.items.length !== count ||
+    steps.items.some((item) => !isMap(item))
+  ) {
+    issueAt(context, steps, code);
+    return [];
+  }
+  return steps.items;
+}
+
+function validateActionStep(context, step, reference, expectedWith, code) {
+  const required = expectedWith === undefined ? ["uses"] : ["uses", "with"];
+  validateKeyContract(context, step, required, ["name"], code);
+  if (scalarText(pairAt(step, "uses")?.value) !== reference) {
+    issueAt(context, pairAt(step, "uses")?.value ?? step, code);
+  }
+  if (
+    expectedWith !== undefined &&
+    !sameMapping(nodeAt(step, ["with"]), expectedWith)
+  ) {
+    issueAt(context, nodeAt(step, ["with"]) ?? step, code);
+  }
+}
+
+function validateRunStep(context, step, command, code) {
+  validateKeyContract(context, step, ["run"], ["name"], code);
+  if (scalarText(pairAt(step, "run")?.value) !== command) {
+    issueAt(context, pairAt(step, "run")?.value ?? step, code);
+  }
 }
 
 function hasCredentialReference(value) {
@@ -433,6 +483,29 @@ function validateGenericWorkflow(context) {
 }
 
 function validateCi(context) {
+  const code = "CI_EXECUTION_POLICY";
+  validateKeyContract(
+    context,
+    context.root,
+    ["name", "on", "permissions", "env", "jobs"],
+    [],
+    code,
+  );
+  validateKeyContract(
+    context,
+    nodeAt(context.root, ["on"]),
+    ["pull_request", "push"],
+    [],
+    code,
+  );
+  expectMapping(context, ["env"], { GITHUB_STARS_MCP_READ_ONLY: "true" }, code);
+  validateKeyContract(
+    context,
+    nodeAt(context.root, ["jobs"]),
+    ["verify", "dependency-review"],
+    [],
+    code,
+  );
   expectMapping(
     context,
     ["permissions"],
@@ -459,7 +532,37 @@ function validateCi(context) {
     "CI_NODE_MATRIX",
   );
 
-  const verifySteps = stepMaps(context, "verify");
+  const verifyJob = nodeAt(context.root, ["jobs", "verify"]);
+  validateKeyContract(
+    context,
+    verifyJob,
+    ["runs-on", "strategy", "steps"],
+    ["name", "timeout-minutes"],
+    code,
+  );
+  const verifyStrategy = nodeAt(verifyJob, ["strategy"]);
+  validateKeyContract(
+    context,
+    verifyStrategy,
+    ["fail-fast", "matrix"],
+    [],
+    code,
+  );
+  expectScalar(
+    context,
+    ["jobs", "verify", "strategy", "fail-fast"],
+    "false",
+    code,
+  );
+  validateKeyContract(
+    context,
+    nodeAt(verifyStrategy, ["matrix"]),
+    ["node-version"],
+    [],
+    code,
+  );
+
+  const verifySteps = exactStepMaps(context, "verify", 4, code);
   expectStepValues(
     context,
     verifySteps,
@@ -475,8 +578,34 @@ function validateCi(context) {
     "CI_COMMANDS",
   );
   validateCheckoutPersistence(context, verifySteps);
+  if (verifySteps.length === 4) {
+    validateActionStep(
+      context,
+      verifySteps[0],
+      PINS.checkout,
+      { "persist-credentials": "false" },
+      code,
+    );
+    validateActionStep(
+      context,
+      verifySteps[1],
+      PINS.setupNode,
+      { "node-version": "${{ matrix.node-version }}", cache: "npm" },
+      code,
+    );
+    validateRunStep(context, verifySteps[2], "npm ci", code);
+    validateRunStep(context, verifySteps[3], "npm run verify", code);
+  }
 
-  const reviewSteps = stepMaps(context, "dependency-review");
+  const reviewJob = nodeAt(context.root, ["jobs", "dependency-review"]);
+  validateKeyContract(
+    context,
+    reviewJob,
+    ["if", "runs-on", "steps"],
+    ["name", "timeout-minutes"],
+    code,
+  );
+  const reviewSteps = exactStepMaps(context, "dependency-review", 2, code);
   expectScalar(
     context,
     ["jobs", "dependency-review", "if"],
@@ -491,9 +620,48 @@ function validateCi(context) {
     "DEPENDENCY_REVIEW_ACTIONS",
   );
   validateCheckoutPersistence(context, reviewSteps);
+  if (reviewSteps.length === 2) {
+    validateActionStep(
+      context,
+      reviewSteps[0],
+      PINS.checkout,
+      { "persist-credentials": "false" },
+      code,
+    );
+    validateActionStep(
+      context,
+      reviewSteps[1],
+      PINS.dependencyReview,
+      undefined,
+      code,
+    );
+  }
 }
 
 function validatePackageSmoke(context) {
+  const code = "PACKAGE_EXECUTION_POLICY";
+  validateKeyContract(
+    context,
+    context.root,
+    ["name", "on", "permissions", "env", "jobs"],
+    [],
+    code,
+  );
+  validateKeyContract(
+    context,
+    nodeAt(context.root, ["on"]),
+    ["pull_request", "push", "workflow_dispatch"],
+    [],
+    code,
+  );
+  expectMapping(context, ["env"], { GITHUB_STARS_MCP_READ_ONLY: "true" }, code);
+  validateKeyContract(
+    context,
+    nodeAt(context.root, ["jobs"]),
+    ["package-smoke"],
+    [],
+    code,
+  );
   expectMapping(
     context,
     ["permissions"],
@@ -537,9 +705,21 @@ function validatePackageSmoke(context) {
 
   const steps = stepMaps(context, "package-smoke");
   const job = nodeAt(context.root, ["jobs", "package-smoke"]);
-  if (hasMapKey(job, "if") || hasMapKey(job, "continue-on-error")) {
-    issueAt(context, job, "PACKAGE_EXECUTION_POLICY");
-  }
+  validateKeyContract(
+    context,
+    job,
+    ["runs-on", "strategy", "steps"],
+    ["name", "timeout-minutes"],
+    code,
+  );
+  const strategy = nodeAt(job, ["strategy"]);
+  validateKeyContract(context, strategy, ["fail-fast", "matrix"], [], code);
+  expectScalar(
+    context,
+    ["jobs", "package-smoke", "strategy", "fail-fast"],
+    "false",
+    code,
+  );
   expectStepValues(
     context,
     steps,
@@ -570,6 +750,26 @@ function validatePackageSmoke(context) {
       issueAt(context, step, "PACKAGE_EXECUTION_POLICY");
     }
   }
+  const exactSteps = exactStepMaps(context, "package-smoke", 5, code);
+  if (exactSteps.length === 5) {
+    validateActionStep(
+      context,
+      exactSteps[0],
+      PINS.checkout,
+      { "persist-credentials": "false" },
+      code,
+    );
+    validateActionStep(
+      context,
+      exactSteps[1],
+      PINS.setupNode,
+      { "node-version": "${{ matrix.node-version }}", cache: "npm" },
+      code,
+    );
+    validateRunStep(context, exactSteps[2], "npm ci", code);
+    validateRunStep(context, exactSteps[3], "npm run build", code);
+    validateRunStep(context, exactSteps[4], "npm run package:verify", code);
+  }
   const probeStep = steps.find(
     (step) =>
       scalarText(pairAt(step, "run")?.value) === "npm run package:verify",
@@ -587,6 +787,29 @@ function validatePackageSmoke(context) {
 }
 
 function validateCodeql(context) {
+  const code = "CODEQL_EXECUTION_POLICY";
+  validateKeyContract(
+    context,
+    context.root,
+    ["name", "on", "permissions", "env", "jobs"],
+    [],
+    code,
+  );
+  validateKeyContract(
+    context,
+    nodeAt(context.root, ["on"]),
+    ["pull_request", "push", "schedule"],
+    [],
+    code,
+  );
+  expectMapping(context, ["env"], { GITHUB_STARS_MCP_READ_ONLY: "true" }, code);
+  validateKeyContract(
+    context,
+    nodeAt(context.root, ["jobs"]),
+    ["analyze"],
+    [],
+    code,
+  );
   expectMapping(
     context,
     ["permissions"],
@@ -605,7 +828,15 @@ function validateCodeql(context) {
     "READ_ONLY_REQUIRED",
   );
 
-  const steps = stepMaps(context, "analyze");
+  const job = nodeAt(context.root, ["jobs", "analyze"]);
+  validateKeyContract(
+    context,
+    job,
+    ["runs-on", "steps"],
+    ["name", "timeout-minutes"],
+    code,
+  );
+  const steps = exactStepMaps(context, "analyze", 6, code);
   expectStepValues(
     context,
     steps,
@@ -629,6 +860,32 @@ function validateCodeql(context) {
     issueAt(context, init ?? context.root, "CODEQL_LANGUAGE");
   }
   validateCheckoutPersistence(context, steps);
+  if (steps.length === 6) {
+    validateActionStep(
+      context,
+      steps[0],
+      PINS.checkout,
+      { "persist-credentials": "false" },
+      code,
+    );
+    validateActionStep(
+      context,
+      steps[1],
+      PINS.codeqlInit,
+      { languages: "javascript-typescript" },
+      code,
+    );
+    validateActionStep(
+      context,
+      steps[2],
+      PINS.setupNode,
+      { "node-version": "24", cache: "npm" },
+      code,
+    );
+    validateRunStep(context, steps[3], "npm ci", code);
+    validateRunStep(context, steps[4], "npm run build", code);
+    validateActionStep(context, steps[5], PINS.codeqlAnalyze, undefined, code);
+  }
 }
 
 function isGhReleaseStep(step) {
@@ -680,6 +937,17 @@ function validateReleaseJob(
     return;
   }
 
+  const executionCode = "RELEASE_EXECUTION_POLICY";
+  validateKeyContract(
+    context,
+    job,
+    name === "release"
+      ? ["environment", "runs-on", "steps"]
+      : ["if", "needs", "environment", "runs-on", "permissions", "steps"],
+    ["name", "permissions", "timeout-minutes"],
+    executionCode,
+  );
+
   if (scalarText(pairAt(job, "environment")?.value) !== environment) {
     issueAt(
       context,
@@ -696,6 +964,18 @@ function validateReleaseJob(
     );
   }
 
+  if (scalarText(pairAt(job, "runs-on")?.value) !== "ubuntu-latest") {
+    issueAt(context, pairAt(job, "runs-on")?.value ?? job, executionCode);
+  }
+  if (name === "npm-publish") {
+    if (scalarText(pairAt(job, "if")?.value) !== "${{ inputs.publish_npm }}") {
+      issueAt(context, pairAt(job, "if")?.value ?? job, executionCode);
+    }
+    if (scalarText(pairAt(job, "needs")?.value) !== "release") {
+      issueAt(context, pairAt(job, "needs")?.value ?? job, executionCode);
+    }
+  }
+
   const jobPermissions = pairAt(job, "permissions")?.value;
   const effectivePermissions = jobPermissions ?? inheritedPermissions;
   if (!sameMapping(effectivePermissions, permissions)) {
@@ -705,6 +985,39 @@ function validateReleaseJob(
       "RELEASE_PERMISSIONS",
     );
   }
+}
+
+function validateReleaseExecution(context) {
+  const code = "RELEASE_EXECUTION_POLICY";
+  const steps = exactStepMaps(context, "release", 2, code);
+  if (steps.length !== 2) return;
+  validateActionStep(
+    context,
+    steps[0],
+    PINS.checkout,
+    { "persist-credentials": "false" },
+    code,
+  );
+  if (!isGhReleaseStep(steps[1])) {
+    issueAt(context, steps[1], code);
+  }
+}
+
+function validateNpmPublishExecution(context) {
+  const code = "RELEASE_EXECUTION_POLICY";
+  const steps = exactStepMaps(context, "npm-publish", 2, code);
+  if (steps.length !== 2) return;
+  validateActionStep(
+    context,
+    steps[0],
+    PINS.setupNode,
+    {
+      "node-version": "24",
+      "registry-url": "https://registry.npmjs.org",
+    },
+    code,
+  );
+  validateRunStep(context, steps[1], NPM_PUBLISH_COMMAND, code);
 }
 
 function validateReleaseCheckout(context) {
@@ -724,6 +1037,13 @@ function validateReleaseCheckout(context) {
 }
 
 function validateRelease(context) {
+  validateKeyContract(
+    context,
+    context.root,
+    ["name", "on", "permissions", "jobs"],
+    [],
+    "RELEASE_EXECUTION_POLICY",
+  );
   const triggers = nodeAt(context.root, ["on"]);
   const triggerKeys = mappingKeys(triggers);
   const dispatch = pairAt(triggers, "workflow_dispatch")?.value;
@@ -760,6 +1080,7 @@ function validateRelease(context) {
       RELEASE_ROOT_PERMISSIONS,
       rootPermissions,
     );
+    validateReleaseExecution(context);
     if (pairAt(jobs, "npm-publish") !== undefined) {
       validateReleaseJob(
         context,
@@ -769,6 +1090,7 @@ function validateRelease(context) {
         NPM_PUBLISH_PERMISSIONS,
         rootPermissions,
       );
+      validateNpmPublishExecution(context);
     }
   }
 

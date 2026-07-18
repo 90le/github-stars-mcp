@@ -587,6 +587,62 @@ describe("GitHub workflow policy", () => {
 
   it.each([
     {
+      name: "a workflow-level BASH_ENV hook",
+      before: "permissions:\n",
+      after: "env:\n  BASH_ENV: ./release-wrapper.sh\n\npermissions:\n",
+    },
+    {
+      name: "a release-job BASH_ENV hook",
+      before: "    runs-on: ubuntu-latest\n",
+      after:
+        "    runs-on: ubuntu-latest\n    env:\n      BASH_ENV: ./release-wrapper.sh\n",
+    },
+    {
+      name: "a release-job NODE_OPTIONS hook",
+      before: "    runs-on: ubuntu-latest\n",
+      after:
+        "    runs-on: ubuntu-latest\n    env:\n      NODE_OPTIONS: --require ./release-wrapper.cjs\n",
+    },
+    {
+      name: "a release-job ENV hook",
+      before: "    runs-on: ubuntu-latest\n",
+      after:
+        "    runs-on: ubuntu-latest\n    env:\n      ENV: ./release-wrapper.sh\n",
+    },
+  ])("rejects GH_TOKEN inheritance beside $name", async ({ before, after }) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(before, after),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_EXECUTION_POLICY)");
+    });
+  });
+
+  it("rejects release precursor steps that can rewrite the gh executable", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(
+          "      - name: Create the verified GitHub release\n",
+          `      - name: Rewrite the command search path
+        run: echo "./bin" >> "$GITHUB_PATH"
+      - name: Create the verified GitHub release
+`,
+        ),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_EXECUTION_POLICY)");
+    });
+  });
+
+  it.each([
+    {
       name: "a missing checkout step",
       before: `      - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -716,6 +772,115 @@ describe("GitHub workflow policy", () => {
 
       const stderr = await verifierFailure(fixtureRoot);
       expect(stderr).toContain("(PACKAGE_EXECUTION_POLICY)");
+    });
+  });
+
+  it.each([
+    {
+      name: "a workflow-level BASH_ENV hook",
+      before: '  GITHUB_STARS_MCP_READ_ONLY: "true"\n',
+      after:
+        '  GITHUB_STARS_MCP_READ_ONLY: "true"\n  BASH_ENV: ./skip-package.sh\n',
+    },
+    {
+      name: "job defaults that replace every run command",
+      before: "    timeout-minutes: 25\n",
+      after:
+        "    timeout-minutes: 25\n    defaults:\n      run:\n        shell: \"bash -c 'true # {0}'\"\n",
+    },
+    {
+      name: "a job-level NODE_OPTIONS hook",
+      before: "    timeout-minutes: 25\n",
+      after:
+        "    timeout-minutes: 25\n    env:\n      NODE_OPTIONS: --require ./skip-package.cjs\n",
+    },
+    {
+      name: "a required-step shell wrapper",
+      before: "        run: npm run package:verify\n",
+      after:
+        "        shell: \"bash -c 'true # {0}'\"\n        run: npm run package:verify\n",
+    },
+    {
+      name: "a required-step BASH_ENV hook",
+      before: "        run: npm run package:verify\n",
+      after:
+        "        env:\n          BASH_ENV: ./skip-package.sh\n        run: npm run package:verify\n",
+    },
+    {
+      name: "a required-step working-directory rewrite",
+      before: "        run: npm run package:verify\n",
+      after:
+        "        working-directory: ./fixtures/noop-package\n        run: npm run package:verify\n",
+    },
+    {
+      name: "checkout redirected away from the tested commit",
+      before: "          persist-credentials: false\n",
+      after: "          persist-credentials: false\n          ref: main\n",
+    },
+    {
+      name: "setup-node detached from the Node matrix",
+      before: "          node-version: ${{ matrix.node-version }}\n",
+      after: "          node-version: 22\n",
+    },
+  ])(
+    "rejects package execution rewrite via $name",
+    async ({ before, after }) => {
+      await withPolicyFixture(async (fixtureRoot) => {
+        const target = resolve(fixtureRoot, workflowPaths[1]);
+        const source = await readFile(target, "utf8");
+        expect(source).toContain(before);
+        await writeFile(target, source.replace(before, after), "utf8");
+
+        const stderr = await verifierFailure(fixtureRoot);
+        expect(stderr).toContain("(PACKAGE_EXECUTION_POLICY)");
+      });
+    },
+  );
+
+  it.each([
+    {
+      name: "CI verify",
+      path: ".github/workflows/ci.yml",
+      before: "        run: npm run verify\n",
+      after:
+        "        shell: \"bash -c 'true # {0}'\"\n        run: npm run verify\n",
+      code: "CI_EXECUTION_POLICY",
+    },
+    {
+      name: "CI checkout",
+      path: ".github/workflows/ci.yml",
+      before: "          persist-credentials: false\n",
+      after: "          persist-credentials: false\n          ref: main\n",
+      code: "CI_EXECUTION_POLICY",
+    },
+    {
+      name: "CodeQL build",
+      path: ".github/workflows/codeql.yml",
+      before: "        run: npm run build\n",
+      after:
+        "        env:\n          BASH_ENV: ./skip-codeql.sh\n        run: npm run build\n",
+      code: "CODEQL_EXECUTION_POLICY",
+    },
+    {
+      name: "CodeQL setup-node",
+      path: ".github/workflows/codeql.yml",
+      before: "          node-version: 24\n",
+      after: "          node-version: 22\n",
+      code: "CODEQL_EXECUTION_POLICY",
+    },
+  ])("rejects $name execution rewrites", async (fixture) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      const target = resolve(fixtureRoot, fixture.path);
+      const source = await readFile(target, "utf8");
+      expect(source).toContain(fixture.before);
+      await writeFile(
+        target,
+        source.replace(fixture.before, fixture.after),
+        "utf8",
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain(`(${fixture.code})`);
     });
   });
 
