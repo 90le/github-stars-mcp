@@ -7,6 +7,9 @@
   "engines": {
     "node": ">=22"
   },
+  "bin": {
+    "github-stars-mcp": "dist/cli.js"
+  },
   "files": [
     "dist",
     "plugins/github-stars-mcp",
