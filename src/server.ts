@@ -47,6 +47,7 @@ export type GitHubSessionFactory = (
   config: AppConfig,
   env: Readonly<NodeJS.ProcessEnv>,
   rateGate: RateGate,
+  signal?: AbortSignal,
 ) => Promise<GitHubSession>;
 
 export type ServiceFactoryOptions = Readonly<{
@@ -55,12 +56,14 @@ export type ServiceFactoryOptions = Readonly<{
   sessionFactory?: GitHubSessionFactory;
   instanceId?: string;
   env?: Readonly<NodeJS.ProcessEnv>;
+  signal?: AbortSignal;
 }>;
 
 async function createGitHubSession(
   config: AppConfig,
   env: Readonly<NodeJS.ProcessEnv>,
   rateGate: RateGate,
+  signal?: AbortSignal,
 ): Promise<GitHubSession> {
   const credential = await new CredentialProvider(
     config,
@@ -70,7 +73,7 @@ async function createGitHubSession(
   const github = new OctokitGitHubAdapter(
     createOctokitTransport(credential, PACKAGE_VERSION, rateGate),
   );
-  const binding = await github.getViewer();
+  const binding = await github.getViewer(signal);
   return Object.freeze({
     github,
     credentialSource: credential.source,
@@ -89,6 +92,7 @@ export async function createServices(
     config,
     options.env ?? process.env,
     rateGate,
+    options.signal,
   );
   const evidence = new EvidenceService(
     session.github,
@@ -230,14 +234,17 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     store.recoverIncompleteSnapshots(runtime.now());
     store.recoverInterruptedRuns(runtime.now());
 
-    const services = await (dependencies.serviceFactory ?? createServices)(
-      options.config,
-      store,
-      {
+    const services = await coordinator.run((signal) =>
+      (dependencies.serviceFactory ?? createServices)(options.config, store, {
         runtime,
         env: options.env ?? process.env,
-      },
+        signal,
+      }),
     );
+    if (!coordinator.accepting) {
+      await requestShutdown();
+      return;
+    }
     server = (dependencies.serverFactory ?? createMcpServer)(
       services,
       coordinator,
@@ -260,11 +267,13 @@ export async function runServer(options: RunServerOptions): Promise<void> {
     await closed;
     await shutdownPromise;
   } catch (error) {
+    const shutdownWasAlreadyRequested = shutdownPromise !== undefined;
     try {
       await requestShutdown();
     } catch (shutdownError) {
       logger.error("shutdown_failed", safeErrorMessage(shutdownError));
     }
+    if (shutdownWasAlreadyRequested) return;
     throw error;
   } finally {
     signalSource.off("SIGINT", onSignal);

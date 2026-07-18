@@ -104,6 +104,51 @@ function lifecycleStore(events: string[]): StoragePort {
 }
 
 describe("runServer lifecycle", () => {
+  it("keeps storage open while an abortable startup session unwinds", async () => {
+    const events: string[] = [];
+    const signals = new TestSignals();
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const transportFactory = vi.fn(() => {
+      throw new Error("transport must not be created after shutdown");
+    });
+    const running = runServer({
+      config: CONFIG,
+      loggerSink: { write: () => true },
+      dependencies: {
+        runtime: new SystemRuntime(),
+        signalSource: signals,
+        storeFactory: () => lifecycleStore(events),
+        serviceFactory: async (_config, _store, options) => {
+          entered.resolve();
+          const signal = options?.signal;
+          if (signal === undefined) throw new Error("missing startup signal");
+          expect(signal.aborted).toBe(false);
+          await new Promise<void>((resolve) => {
+            signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+          events.push("startupAbort");
+          await release.promise;
+          events.push("startupCleanup");
+          return fakeServices();
+        },
+        transportFactory,
+      },
+    });
+
+    await entered.promise;
+    signals.emit("SIGTERM");
+    await Promise.resolve();
+    expect(events).toContain("startupAbort");
+    expect(events).not.toContain("closeStore");
+    release.resolve();
+    await expect(running).resolves.toBeUndefined();
+    expect(transportFactory).not.toHaveBeenCalled();
+    expect(events.indexOf("startupCleanup")).toBeLessThan(
+      events.indexOf("closeStore"),
+    );
+  });
+
   it("recovers local state before connecting and closes in safe order", async () => {
     const events: string[] = [];
     const signals = new TestSignals();
