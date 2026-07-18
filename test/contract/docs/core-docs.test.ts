@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 const requiredFiles = [
   "README.md",
+  "README.zh-CN.md",
   "docs/architecture.md",
   "docs/requirements.md",
   "docs/security.md",
@@ -163,5 +164,21 @@ describe("core documentation", () => {
     const requirements = await readFile("docs/requirements.md", "utf8");
     expect(readme).toContain("docs/tool-reference.md");
     expect(requirements).toContain("verification-matrix.md");
+  });
+
+  it("keeps the bilingual landing pages linked and structurally aligned", async () => {
+    const [english, chinese] = await Promise.all([
+      readFile("README.md", "utf8"),
+      readFile("README.zh-CN.md", "utf8"),
+    ]);
+    for (const text of [english, chinese]) {
+      expect(text).toContain("[English](README.md)");
+      expect(text).toContain("[简体中文](README.zh-CN.md)");
+      expect(text).toContain("github_stars_status");
+      expect(text).toContain("github_changes_apply");
+      expect(text).toContain("GITHUB_STARS_MCP_READ_ONLY");
+    }
+    expect(english).toContain("AI-native MCP server");
+    expect(chinese).toContain("面向 AI 的 MCP Server");
   });
 });
