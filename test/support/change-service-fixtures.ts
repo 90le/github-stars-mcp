@@ -1620,6 +1620,11 @@ export interface RollbackFixtureOptions {
   readonly transformPlan?: (plan: ChangePlan) => unknown;
   readonly transformRun?: (run: ChangeRun) => unknown;
   readonly transformRows?: (rows: readonly RunOperation[]) => unknown;
+  readonly runRowsProvider?: (
+    runId: RunId,
+    sourceRows: readonly RunOperation[],
+  ) => unknown;
+  readonly transformSnapshot?: (snapshot: Snapshot) => unknown;
   readonly transformListPage?: (
     page: ListQueryPage,
     input: ListQuery,
@@ -1811,11 +1816,14 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
     },
     listRunOperations(id: RunId): readonly RunOperation[] {
       tracking.listRunOperations += 1;
-      if (id !== sourceRun.id) return Object.freeze([]);
       const value =
-        options.transformRows === undefined
-          ? sourceRows
-          : options.transformRows(sourceRows);
+        options.runRowsProvider !== undefined
+          ? options.runRowsProvider(id, sourceRows)
+          : id !== sourceRun.id
+            ? Object.freeze([])
+            : options.transformRows === undefined
+              ? sourceRows
+              : options.transformRows(sourceRows);
       return value as readonly RunOperation[];
     },
     getCompleteSnapshot(id: Parameters<StoragePort["getCompleteSnapshot"]>[0]) {
@@ -1823,7 +1831,10 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
       if (id === snapshot.id && options.sourceSnapshotAvailable === false) {
         return null;
       }
-      return rawStorage.getCompleteSnapshot(id);
+      const value = rawStorage.getCompleteSnapshot(id);
+      return value === null || options.transformSnapshot === undefined
+        ? value
+        : (options.transformSnapshot(value) as Snapshot);
     },
     getSnapshotRepository(
       snapshotId: Parameters<StoragePort["getSnapshotRepository"]>[0],

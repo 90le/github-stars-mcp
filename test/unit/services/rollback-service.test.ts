@@ -18,6 +18,7 @@ import {
   asPlanId,
   asRepositoryId,
   asRunId,
+  asSnapshotId,
   asUserListId,
   type UserListId,
 } from "../../../src/domain/ids.js";
@@ -559,7 +560,59 @@ describe("RollbackService", () => {
     },
   );
 
-  it("fails closed for missing or corrupt source records and bindings", async () => {
+  it("rejects a coherent run returned under the wrong requested key before downstream reads", async () => {
+    const substitutedRunId = asRunId("run_substituted");
+    const fixture = rollbackFixture({
+      transformRun: (run) =>
+        parseChangeRun({
+          ...run,
+          id: substitutedRunId,
+        }),
+      runRowsProvider: (runId, rows) =>
+        Object.freeze(
+          rows.map((row) =>
+            parseRunOperation({
+              ...row,
+              runId,
+            }),
+          ),
+        ),
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+
+    expect(fixture.tracking.getRun).toBe(1);
+    expect(fixture.tracking.getPlan).toBe(0);
+    expect(fixture.tracking.getCompleteSnapshot).toBe(0);
+    expect(fixture.tracking.listRunOperations).toBe(0);
+    expectNoSave(fixture);
+  });
+
+  it("rejects a complete snapshot returned under the wrong requested key before downstream reads", async () => {
+    const fixture = rollbackFixture({
+      transformSnapshot: (snapshot) => ({
+        ...snapshot,
+        id: asSnapshotId("snap_substituted"),
+      }),
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+
+    expect(fixture.tracking.getCompleteSnapshot).toBe(1);
+    expect(fixture.tracking.listRunOperations).toBe(0);
+    expect(fixture.tracking.listQueries).toEqual([]);
+    expect(fixture.tracking.snapshotRepositoryReads).toBe(0);
+    expect(fixture.tracking.membershipQueries).toBe(0);
+    expectNoSave(fixture);
+  });
+
+  it("fails closed for missing source records and bindings", async () => {
     const missingRun = rollbackFixture({ transformRun: () => null });
     await rejectsWith(
       service(missingRun).createRollback(missingRun.validInput),
@@ -620,24 +673,6 @@ describe("RollbackService", () => {
     );
     expectNoSave(lifecycle);
 
-    const corruptRun = rollbackFixture({
-      transformRun: (run) => ({ ...run, unknown: true }),
-    });
-    await rejectsWith(
-      service(corruptRun).createRollback(corruptRun.validInput),
-      "VALIDATION_ERROR",
-    );
-    expectNoSave(corruptRun);
-
-    const corruptPlan = rollbackFixture({
-      transformPlan: (plan) => ({ ...plan, unknown: true }),
-    });
-    await rejectsWith(
-      service(corruptPlan).createRollback(corruptPlan.validInput),
-      "VALIDATION_ERROR",
-    );
-    expectNoSave(corruptPlan);
-
     const snapshot = rollbackFixture({ sourceSnapshotAvailable: false });
     await rejectsWith(
       service(snapshot).createRollback(snapshot.validInput),
@@ -645,6 +680,43 @@ describe("RollbackService", () => {
     );
     expectNoSave(snapshot);
   });
+
+  it.each([
+    [
+      "run",
+      () =>
+        rollbackFixture({
+          transformRun: (run) => ({ ...run, unknown: true }),
+        }),
+    ],
+    [
+      "plan",
+      () =>
+        rollbackFixture({
+          transformPlan: (plan) => ({ ...plan, unknown: true }),
+        }),
+    ],
+    [
+      "snapshot",
+      () =>
+        rollbackFixture({
+          transformSnapshot: (snapshot) => ({
+            ...snapshot,
+            unknown: true,
+          }),
+        }),
+    ],
+  ] as const)(
+    "normalizes a corrupt storage-returned source %s to a precondition failure",
+    async (_label, buildFixture) => {
+      const fixture = buildFixture();
+      await rejectsWith(
+        service(fixture).createRollback(fixture.validInput),
+        "PRECONDITION_FAILED",
+      );
+      expectNoSave(fixture);
+    },
+  );
 
   it("rejects missing, duplicate, foreign, mis-sequenced, or contradictory audit rows", async () => {
     const cases = [
@@ -711,6 +783,111 @@ describe("RollbackService", () => {
       );
       expectNoSave(fixture);
     }
+  });
+
+  it("rejects a completed run containing a failed operation row", async () => {
+    const fixture = rollbackFixture({
+      rowStatuses: {
+        [rollbackSourceOperationIds.membership]: "failed",
+      },
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+
+    expect(fixture.tracking.listQueries).toEqual([]);
+    expect(fixture.tracking.snapshotRepositoryReads).toBe(0);
+    expect(fixture.tracking.membershipQueries).toBe(0);
+    expectNoSave(fixture);
+  });
+
+  it("rejects a full-coverage partial run whose rows are all succeeded or skipped", async () => {
+    const fixture = rollbackFixture({
+      runState: "partial",
+      failureMode: "continue",
+      rowStatuses: {
+        [rollbackSourceOperationIds.membership]: "skipped",
+      },
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+
+    expect(fixture.tracking.listQueries).toEqual([]);
+    expect(fixture.tracking.snapshotRepositoryReads).toBe(0);
+    expect(fixture.tracking.membershipQueries).toBe(0);
+    expectNoSave(fixture);
+  });
+
+  it.each(["pending", "running"] as const)(
+    "rejects a terminal source run containing a %s operation row",
+    async (status) => {
+      const fixture = rollbackFixture({
+        rowStatuses: {
+          [rollbackSourceOperationIds.membership]: status,
+        },
+      });
+
+      await rejectsWith(
+        service(fixture).createRollback(fixture.validInput),
+        "PRECONDITION_FAILED",
+      );
+
+      expect(fixture.tracking.listQueries).toEqual([]);
+      expect(fixture.tracking.snapshotRepositoryReads).toBe(0);
+      expect(fixture.tracking.membershipQueries).toBe(0);
+      expectNoSave(fixture);
+    },
+  );
+
+  it("accepts a valid partial stop prefix ending at an unresolved boundary with an exact unscheduled suffix", async () => {
+    const fixture = rollbackFixture({
+      runState: "partial",
+      failureMode: "stop",
+      rowStatuses: {
+        [rollbackSourceOperationIds.unstar]: "skipped",
+        [rollbackSourceOperationIds.create]: "unresolved",
+      },
+      transformRows: (rows) => Object.freeze(rows.slice(0, 3)),
+    });
+
+    const { plan } = await service(fixture).createRollback(fixture.validInput);
+
+    expect(
+      plan.operations.some((operation) =>
+        operation.operationId.includes(rollbackSourceOperationIds.star),
+      ),
+    ).toBe(true);
+    expect(
+      plan.operations.some((operation) =>
+        operation.operationId.includes(rollbackSourceOperationIds.unstar),
+      ),
+    ).toBe(false);
+    expect(plan.warnings).toContain(
+      `Source run ${fixture.sourceRun.id} has 4 unscheduled operations without audit rows; they are not included.`,
+    );
+    expect(fixture.tracking.transactionCalls).toBe(1);
+    expect(fixture.tracking.savedPlans).toEqual([plan]);
+  });
+
+  it("accepts a partial stop exact successful prefix with an unscheduled suffix", async () => {
+    const fixture = rollbackFixture({
+      runState: "partial",
+      failureMode: "stop",
+      transformRows: (rows) => Object.freeze(rows.slice(0, 2)),
+    });
+
+    const { plan } = await service(fixture).createRollback(fixture.validInput);
+
+    expect(plan.warnings).toContain(
+      `Source run ${fixture.sourceRun.id} has 5 unscheduled operations without audit rows; they are not included.`,
+    );
+    expect(fixture.tracking.transactionCalls).toBe(1);
+    expect(fixture.tracking.savedPlans).toEqual([plan]);
   });
 
   it("accepts an exact stop-partial audit prefix and warns about the unscheduled gap", async () => {
@@ -1350,6 +1527,7 @@ describe("RollbackService", () => {
       runState: "partial",
       rowStatuses: {
         [rollbackSourceOperationIds.createdMembership]: "skipped",
+        [rollbackSourceOperationIds.membership]: "failed",
       },
     });
     const { plan } = await service(fixture).createRollback(fixture.validInput);

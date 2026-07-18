@@ -39,6 +39,7 @@ import {
   type ChangeRun,
   type RunOperation,
 } from "../../domain/run.js";
+import { parseSnapshot } from "../../domain/snapshot.js";
 import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
 import type { Clock, IdGenerator } from "../ports/runtime-port.js";
 import type { StoragePort } from "../ports/storage-port.js";
@@ -515,6 +516,27 @@ function sourceAudit(
       );
     }
     result.set(row.operationId, row);
+  }
+  const rowValues = [...result.values()];
+  if (
+    rowValues.some(
+      (row) => row.status === "pending" || row.status === "running",
+    )
+  ) {
+    return precondition("source terminal run contains an in-flight audit row");
+  }
+  const hasFullCoverage = result.size === planOperations.length;
+  const allRowsSucceededOrSkipped = rowValues.every(
+    (row) => row.status === "succeeded" || row.status === "skipped",
+  );
+  if (
+    (run.state === "completed" &&
+      (!hasFullCoverage || !allRowsSucceededOrSkipped)) ||
+    (run.state === "partial" && hasFullCoverage && allRowsSucceededOrSkipped)
+  ) {
+    return precondition(
+      "source run terminal state contradicts its operation audit",
+    );
   }
   if (!allowsUnscheduledSuffix && result.size !== planOperations.length) {
     return precondition("source run audit is missing operation rows");
@@ -995,9 +1017,13 @@ export class RollbackService {
     let run;
     try {
       run = parseChangeRun(rawRun);
-    } catch (error) {
-      if (error instanceof AppError) throw error;
+    } catch {
       return precondition("Source run is corrupt");
+    }
+    if (run.id !== request.runId) {
+      return precondition(
+        "Source run identity does not match the requested key",
+      );
     }
     if (run.state !== "completed" && run.state !== "partial") {
       return precondition(
@@ -1010,8 +1036,7 @@ export class RollbackService {
     let sourcePlan;
     try {
       sourcePlan = parseChangePlan(rawPlan);
-    } catch (error) {
-      if (error instanceof AppError) throw error;
+    } catch {
       return precondition("Source plan is corrupt");
     }
     if (
@@ -1029,17 +1054,30 @@ export class RollbackService {
       );
     }
 
-    const snapshot = this.#storage.getCompleteSnapshot(
-      sourcePlan.executable.snapshotId,
-    );
-    if (snapshot === null) {
+    const sourceSnapshotId = sourcePlan.executable.snapshotId;
+    const rawSnapshot = this.#storage.getCompleteSnapshot(sourceSnapshotId);
+    if (rawSnapshot === null) {
       return staleSnapshot(
         "Rollback requires the persisted complete source snapshot",
       );
     }
-    if (!sameBinding(snapshot.binding, sourcePlan.executable.binding)) {
+    let snapshot;
+    try {
+      snapshot = parseSnapshot(rawSnapshot);
+    } catch {
+      return precondition("Source snapshot is corrupt");
+    }
+    if (snapshot.id !== sourceSnapshotId || snapshot.status !== "complete") {
       return precondition(
-        "Source snapshot binding does not match the source executable",
+        "Source snapshot lifecycle does not match the requested key",
+      );
+    }
+    if (
+      !sameBinding(snapshot.binding, sourcePlan.executable.binding) ||
+      !sameBinding(snapshot.binding, run.binding)
+    ) {
+      return precondition(
+        "Source snapshot binding does not match the source run and executable",
       );
     }
     if (snapshot.listCoverage !== "complete") {
