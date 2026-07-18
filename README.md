@@ -284,6 +284,7 @@ only after inspection establishes current state.
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [MCP tool reference](docs/tool-reference.md)
 - [Requirements](docs/requirements.md)
 - [Security model](docs/security.md)
 - [Codex plugin](docs/plugin.md)
