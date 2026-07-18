@@ -765,9 +765,18 @@ function querySnapshotMemberships(
   repositoryId: RepositoryId,
 ): readonly UserListId[] {
   const result: UserListId[] = [];
+  const seenCursors = new Set<string>();
   let cursor: string | null = null;
   let expectedTotal: number | null = null;
   do {
+    if (cursor !== null) {
+      if (seenCursors.has(cursor)) {
+        return precondition(
+          "source snapshot membership pagination repeated a cursor",
+        );
+      }
+      seenCursors.add(cursor);
+    }
     const page = storage.queryListMemberships({
       snapshotId,
       selector: { kind: "repository", repositoryId },
@@ -784,16 +793,30 @@ function querySnapshotMemberships(
         "source snapshot membership selector echo is contradictory",
       );
     }
+    const pageListIds = page.listIds;
+    if (pageListIds.length > PAGE_SIZE) {
+      return precondition("source snapshot membership page is not bounded");
+    }
     if (expectedTotal === null) expectedTotal = page.total;
-    if (expectedTotal !== page.total || page.total > MAX_IDS) {
+    if (
+      !Number.isSafeInteger(page.total) ||
+      page.total < 0 ||
+      expectedTotal !== page.total ||
+      page.total > MAX_IDS
+    ) {
       return precondition(
         "source snapshot membership pagination is contradictory",
       );
     }
-    result.push(...page.listIds);
+    result.push(...pageListIds);
+    if (result.length > expectedTotal || result.length > MAX_IDS) {
+      return precondition(
+        "source snapshot membership pagination exceeded its bound",
+      );
+    }
     if (
       page.nextCursor !== null &&
-      (page.nextCursor === cursor || page.listIds.length === 0)
+      (page.nextCursor === cursor || pageListIds.length === 0)
     ) {
       return precondition(
         "source snapshot membership pagination did not advance",

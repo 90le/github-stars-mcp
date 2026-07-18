@@ -22,6 +22,7 @@ import {
 } from "../../src/domain/plan.js";
 import type {
   ListMembershipQuery,
+  ListMembershipQueryPage,
   ListQuery,
   ListQueryPage,
   RepositoryQuery,
@@ -1623,6 +1624,10 @@ export interface RollbackFixtureOptions {
     page: ListQueryPage,
     input: ListQuery,
   ) => unknown;
+  readonly membershipPageProvider?: (
+    input: ListMembershipQuery,
+    fallback: () => ListMembershipQueryPage,
+  ) => unknown;
   readonly transformSnapshotRepository?: (
     repository: RepositoryView | null,
     repositoryId: RepositoryId,
@@ -1853,7 +1858,13 @@ export function rollbackFixture(options: RollbackFixtureOptions = {}) {
     },
     queryListMemberships(input: ListMembershipQuery) {
       tracking.membershipQueries += 1;
-      return rawStorage.queryListMemberships(input);
+      const value =
+        options.membershipPageProvider === undefined
+          ? rawStorage.queryListMemberships(input)
+          : options.membershipPageProvider(input, () =>
+              rawStorage.queryListMemberships(input),
+            );
+      return value as ListMembershipQueryPage;
     },
     withTransaction<T>(callback: (transaction: StorageTransaction) => T): T {
       tracking.transactionCalls += 1;

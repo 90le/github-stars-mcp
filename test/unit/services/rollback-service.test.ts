@@ -21,6 +21,10 @@ import {
   asUserListId,
   type UserListId,
 } from "../../../src/domain/ids.js";
+import type {
+  ListMembershipQuery,
+  ListMembershipQueryPage,
+} from "../../../src/domain/filter.js";
 import type { JsonValue } from "../../../src/domain/json.js";
 import {
   hashPlanExecutable,
@@ -260,6 +264,58 @@ function replaceCreatedAuditListId(
       });
     }),
   );
+}
+
+type RepositoryMembershipPage = Extract<
+  ListMembershipQueryPage,
+  { readonly selector: { readonly kind: "repository" } }
+>;
+
+function membershipIds(
+  prefix: string,
+  start: number,
+  count: number,
+): readonly UserListId[] {
+  return Object.freeze(
+    Array.from({ length: count }, (_, index) =>
+      asUserListId(`${prefix}_${String(start + index).padStart(4, "0")}`),
+    ),
+  );
+}
+
+function repositoryMembershipPage(
+  input: ListMembershipQuery,
+  listIds: readonly UserListId[],
+  total: number,
+  nextCursor: string | null,
+): RepositoryMembershipPage {
+  if (input.selector.kind !== "repository") {
+    throw new Error("Rollback must query memberships by repository");
+  }
+  return Object.freeze({
+    coverage: "complete",
+    selector: Object.freeze({
+      kind: "repository" as const,
+      repositoryId: input.selector.repositoryId,
+    }),
+    listIds: Object.freeze([...listIds]),
+    total,
+    nextCursor,
+  });
+}
+
+function targetMembershipProvider(
+  targetRepositoryId: ReturnType<typeof asRepositoryId>,
+  pageForTarget: (input: ListMembershipQuery) => RepositoryMembershipPage,
+): (
+  input: ListMembershipQuery,
+  fallback: () => ListMembershipQueryPage,
+) => ListMembershipQueryPage {
+  return (input, fallback) =>
+    input.selector.kind === "repository" &&
+    input.selector.repositoryId === targetRepositoryId
+      ? pageForTarget(input)
+      : fallback();
 }
 
 function assertNoDanglingDependencies(
@@ -845,6 +901,247 @@ describe("RollbackService", () => {
     );
     expect(overBound.tracking.listQueries).toHaveLength(1);
     expectNoSave(overBound);
+  });
+
+  it("rejects an A-to-B-to-A membership cursor cycle before revisiting a cursor", async () => {
+    const target = asRepositoryId("R_created_member");
+    let cursorAVisits = 0;
+    const fixture = rollbackFixture({
+      membershipPageProvider: targetMembershipProvider(target, (input) => {
+        if (input.cursor === null) {
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_cycle", 0, 1),
+            4,
+            "cursor_a",
+          );
+        }
+        if (input.cursor === "cursor_a") {
+          cursorAVisits += 1;
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_cycle", cursorAVisits === 1 ? 1 : 3, 1),
+            4,
+            cursorAVisits === 1 ? "cursor_b" : null,
+          );
+        }
+        if (input.cursor === "cursor_b") {
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_cycle", 2, 1),
+            4,
+            "cursor_a",
+          );
+        }
+        throw new Error("Unexpected membership cursor");
+      }),
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expect(fixture.tracking.membershipQueries).toBe(3);
+    expect(cursorAVisits).toBe(1);
+    expectNoSave(fixture);
+  });
+
+  it("rejects a single membership page larger than the requested page size", async () => {
+    const target = asRepositoryId("R_created_member");
+    const fixture = rollbackFixture({
+      membershipPageProvider: targetMembershipProvider(target, (input) =>
+        repositoryMembershipPage(
+          input,
+          membershipIds("UL_oversized", 0, 101),
+          101,
+          null,
+        ),
+      ),
+    });
+
+    await rejectsWith(
+      service(fixture).createRollback(fixture.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expect(fixture.tracking.membershipQueries).toBe(1);
+    expectNoSave(fixture);
+  });
+
+  it("stops membership pagination as soon as accumulation exceeds the declared total", async () => {
+    const target = asRepositoryId("R_created_member");
+    const declaredBound = rollbackFixture({
+      membershipPageProvider: targetMembershipProvider(target, (input) => {
+        if (input.cursor === null) {
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_declared", 0, 100),
+            100,
+            "declared_1",
+          );
+        }
+        if (input.cursor === "declared_1") {
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_declared", 100, 1),
+            100,
+            "declared_2",
+          );
+        }
+        return repositoryMembershipPage(input, [], 100, null);
+      }),
+    });
+
+    await rejectsWith(
+      service(declaredBound).createRollback(declaredBound.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expect(declaredBound.tracking.membershipQueries).toBe(2);
+    expectNoSave(declaredBound);
+  });
+
+  it("stops membership pagination as soon as accumulation exceeds the global bound", async () => {
+    const target = asRepositoryId("R_created_member");
+    const globalBound = rollbackFixture({
+      membershipPageProvider: targetMembershipProvider(target, (input) => {
+        const pageIndex =
+          input.cursor === null
+            ? 0
+            : Number.parseInt(input.cursor.replace("global_", ""), 10);
+        if (pageIndex < 50) {
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_global", pageIndex * 100, 100),
+            5_000,
+            `global_${String(pageIndex + 1)}`,
+          );
+        }
+        if (pageIndex === 50) {
+          return repositoryMembershipPage(
+            input,
+            membershipIds("UL_global", 5_000, 1),
+            5_000,
+            "global_51",
+          );
+        }
+        return repositoryMembershipPage(input, [], 5_000, null);
+      }),
+    });
+
+    await rejectsWith(
+      service(globalBound).createRollback(globalBound.validInput),
+      "PRECONDITION_FAILED",
+    );
+    expect(globalBound.tracking.membershipQueries).toBe(51);
+    expectNoSave(globalBound);
+  });
+
+  it("rejects negative, unsafe, and cross-page-changing membership totals", async () => {
+    const target = asRepositoryId("R_created_member");
+    const cases = [
+      {
+        calls: 1,
+        fixture: rollbackFixture({
+          membershipPageProvider: targetMembershipProvider(target, (input) =>
+            repositoryMembershipPage(input, [], -1, null),
+          ),
+        }),
+      },
+      {
+        calls: 1,
+        fixture: rollbackFixture({
+          membershipPageProvider: targetMembershipProvider(target, (input) =>
+            repositoryMembershipPage(
+              input,
+              [],
+              Number.MAX_SAFE_INTEGER + 1,
+              null,
+            ),
+          ),
+        }),
+      },
+      {
+        calls: 2,
+        fixture: rollbackFixture({
+          membershipPageProvider: targetMembershipProvider(target, (input) =>
+            input.cursor === null
+              ? repositoryMembershipPage(
+                  input,
+                  membershipIds("UL_total", 0, 1),
+                  2,
+                  "total_1",
+                )
+              : repositoryMembershipPage(
+                  input,
+                  membershipIds("UL_total", 1, 1),
+                  3,
+                  null,
+                ),
+          ),
+        }),
+      },
+    ];
+
+    for (const { calls, fixture } of cases) {
+      await rejectsWith(
+        service(fixture).createRollback(fixture.validInput),
+        "PRECONDITION_FAILED",
+      );
+      expect(fixture.tracking.membershipQueries).toBe(calls);
+      expectNoSave(fixture);
+    }
+  });
+
+  it("retains exact-end and duplicate membership validation", async () => {
+    const target = asRepositoryId("R_created_member");
+    const duplicate = asUserListId("UL_duplicate");
+    const invalidCases = [
+      rollbackFixture({
+        membershipPageProvider: targetMembershipProvider(target, (input) =>
+          input.cursor === null
+            ? repositoryMembershipPage(input, [duplicate], 2, "duplicate_1")
+            : repositoryMembershipPage(input, [duplicate], 2, null),
+        ),
+      }),
+      rollbackFixture({
+        membershipPageProvider: targetMembershipProvider(target, (input) =>
+          repositoryMembershipPage(
+            input,
+            membershipIds("UL_incomplete", 0, 1),
+            2,
+            null,
+          ),
+        ),
+      }),
+    ];
+
+    for (const fixture of invalidCases) {
+      await rejectsWith(
+        service(fixture).createRollback(fixture.validInput),
+        "PRECONDITION_FAILED",
+      );
+      expectNoSave(fixture);
+    }
+
+    const exact = rollbackFixture({
+      membershipPageProvider: targetMembershipProvider(target, (input) =>
+        input.cursor === null
+          ? repositoryMembershipPage(
+              input,
+              membershipIds("UL_exact", 0, 1),
+              2,
+              "exact_1",
+            )
+          : repositoryMembershipPage(
+              input,
+              membershipIds("UL_exact", 1, 1),
+              2,
+              null,
+            ),
+      ),
+    });
+    const { plan } = await service(exact).createRollback(exact.validInput);
+    expect(exact.tracking.transactionCalls).toBe(1);
+    expect(exact.tracking.savedPlans).toEqual([plan]);
   });
 
   it("rejects corrupt or key-mismatched snapshot repository records before persistence", async () => {
