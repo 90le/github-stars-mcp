@@ -55,6 +55,7 @@ const EXPECTED_PACKAGE_FILES = Object.freeze([
   "dist",
   "plugins/github-stars-mcp",
   "README.md",
+  "README.zh-CN.md",
   "LICENSE",
   "SECURITY.md",
   "npm-shrinkwrap.json",
@@ -1272,6 +1273,7 @@ async function validatePackageDryRun(staticOnly, expectedDistPaths, assets) {
         return (
           path === "package.json" ||
           path === "README.md" ||
+          path === "README.zh-CN.md" ||
           path === "LICENSE" ||
           path === "SECURITY.md" ||
           path === "npm-shrinkwrap.json" ||

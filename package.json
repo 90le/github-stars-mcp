@@ -37,6 +37,7 @@
     "dist",
     "plugins/github-stars-mcp",
     "README.md",
+    "README.zh-CN.md",
     "LICENSE",
     "SECURITY.md",
     "npm-shrinkwrap.json"
