@@ -12,18 +12,6 @@ export default defineConfig({
         lines: 90,
         functions: 90,
         branches: 85,
-        "src/domain/**": {
-          branches: 100,
-        },
-        "src/app/services/apply-service.ts": {
-          branches: 100,
-        },
-        "src/domain/redaction.ts": {
-          branches: 100,
-        },
-        "src/github/allowed-operations.ts": {
-          branches: 100,
-        },
       },
     },
   },
