@@ -4,6 +4,7 @@ import type {
   ToolAnnotations,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { z } from "zod";
+import type { OperationCoordinator } from "../app/services/operation-coordinator.js";
 import { newRequestId } from "../domain/ids.js";
 import type { ToolName } from "./schemas/common.js";
 import type { ToolOutputSchemas } from "./schemas/output.js";
@@ -41,6 +42,7 @@ export function registerMappedTool<
 >(
   server: McpServer,
   registration: Registration<Name, InputSchema, ServiceResult>,
+  coordinator?: OperationCoordinator,
 ): void {
   server.registerTool<(typeof ToolOutputSchemas)[Name], z.ZodType>(
     registration.name,
@@ -53,29 +55,31 @@ export function registerMappedTool<
     async (input, context): Promise<CallToolResult> => {
       const requestId = newRequestId();
       try {
-        const parsed = registration.inputSchema.parse(input);
-        const serviceResult = await registration.execute(
-          parsed,
-          context.signal,
-        );
-        const mapped = registration.mapOutput(serviceResult);
-        const success = toolSuccess(mapped.data, {
-          requestId,
-          summary: registration.summary,
-          warnings: mapped.warnings,
-          rateLimit: mapped.rateLimit,
-          nextCursor: mapped.nextCursor,
-        });
-        const plainStructuredContent: unknown = JSON.parse(
-          JSON.stringify(success.structuredContent),
-        );
-        const structuredContent = registration.outputSchema.parse(
-          plainStructuredContent,
-        );
-        return {
-          ...success,
-          structuredContent,
+        const invoke = async (signal: AbortSignal): Promise<CallToolResult> => {
+          const parsed = registration.inputSchema.parse(input);
+          const serviceResult = await registration.execute(parsed, signal);
+          const mapped = registration.mapOutput(serviceResult);
+          const success = toolSuccess(mapped.data, {
+            requestId,
+            summary: registration.summary,
+            warnings: mapped.warnings,
+            rateLimit: mapped.rateLimit,
+            nextCursor: mapped.nextCursor,
+          });
+          const plainStructuredContent: unknown = JSON.parse(
+            JSON.stringify(success.structuredContent),
+          );
+          const structuredContent = registration.outputSchema.parse(
+            plainStructuredContent,
+          );
+          return {
+            ...success,
+            structuredContent,
+          };
         };
+        return coordinator === undefined
+          ? await invoke(context.signal)
+          : await coordinator.run(invoke, context.signal);
       } catch (error) {
         const failure = toolFailure(error, requestId);
         const plainStructuredContent: unknown = JSON.parse(
