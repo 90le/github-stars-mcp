@@ -41,6 +41,7 @@ const ARCHIVE_PLUGIN_ROOT = `${PACKAGE_ROOT}${PLUGIN_ROOT}`;
 const REQUIRED_ARCHIVE_FILES = Object.freeze([
   "package/LICENSE",
   "package/README.md",
+  "package/README.zh-CN.md",
   "package/SECURITY.md",
   "package/dist/cli.js",
   "package/npm-shrinkwrap.json",
@@ -62,6 +63,7 @@ const REQUIRED_DOCTOR_CHECKS = Object.freeze([
 const METADATA_FILES = new Set([
   "package/LICENSE",
   "package/README.md",
+  "package/README.zh-CN.md",
   "package/SECURITY.md",
   "package/npm-shrinkwrap.json",
   "package/package.json",
