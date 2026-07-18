@@ -21,11 +21,13 @@ AI-native, auditable GitHub Stars and User Lists management over MCP stdio.
 
 Usage:
   github-stars-mcp
+  github-stars-mcp --stdio
   github-stars-mcp --doctor [--json]
   github-stars-mcp --help
   github-stars-mcp --version
 
 Options:
+  --stdio          Start the MCP stdio server (also the default).
   -h, --help       Show this help.
   -V, --version    Show the package version.
   --doctor         Check runtime, database, authentication, network, and capabilities.
@@ -69,7 +71,12 @@ function invalidArguments(): never {
 }
 
 function parseCli(arguments_: readonly string[]): CliMode {
-  if (arguments_.length === 0) return Object.freeze({ kind: "server" });
+  if (
+    arguments_.length === 0 ||
+    (arguments_.length === 1 && arguments_[0] === "--stdio")
+  ) {
+    return Object.freeze({ kind: "server" });
+  }
   if (
     arguments_.length === 1 &&
     (arguments_[0] === "--help" || arguments_[0] === "-h")

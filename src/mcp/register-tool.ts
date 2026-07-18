@@ -163,7 +163,10 @@ function conciseText(result: CallToolResult): CallToolResult["content"] {
   const content = result.content[0];
   const text =
     content?.type === "text"
-      ? content.text.slice(0, MAX_TOOL_TEXT_LENGTH)
+      ? Buffer.from(content.text, "utf8")
+          .toString("utf8")
+          .slice(0, MAX_TOOL_TEXT_LENGTH)
+          .replace(/[\uD800-\uDBFF]$/u, "")
       : "INTERNAL_ERROR: An unexpected internal error occurred";
   return [{ type: "text", text }];
 }
@@ -210,6 +213,12 @@ function initializeToolBoundary(server: McpServer): ToolState {
   const current = toolStates.get(server);
   if (current !== undefined) return current;
 
+  server.server.assertCanSetRequestHandler(
+    ListToolsRequestSchema.shape.method.value,
+  );
+  server.server.assertCanSetRequestHandler(
+    CallToolRequestSchema.shape.method.value,
+  );
   const state: ToolState = { tools: new Map() };
   toolStates.set(server, state);
   server.server.registerCapabilities({ tools: { listChanged: false } });

@@ -178,6 +178,20 @@ function expectNoServiceCalls(services: FakeServices): void {
 }
 
 describe("MCP call error boundary after tool discovery", () => {
+  it("refuses to replace an existing public MCP tool handler", () => {
+    const server = new McpServer({
+      name: "existing-handler-contract",
+      version: "0.0.0",
+    });
+    server.registerTool("existing_tool", {}, () =>
+      Promise.resolve({ content: [{ type: "text", text: "existing" }] }),
+    );
+
+    expect(() => registerReadTools(server, fakeServices())).toThrow(
+      /request handler/iu,
+    );
+  });
+
   it("advertises each exact tool output as success or strict failure", async () => {
     const { client } = await connectServer();
     const listed = await client.listTools();
@@ -328,6 +342,30 @@ describe("MCP call error boundary after tool discovery", () => {
     );
     expectSafeFailure(
       await call(client, { name: "github_stars_status", arguments: {} }),
+    );
+  });
+
+  it("never splits a Unicode surrogate pair at the text boundary", async () => {
+    const { client, services } = await connectServer();
+    await client.listTools();
+    rejectNext(
+      services,
+      "github_stars_status",
+      new AppError(
+        "GITHUB_UNAVAILABLE",
+        `${"a".repeat(159)}😀TAIL`,
+        { retryable: true },
+      ),
+    );
+    const result = await call(client, {
+      name: "github_stars_status",
+      arguments: {},
+    });
+    expectSafeFailure(result);
+    const content = result.content[0];
+    if (content?.type !== "text") throw new Error("expected text failure");
+    expect(Buffer.from(content.text, "utf8").toString("utf8")).toBe(
+      content.text,
     );
   });
 

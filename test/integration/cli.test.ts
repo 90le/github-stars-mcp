@@ -122,24 +122,27 @@ describe("CLI", () => {
     },
   );
 
-  it("starts stdio with read-only defaults and writes no protocol text itself", async () => {
-    const output = io();
-    const serverRunner = vi.fn<typeof runServer>(() => Promise.resolve());
-    expect(
-      await runCli(
-        [],
-        {
-          GITHUB_STARS_MCP_DATA_DIR: resolve(".server-test-state"),
-          GITHUB_STARS_MCP_AUTH_MODE: "env",
-        },
-        { io: output, serverRunner },
-      ),
-    ).toBe(0);
-    expect(serverRunner).toHaveBeenCalledOnce();
-    expect(serverRunner.mock.calls[0]?.[0].config.readOnly).toBe(true);
-    expect(serverRunner.mock.calls[0]?.[0].output).toBe(output.stdout);
-    expect(output.stdout.value).toBe("");
-  });
+  it.each([[[]], [["--stdio"]]] as const)(
+    "starts stdio with arguments %j, read-only defaults, and no protocol text itself",
+    async (arguments_) => {
+      const output = io();
+      const serverRunner = vi.fn<typeof runServer>(() => Promise.resolve());
+      expect(
+        await runCli(
+          arguments_,
+          {
+            GITHUB_STARS_MCP_DATA_DIR: resolve(".server-test-state"),
+            GITHUB_STARS_MCP_AUTH_MODE: "env",
+          },
+          { io: output, serverRunner },
+        ),
+      ).toBe(0);
+      expect(serverRunner).toHaveBeenCalledOnce();
+      expect(serverRunner.mock.calls[0]?.[0].config.readOnly).toBe(true);
+      expect(serverRunner.mock.calls[0]?.[0].output).toBe(output.stdout);
+      expect(output.stdout.value).toBe("");
+    },
+  );
 
   it("rejects unknown flags without reflecting their contents", async () => {
     const output = io();
