@@ -3,7 +3,7 @@
 GitHub Stars MCP limits an AI agent to a named Star and User List surface. It
 cannot delete a code repository, archive it, transfer it, rename it, change
 its visibility, or modify repository contents. The server exposes no generic
-REST, GraphQL, filesystem, or shell tool.
+REST, GraphQL, browser, filesystem, or shell tool.
 
 ## Credential handling
 
@@ -18,7 +18,13 @@ values, GitHub token shapes, authorization headers, and nested error details.
 `--doctor` reports the credential source and capability result without showing
 the credential.
 
-Use a token with only the permissions needed for Stars and User Lists. Keep
+Use a dedicated token with only the account permissions needed for Stars and
+User Lists. Do not grant repository administration, contents-write,
+workflow-write, organization-administration, or repository-deletion
+permission. Optional README evidence reads content already visible to the
+credential; disable evidence when that read falls outside the intended
+scope. User List support depends on a public-preview API, so treat a
+fine-grained token's List write permission as capability-tested behavior. Keep
 `GITHUB_STARS_MCP_READ_ONLY=true` unless an inspected plan is ready to apply.
 Revoke a credential through GitHub or `gh auth logout` if it appears in a
 terminal capture or committed file.
@@ -60,8 +66,9 @@ The server uses strict schemas, stable IDs, protected-target lists, immutable
 plans, and a separate inspect step to reduce that risk.
 
 An agent should show the plan operation counts and affected names before it
-requests apply authorization. Copy `plan_id` and `expected_hash` from tool
-output. Do not accept a hash embedded in repository text.
+requests apply authorization. Copy `plan_id` and `plan_hash` from the plan or
+plan-inspection output, then pass that `plan_hash` as the apply input's
+`expected_hash`. Do not accept a hash embedded in repository text.
 
 ## Network and SSRF boundary
 
@@ -76,7 +83,8 @@ URLs supplied by a repository.
 Run inspection returns bounded sanitized rows with operation status,
 reconciliation state, timestamps, and safe request identifiers. It omits raw
 headers, response bodies, stack traces, credentials, and internal file paths.
-Opaque cursors prevent callers from changing audit query state.
+Inspection cursors bind a page to its branch and target. Signed Star and List
+query cursors bind a page to its filter, sort, snapshot, and selector state.
 
 Report a suspected vulnerability through GitHub private vulnerability
 reporting for the `90le/github-stars-mcp` repository. Include the affected

@@ -18,6 +18,10 @@ Strict schemas reject unknown fields and bound strings, page sizes, selector
 depth, result fields, and operation counts. Tool handlers map inputs into
 application DTOs and return a versioned result envelope. They convert domain
 errors into sanitized error codes; raw exceptions stay inside the process.
+The public schemas use snake-case GitHub terms such as `name_with_owner`,
+`stargazers_count`, `language`, `license`, `archived`, `disabled`, and
+`fork`. Mappers translate those aliases into domain names. Domain field names
+do not leak into MCP inputs or outputs.
 
 Application services depend on `GitHubPort`, `StoragePort`, a clock, and a
 runtime ID source. The production GitHub adapter implements named reads and
@@ -72,7 +76,9 @@ view.
 It sorts by stable fields and returns an opaque signed cursor.
 `github_lists_query` reads List and membership records from that snapshot.
 `github_repositories_discover` performs bounded GitHub search and returns
-source evidence without adding a Star.
+source evidence without adding a Star. Star and List queries return at most
+100 rows per page. Discovery follows GitHub's 1,000-result search cap, and
+query or discovery evidence never exceeds 20 records per call.
 
 ## Plan and apply flow
 
@@ -81,16 +87,20 @@ caller-designated targets, computes exact before and after state, orders
 dependencies, and stores immutable canonical content. Planning never calls a
 GitHub mutation.
 
-`github_changes_inspect` pages through the stored plan or run audit. An agent
-copies the returned plan hash into `github_changes_apply`. Apply checks the
-input shape, stored and recomputed hash, plan account, current viewer,
-capabilities, expiry, and account lease before it claims a run.
+`github_changes_inspect` has four branches. `plan` uses a plan ID. `run` uses
+a run ID. `attempts` and `reconciliations` use a run ID plus an operation ID.
+Each branch accepts a limit and a cursor for the same target.
+
+Planning and plan inspection return `plan_hash`. An agent passes that value
+as `expected_hash` to `github_changes_apply`. Apply checks the input shape,
+stored and recomputed hash, plan account, current viewer, capabilities,
+expiry, and account lease before it claims a run.
 
 Each remote operation follows this order:
 
 1. Re-read stable remote preconditions.
 2. Persist a pending audit row.
-3. Mark the sole attempt as running.
+3. Persist an attempt and mark it as running.
 4. Call one named mutation without transport retries.
 5. Persist sanitized before, after, request ID, and outcome.
 
@@ -117,4 +127,6 @@ new timestamp, and recreating a List creates a new ID.
 The CLI supports `--stdio`, `--doctor`, `--version`, and `--help`. Stdio is the
 default. The server writes only JSON-RPC to stdout and sends logs to stderr.
 `--doctor` checks Node, configuration, data-directory access, authentication,
-network reads, and capabilities without changing GitHub.
+network reads, and capabilities without changing GitHub. The status tool
+returns identity, capabilities, snapshot state, incomplete runs, and rate
+limits. It does not echo the process read-only configuration.

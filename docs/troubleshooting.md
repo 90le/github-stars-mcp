@@ -42,8 +42,13 @@ sync, query, discovery, planning, inspection, and rollback creation. Set it to
 `false` in the MCP server process only after you inspect the plan. Restart the
 server so it loads the new configuration.
 
+`github_stars_status` does not echo the read-only switch. Check the MCP host's
+server environment when apply returns `CAPABILITY_UNAVAILABLE` with
+`reason: "read_only"`.
+
 Apply still requires the exact `expected_hash`, current account binding,
-capability, unexpired plan, remote preconditions, and account lease. Enabling
+capability, unexpired plan, remote preconditions, and account lease. Copy the
+plan or plan-inspection output's `plan_hash` into `expected_hash`. Enabling
 write mode bypasses none of those checks.
 
 ## Rate limits
@@ -74,14 +79,16 @@ relative path fails configuration validation.
 
 Stop duplicate server processes that use the same account and data directory.
 The global account lease prevents overlapping mutation sessions. A crashed
-process leaves durable audit state; a later invocation waits for lease expiry,
-reconciles uncertain rows, and resumes the same run.
+process leaves durable audit state. After the lease expires, a later process
+reconciles uncertain rows before it resumes the same run.
 
 Do not edit SQLite rows to clear a lease or mark an operation successful.
 Keep a copy of the database and inspect the run through
-`github_changes_inspect`. A `RECONCILIATION_REQUIRED` outcome means the server
-could not prove remote state. Resolve it through supported inspection and a
-fresh plan.
+`github_changes_inspect` with `kind: "run"` and the run ID in `id`. Inspect
+one operation with `kind: "attempts"` or `kind: "reconciliations"`, the same
+run ID in `id`, and its `operation_id`. A `RECONCILIATION_REQUIRED` outcome
+means the server could not prove remote state. Resolve it through supported
+inspection and a fresh plan.
 
 ## Stdio protocol errors
 
@@ -99,8 +106,9 @@ sessions.
 
 `STALE_SNAPSHOT` asks for a new `github_stars_sync` before planning.
 `PLAN_EXPIRED` requires a new plan. `PLAN_HASH_MISMATCH` means the supplied
-hash does not match stored canonical content. Inspect the plan and copy its
-returned hash; do not reuse a hash from another task or account.
+`expected_hash` does not match stored canonical content. Inspect the plan and
+copy its returned `plan_hash` into `expected_hash`; do not reuse a hash from
+another task or account.
 
 `PLAN_ACCOUNT_MISMATCH` means the current GitHub viewer differs from the
 account that owns the snapshot and plan. Switch back to the correct account

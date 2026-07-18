@@ -79,12 +79,12 @@ before dispatch and preserve stable run IDs during recovery.
 
 ## Release preparation
 
-Run the complete verification suite, generate the tool reference, validate
-YAML and workflows, pack the npm tarball, install it into a clean temporary
-project, and run `--help`, `--version`, and fixture-backed `--doctor`.
+Run the complete verification suite, validate YAML and workflows, pack the
+npm tarball, install it into a clean temporary project, and run `--help`,
+`--version`, and fixture-backed `--doctor`.
 Validate the plugin in an isolated home. Produce the SBOM, checksums, and
 provenance from the verified commit.
 
 The release workflow uses a manually approved environment for publication.
-Tag, package, plugin, README, changelog, and generated reference versions must
-match. Pull-request workflows never receive a mutation credential.
+Tag, package, plugin, and README versions must match. Pull-request workflows
+never receive a mutation credential.

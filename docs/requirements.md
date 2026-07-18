@@ -29,12 +29,17 @@ LIST requirements cover List metadata, membership views, exact IDs, and
 snapshot consistency. Acceptance rejects stale or tampered cursors and proves
 that page traversal returns each matching record once.
 
+The public repository contract uses `name_with_owner`, `stargazers_count`,
+`language`, `license`, `archived`, `disabled`, and `fork`. It does not expose
+the corresponding internal domain field names. Page size stays between 1 and
+100, and one query returns no more than 20 evidence records.
+
 ## DISCOVER: repository search
 
-DISCOVER requirements define bounded GitHub search, deterministic ranking,
-minimum evidence, source links, private-result handling, and rate-limit
-reporting. Discovery never stars a result. An agent must create a plan to add
-a Star.
+DISCOVER requirements define bounded GitHub search, allowlisted sort and
+qualifier inputs, minimum evidence, source links, private-result handling,
+and rate-limit reporting. Discovery never stars a result. An agent must
+create a plan to add a Star.
 
 ## PLAN: immutable proposed changes
 
@@ -44,15 +49,29 @@ canonical serialization, SHA-256 hashing, account binding, and caller notes.
 Acceptance proves that planning performs no GitHub mutation and that a stored
 plan cannot change after creation.
 
+The public plan root uses `operations`. Star and membership operations nest
+an ID or filter selector under `repositories`. Plan output and plan inspection
+return `plan_hash`.
+
+## INSPECT: plans and durable run evidence
+
+INSPECT requirements define four strict branches. `plan` accepts a plan ID;
+`run` accepts a run ID; `attempts` and `reconciliations` accept a run ID and
+an operation ID. All branches use bounded pages and target-bound cursors.
+Acceptance rejects branch-specific fields on the wrong branch.
+
 ## APPLY: guarded mutation and audit
 
-APPLY requirements define read-only startup, exact hash confirmation, current
-viewer and capability checks, plan expiry, a global account lease, mutation
-pacing, write-ahead rows, one transport dispatch per attempt, failure modes,
-idempotent replay, cancellation, bounded output, and partial-run
-reconciliation. Acceptance injects process resets and lease loss at each
-dispatch boundary. The service must preserve confirmed success and must not
-retry an unknown outcome.
+APPLY requirements define read-only startup and require `plan_id`,
+`expected_hash`, and a `stop` or `continue` failure mode. The caller copies
+the plan result's `plan_hash` into `expected_hash`. Apply also checks the
+current viewer, capabilities, plan expiry, a global account lease,
+preconditions, and stable remote identities. Mutation pacing, write-ahead
+rows, one transport dispatch per attempt, idempotent replay, cancellation,
+bounded output, and partial-run reconciliation complete the contract.
+Acceptance injects process resets and lease loss at each dispatch boundary.
+The service must preserve confirmed success and must not retry an unknown
+outcome.
 
 The only allowed remote writes are star, unstar, User List creation, User List
 metadata update, User List deletion, and complete User List membership
@@ -87,13 +106,12 @@ listed server command.
 
 ## Acceptance links
 
-The implementation source of truth lives in
-[the approved design](superpowers/specs/2026-07-16-github-stars-mcp-design.md).
-The staged implementation plans live in
-[the program execution index](superpowers/plans/2026-07-16-00-program-execution-index.md).
-The release process also publishes a
-[verification matrix](verification-matrix.md) that maps each family to
-contract, security, package, and live-read evidence.
+[The approved design](superpowers/specs/2026-07-16-github-stars-mcp-design.md)
+records the product rationale and requirement IDs. The current MCP schemas,
+mappers, and contract tests define the executable public contract.
+[The program execution index](superpowers/plans/2026-07-16-00-program-execution-index.md)
+records the staged implementation plan. Contract, security, package, and
+live-read tests use these family names.
 
 No acceptance row may rely on a live mutation in pull-request CI. Live
 contracts use read-only credentials unless a maintainer starts a separate,
