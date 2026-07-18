@@ -8,8 +8,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 test("exports package identity", () => {
+  const packageJson = JSON.parse(
+    readFileSync(new URL("../../package.json", import.meta.url), "utf8"),
+  ) as { name: string; version: string };
   expect(PACKAGE_NAME).toBe("github-stars-mcp");
   expect(PACKAGE_VERSION).toMatch(/^\d+\.\d+\.\d+$/u);
+  expect({ name: PACKAGE_NAME, version: PACKAGE_VERSION }).toEqual({
+    name: packageJson.name,
+    version: packageJson.version,
+  });
 });
 
 test("includes every source file in coverage", () => {
