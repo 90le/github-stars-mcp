@@ -1,0 +1,1566 @@
+import type { AppConfig } from "../../config.js";
+import { canonicalJsonClone, sha256Hex } from "../../domain/canonical-json.js";
+import {
+  AppError,
+  serializeError,
+  type SerializedDomainError,
+} from "../../domain/errors.js";
+import {
+  asPlanId,
+  asRunId,
+  asUserListId,
+  type PlanId,
+} from "../../domain/ids.js";
+import type { JsonValue } from "../../domain/json.js";
+import {
+  hashPlanExecutable,
+  topologicalOperationIds,
+  type ChangePlan,
+  type ResolvedOperation,
+} from "../../domain/plan.js";
+import type { AccountBinding } from "../../domain/repository.js";
+import {
+  parseChangeRun,
+  parseRunOperation,
+  type ChangeRun,
+  type FailureMode,
+  type RunOperation,
+  type RunOperationStatus,
+} from "../../domain/run.js";
+import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
+import type {
+  GitHubCapabilities,
+  GitHubStatusReadPort,
+} from "../ports/github-port.js";
+import type { Clock, IdGenerator } from "../ports/runtime-port.js";
+import type {
+  LeaseGuard,
+  StoragePort,
+  StorageTransaction,
+} from "../ports/storage-port.js";
+import type {
+  ExecutionContext,
+  MutationExecutor,
+  PreparedMutation,
+  PrepareMutationResult,
+} from "./mutation-executor.js";
+import type { ExecutionOutcome, MutationPacer } from "./mutation-pacer.js";
+import {
+  appendCleanupDiagnostic,
+  LeaseScope,
+  type LeaseScheduler,
+} from "./lease-scope.js";
+import { reconcileOperation } from "./reconciliation.js";
+
+export type ApplyInput = Readonly<{
+  planId: PlanId;
+  expectedHash: string;
+  failureMode: FailureMode;
+}>;
+
+export type ApplyResult = Readonly<{
+  run: ChangeRun;
+  warnings: readonly string[];
+  counts: Readonly<Record<RunOperationStatus, number>>;
+  errors: readonly SerializedDomainError[];
+  auditCursor: string | null;
+}>;
+
+type ApplyRuntime = Clock & Pick<IdGenerator, "requestId" | "runId">;
+type ApplyExecutor = MutationExecutor;
+type ApplyPacer = Pick<
+  MutationPacer,
+  "run" | "waitForRetry" | "waitForSafetyWindow"
+>;
+
+export type ApplyServiceOptions = Readonly<{
+  github: GitHubStatusReadPort;
+  storage: StoragePort;
+  runtime: ApplyRuntime;
+  executor: ApplyExecutor;
+  pacer: ApplyPacer;
+  config: Pick<AppConfig, "readOnly"> &
+    Partial<Pick<AppConfig, "writeIntervalMs">>;
+  instanceId: string;
+  leaseScheduler?: LeaseScheduler;
+}>;
+
+const HASH = /^[a-f0-9]{64}$/u;
+const DEFAULT_WRITE_INTERVAL_MS = 1_000;
+const BASE_LEASE_MS = 10 * 60_000;
+const LEASE_HEARTBEAT_MS = 60_000;
+const MAX_ERRORS = 20;
+const MAX_ATTEMPTS = 3;
+const MAX_RETRY_DELAY_MS = 15 * 60_000;
+
+type JsonRecord = Readonly<Record<string, JsonValue>>;
+
+function isJsonArray(value: JsonValue): value is readonly JsonValue[] {
+  return Array.isArray(value);
+}
+
+function errorObject(error: unknown): Error {
+  return error instanceof Error
+    ? error
+    : new AppError("INTERNAL_ERROR", "An unexpected apply failure occurred", {
+        retryable: false,
+        details: { reason: "non_error_failure" },
+      });
+}
+
+function validationError(reason: string): AppError {
+  return new AppError("VALIDATION_ERROR", "Apply input is invalid", {
+    retryable: false,
+    details: { reason },
+  });
+}
+
+function storageFailure(reason: string, cause?: unknown): AppError {
+  return new AppError("STORAGE_ERROR", "Apply storage failed", {
+    retryable: false,
+    details: { reason },
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
+
+function githubFailure(reason: string, cause?: unknown): AppError {
+  return new AppError("GITHUB_UNAVAILABLE", "Apply admission failed", {
+    retryable: true,
+    details: { reason },
+    ...(cause === undefined ? {} : { cause }),
+  });
+}
+
+function invalidRuntime(reason: string): AppError {
+  return new AppError("INTERNAL_ERROR", "Apply runtime returned invalid data", {
+    retryable: false,
+    details: { reason },
+  });
+}
+
+function fixedAbortError(): DOMException {
+  return new DOMException("The operation was aborted", "AbortError");
+}
+
+function signalAborted(signal: AbortSignal | undefined): boolean {
+  if (signal === undefined) return false;
+  try {
+    return signal.aborted;
+  } catch {
+    return true;
+  }
+}
+
+function assertNotAborted(signal: AbortSignal | undefined): void {
+  if (signalAborted(signal)) throw fixedAbortError();
+}
+
+function jsonRecord(value: JsonValue, reason: string): JsonRecord {
+  if (value === null || typeof value !== "object" || isJsonArray(value)) {
+    throw validationError(reason);
+  }
+  return value;
+}
+
+function parseInput(input: ApplyInput): ApplyInput {
+  let cloned: JsonValue;
+  try {
+    cloned = canonicalJsonClone(input);
+  } catch {
+    throw validationError("invalid_shape");
+  }
+  const root = jsonRecord(cloned, "invalid_shape");
+  const keys = Object.keys(root);
+  if (
+    keys.length !== 3 ||
+    keys.some(
+      (key) =>
+        key !== "planId" && key !== "expectedHash" && key !== "failureMode",
+    ) ||
+    typeof root.planId !== "string" ||
+    typeof root.expectedHash !== "string" ||
+    !HASH.test(root.expectedHash) ||
+    (root.failureMode !== "stop" && root.failureMode !== "continue")
+  ) {
+    throw validationError("invalid_shape");
+  }
+  let planId: PlanId;
+  try {
+    planId = asPlanId(root.planId);
+  } catch {
+    throw validationError("invalid_plan_id");
+  }
+  return Object.freeze({
+    planId,
+    expectedHash: root.expectedHash,
+    failureMode: root.failureMode,
+  });
+}
+
+function safeNow(runtime: Clock): string {
+  try {
+    return canonicalUtcTimestamp(runtime.now(), "apply time");
+  } catch {
+    throw invalidRuntime("invalid_wall_clock");
+  }
+}
+
+function stableInstanceId(value: string): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 128 ||
+    value !== value.trim() ||
+    value.includes("\0")
+  ) {
+    throw validationError("invalid_instance_id");
+  }
+  return value;
+}
+
+function writeInterval(value: number | undefined): number {
+  const interval = value ?? DEFAULT_WRITE_INTERVAL_MS;
+  if (!Number.isSafeInteger(interval) || interval < DEFAULT_WRITE_INTERVAL_MS) {
+    throw validationError("invalid_write_interval");
+  }
+  return interval;
+}
+
+function runId(runtime: Pick<IdGenerator, "runId">) {
+  try {
+    return asRunId(runtime.runId());
+  } catch {
+    throw invalidRuntime("invalid_run_id");
+  }
+}
+
+function requestId(runtime: Pick<IdGenerator, "requestId">): string {
+  let value: string;
+  try {
+    value = runtime.requestId();
+  } catch {
+    throw invalidRuntime("invalid_request_id");
+  }
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 128 ||
+    value !== value.trim() ||
+    value.includes("\0")
+  ) {
+    throw invalidRuntime("invalid_request_id");
+  }
+  return value;
+}
+
+function storageCall<T>(action: () => T): T {
+  try {
+    return action();
+  } catch (error) {
+    if (error instanceof AppError) throw error;
+    throw storageFailure("storage_call_failed", error);
+  }
+}
+
+function sameBinding(left: AccountBinding, right: AccountBinding): boolean {
+  return (
+    left.host === right.host &&
+    left.login === right.login &&
+    left.accountId === right.accountId
+  );
+}
+
+function stableText(value: JsonValue | undefined, maximum: number): string {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > maximum ||
+    value !== value.trim() ||
+    value.includes("\0")
+  ) {
+    throw githubFailure("invalid_identity");
+  }
+  return value;
+}
+
+function parseBinding(value: AccountBinding): AccountBinding {
+  let cloned: JsonValue;
+  try {
+    cloned = canonicalJsonClone(value);
+  } catch {
+    throw githubFailure("invalid_identity");
+  }
+  const root = jsonRecord(cloned, "invalid_identity");
+  const keys = Object.keys(root);
+  if (
+    keys.length !== 3 ||
+    keys.some((key) => key !== "host" && key !== "login" && key !== "accountId")
+  ) {
+    throw githubFailure("invalid_identity");
+  }
+  return Object.freeze({
+    host: stableText(root.host, 253),
+    login: stableText(root.login, 100),
+    accountId: stableText(root.accountId, 128),
+  });
+}
+
+function capability(
+  value: JsonValue | undefined,
+): "available" | "unavailable" | "unknown" {
+  if (value !== "available" && value !== "unavailable" && value !== "unknown") {
+    throw githubFailure("invalid_capabilities");
+  }
+  return value;
+}
+
+function parseCapabilities(value: GitHubCapabilities): GitHubCapabilities {
+  let cloned: JsonValue;
+  try {
+    cloned = canonicalJsonClone(value);
+  } catch {
+    throw githubFailure("invalid_capabilities");
+  }
+  const root = jsonRecord(cloned, "invalid_capabilities");
+  const keys = Object.keys(root);
+  if (
+    keys.length !== 4 ||
+    keys.some(
+      (key) =>
+        key !== "starRead" &&
+        key !== "starWrite" &&
+        key !== "listRead" &&
+        key !== "listWrite",
+    )
+  ) {
+    throw githubFailure("invalid_capabilities");
+  }
+  return Object.freeze({
+    starRead: capability(root.starRead),
+    starWrite: capability(root.starWrite),
+    listRead: capability(root.listRead),
+    listWrite: capability(root.listWrite),
+  });
+}
+
+function assertPlanHash(plan: ChangePlan, expectedHash: string): void {
+  let recomputed: string;
+  try {
+    recomputed = hashPlanExecutable(plan.executable);
+  } catch {
+    throw new AppError(
+      "PLAN_HASH_MISMATCH",
+      "The persisted plan executable could not be verified",
+      { retryable: false },
+    );
+  }
+  if (
+    !HASH.test(plan.hash) ||
+    recomputed !== plan.hash ||
+    expectedHash !== plan.hash
+  ) {
+    throw new AppError(
+      "PLAN_HASH_MISMATCH",
+      "The expected and persisted plan hashes do not match",
+      { retryable: false },
+    );
+  }
+}
+
+function assertPlanAvailable(plan: ChangePlan, now: string): void {
+  if (plan.state === "expired" || now >= plan.expiresAt) {
+    throw new AppError("PLAN_EXPIRED", "The change plan has expired", {
+      retryable: false,
+    });
+  }
+  if (plan.state === "failed" || plan.state === "superseded") {
+    throw new AppError(
+      "PRECONDITION_FAILED",
+      "The change plan cannot be applied from its current state",
+      {
+        retryable: false,
+        details: { state: plan.state },
+      },
+    );
+  }
+}
+
+function requiredWriteCapabilities(
+  plan: ChangePlan,
+): readonly ("starWrite" | "listWrite")[] {
+  let star = false;
+  let list = false;
+  for (const operation of plan.operations) {
+    if (operation.kind === "star" || operation.kind === "unstar") {
+      star = true;
+    } else {
+      list = true;
+    }
+  }
+  return Object.freeze([
+    ...(star ? (["starWrite"] as const) : []),
+    ...(list ? (["listWrite"] as const) : []),
+  ]);
+}
+
+function capabilityWarning(name: "starWrite" | "listWrite"): string {
+  return name === "starWrite"
+    ? "GitHub Star write capability is unknown; the first mutation will verify permission"
+    : "GitHub User List write capability is unknown; the first mutation will verify permission";
+}
+
+function capabilityUnavailable(name: "starWrite" | "listWrite"): AppError {
+  return new AppError(
+    "CAPABILITY_UNAVAILABLE",
+    name === "starWrite"
+      ? "GitHub Star write capability is unavailable"
+      : "GitHub User List write capability is unavailable",
+    {
+      retryable: false,
+      details: {
+        reason:
+          name === "starWrite"
+            ? "star_write_unavailable"
+            : "list_write_unavailable",
+      },
+    },
+  );
+}
+
+function warningsFor(
+  plan: ChangePlan,
+  capabilities: GitHubCapabilities,
+): readonly string[] {
+  const warnings = [...plan.warnings];
+  for (const name of requiredWriteCapabilities(plan)) {
+    if (capabilities[name] === "unavailable") {
+      throw capabilityUnavailable(name);
+    }
+    if (capabilities[name] === "unknown") {
+      const warning = capabilityWarning(name);
+      if (!warnings.includes(warning)) warnings.push(warning);
+    }
+  }
+  return Object.freeze(warnings);
+}
+
+function completedReplay(
+  storage: StoragePort,
+  plan: ChangePlan,
+  binding: AccountBinding,
+): ChangeRun | null {
+  if (plan.state !== "applied") return null;
+  const run = storageCall(() => storage.getLatestRunForPlan(plan.id));
+  if (
+    run === null ||
+    run.state !== "completed" ||
+    run.planId !== plan.id ||
+    !sameBinding(run.binding, binding)
+  ) {
+    throw new AppError(
+      "PRECONDITION_FAILED",
+      "The applied plan does not have a valid completed run",
+      {
+        retryable: false,
+        details: { reason: "completed_replay_invalid" },
+      },
+    );
+  }
+  return run;
+}
+
+type Claim = Readonly<{
+  plan: ChangePlan;
+  run: ChangeRun;
+  completed: boolean;
+}>;
+
+function revalidateClaimPlan(
+  plan: ChangePlan | null,
+  input: ApplyInput,
+  binding: AccountBinding,
+  now: string,
+): ChangePlan {
+  if (plan === null) {
+    throw new AppError("NOT_FOUND", "The change plan was not found", {
+      retryable: false,
+    });
+  }
+  assertPlanHash(plan, input.expectedHash);
+  assertPlanAvailable(plan, now);
+  if (!sameBinding(plan.executable.binding, binding)) {
+    throw new AppError(
+      "PLAN_ACCOUNT_MISMATCH",
+      "The authenticated account does not match the change plan",
+      { retryable: false },
+    );
+  }
+  return plan;
+}
+
+function claimRun(
+  tx: StorageTransaction,
+  input: ApplyInput,
+  admittedPlan: ChangePlan,
+  binding: AccountBinding,
+  warnings: readonly string[],
+  runtime: ApplyRuntime,
+  guard: LeaseGuard,
+): Claim {
+  const plan = revalidateClaimPlan(
+    tx.getPlan(input.planId),
+    input,
+    binding,
+    safeNow(runtime),
+  );
+  if (plan.hash !== admittedPlan.hash) {
+    throw new AppError(
+      "PLAN_HASH_MISMATCH",
+      "The change plan changed during admission",
+      { retryable: false },
+    );
+  }
+  const existing = tx.getLatestRunForPlan(plan.id);
+  if (existing !== null) {
+    if (existing.failureMode !== input.failureMode) {
+      throw new AppError(
+        "PRECONDITION_FAILED",
+        "A resumed apply must preserve its original failure mode",
+        {
+          retryable: false,
+          details: { reason: "failure_mode_conflict" },
+        },
+      );
+    }
+    if (existing.state === "completed" && plan.state === "applied") {
+      return Object.freeze({ plan, run: existing, completed: true });
+    }
+    if (existing.state !== "partial" || plan.state !== "partial") {
+      throw new AppError(
+        "PRECONDITION_FAILED",
+        "The existing apply run is not resumable",
+        {
+          retryable: false,
+          details: { reason: "run_not_resumable" },
+        },
+      );
+    }
+    tx.compareAndSetPlanState({
+      planId: plan.id,
+      expected: ["partial"],
+      next: "applying",
+    });
+    const run = tx.compareAndSetRunState({
+      runId: existing.id,
+      expected: ["partial"],
+      next: "running",
+      finishedAt: null,
+      lease: guard,
+    });
+    return Object.freeze({
+      plan: Object.freeze({ ...plan, state: "applying" }),
+      run,
+      completed: false,
+    });
+  }
+
+  if (plan.state !== "ready") {
+    throw new AppError(
+      "PRECONDITION_FAILED",
+      "The change plan is not ready to apply",
+      {
+        retryable: false,
+        details: { state: plan.state },
+      },
+    );
+  }
+  tx.compareAndSetPlanState({
+    planId: plan.id,
+    expected: ["ready"],
+    next: "applying",
+  });
+  const pending = parseChangeRun({
+    id: runId(runtime),
+    planId: plan.id,
+    binding,
+    state: "pending",
+    failureMode: input.failureMode,
+    warnings,
+    startedAt: safeNow(runtime),
+    finishedAt: null,
+  });
+  tx.createRun({ run: pending, lease: guard });
+  const run = tx.compareAndSetRunState({
+    runId: pending.id,
+    expected: ["pending"],
+    next: "running",
+    finishedAt: null,
+    lease: guard,
+  });
+  return Object.freeze({
+    plan: Object.freeze({ ...plan, state: "applying" }),
+    run,
+    completed: false,
+  });
+}
+
+function pendingOperation(
+  run: ChangeRun,
+  operation: ResolvedOperation,
+  sequence: number,
+): RunOperation {
+  return parseRunOperation({
+    runId: run.id,
+    operationId: operation.operationId,
+    sequence,
+    status: "pending",
+    reconciliation: "not_required",
+    attempts: 0,
+    before: operation.before,
+    after: null,
+    externalRequestId: null,
+    error: null,
+    startedAt: null,
+    finishedAt: null,
+  });
+}
+
+function retryableCancellation(): SerializedDomainError {
+  return serializeError(
+    new AppError(
+      "GITHUB_UNAVAILABLE",
+      "Mutation dispatch was cancelled before it started",
+      {
+        retryable: true,
+        details: { reason: "cancelled_before_dispatch" },
+      },
+    ),
+  );
+}
+
+function unknownDispatchError(error: unknown): SerializedDomainError & {
+  readonly retryable: false;
+} {
+  const hints = retryHints(error);
+  const serialized = serializeError(
+    error instanceof AppError && error.code === "RECONCILIATION_REQUIRED"
+      ? error
+      : new AppError(
+          "RECONCILIATION_REQUIRED",
+          "The mutation outcome requires reconciliation",
+          {
+            retryable: false,
+            details: {
+              reason: "dispatch_outcome_unknown",
+              ...hints,
+            },
+            cause: error,
+          },
+        ),
+  );
+  return Object.freeze({ ...serialized, retryable: false });
+}
+
+function retryHints(error: unknown): Readonly<Record<string, JsonValue>> {
+  let serialized: unknown;
+  if (error instanceof AppError) {
+    serialized = serializeError(error);
+  } else {
+    try {
+      serialized = canonicalJsonClone(error);
+    } catch {
+      return Object.freeze({});
+    }
+  }
+  if (
+    serialized === null ||
+    typeof serialized !== "object" ||
+    Array.isArray(serialized)
+  ) {
+    return Object.freeze({});
+  }
+  const record = serialized as Partial<SerializedDomainError>;
+  const details = record.details;
+  if (
+    details === null ||
+    typeof details !== "object" ||
+    Array.isArray(details)
+  ) {
+    return Object.freeze({});
+  }
+  const detailRecord = details as Readonly<Record<string, JsonValue>>;
+  const sourceCode =
+    record.code === "RATE_LIMITED" || record.code === "SECONDARY_RATE_LIMITED"
+      ? record.code
+      : detailRecord.sourceCode === "RATE_LIMITED" ||
+          detailRecord.sourceCode === "SECONDARY_RATE_LIMITED"
+        ? detailRecord.sourceCode
+        : null;
+  if (sourceCode === null) return Object.freeze({});
+  const result: Record<string, JsonValue> = { sourceCode };
+  const retryAt =
+    typeof detailRecord.retryAt === "string"
+      ? detailRecord.retryAt
+      : typeof detailRecord.resetAt === "string"
+        ? detailRecord.resetAt
+        : null;
+  if (retryAt !== null) {
+    try {
+      result.retryAt = canonicalUtcTimestamp(retryAt, "retryAt");
+    } catch {
+      // Malformed persisted hints are deliberately ignored.
+    }
+  }
+  if (
+    typeof detailRecord.retryAfterMs === "number" &&
+    Number.isSafeInteger(detailRecord.retryAfterMs) &&
+    detailRecord.retryAfterMs >= 0
+  ) {
+    result.retryAfterMs = Math.min(
+      detailRecord.retryAfterMs,
+      MAX_RETRY_DELAY_MS,
+    );
+  }
+  return Object.freeze(result);
+}
+
+function retryDelayMs(
+  error: SerializedDomainError | null,
+  runtime: ApplyRuntime,
+): number {
+  const hints = retryHints(error);
+  if (Object.keys(hints).length === 0) return 0;
+  if (typeof hints.retryAfterMs === "number") {
+    return Math.min(hints.retryAfterMs, MAX_RETRY_DELAY_MS);
+  }
+  if (typeof hints.retryAt !== "string") return 0;
+  let now: number;
+  let retryAt: number;
+  try {
+    now = Date.parse(safeNow(runtime));
+    retryAt = Date.parse(canonicalUtcTimestamp(hints.retryAt, "retryAt"));
+  } catch {
+    return 0;
+  }
+  const delay = retryAt - now;
+  if (!Number.isSafeInteger(delay) || delay <= 0) return 0;
+  return Math.min(delay, MAX_RETRY_DELAY_MS);
+}
+
+function isCancellation(error: unknown, signal: AbortSignal | undefined) {
+  return (
+    signalAborted(signal) ||
+    (error instanceof DOMException && error.name === "AbortError") ||
+    (error instanceof AppError &&
+      error.code === "GITHUB_UNAVAILABLE" &&
+      typeof error.details === "object" &&
+      error.details !== null &&
+      !isJsonArray(error.details) &&
+      error.details.reason === "cancelled")
+  );
+}
+
+async function executePendingOperation(input: {
+  storage: StoragePort;
+  runtime: ApplyRuntime;
+  executor: ApplyExecutor;
+  pacer: ApplyPacer;
+  lease: LeaseScope;
+  run: ChangeRun;
+  operation: ResolvedOperation;
+  sequence: number;
+  context: ExecutionContext;
+  createWriteAhead: boolean;
+  callerSignal?: AbortSignal;
+}): Promise<RunOperation> {
+  if (input.createWriteAhead) {
+    const row = pendingOperation(input.run, input.operation, input.sequence);
+    storageCall(() =>
+      input.storage.createRunOperation({
+        operation: row,
+        lease: input.lease.freshGuard(),
+      }),
+    );
+  } else {
+    const queued = storageCall(() =>
+      input.storage.getRunOperation({
+        runId: input.run.id,
+        operationId: input.operation.operationId,
+      }),
+    );
+    if (queued?.status !== "pending") {
+      throw storageFailure("retry_was_not_queued");
+    }
+  }
+
+  let attemptStarted = false;
+  let remoteDispatchEntered = false;
+  let executionOutcomeAvailable = false;
+  let prepared: PreparedMutation | null = null;
+  try {
+    const outcome = await input.pacer.run({
+      signal: input.lease.signal,
+      prepare: async (): Promise<PrepareMutationResult> => {
+        const value = await input.executor.prepare(
+          input.operation,
+          input.context,
+          input.lease.signal,
+        );
+        if (value.kind === "dispatch") prepared = value.prepared;
+        return value;
+      },
+      dispatch: (value: PreparedMutation): Promise<ExecutionOutcome> => {
+        input.lease.assertActive();
+        const guard = input.lease.renew();
+        storageCall(() =>
+          input.storage.startRunOperation({
+            runId: input.run.id,
+            operationId: input.operation.operationId,
+            startedAt: safeNow(input.runtime),
+            lease: guard,
+          }),
+        );
+        attemptStarted = true;
+        input.lease.assertActive();
+        remoteDispatchEntered = true;
+        return input.executor.dispatchPrepared(
+          value,
+          input.context,
+          input.lease.signal,
+        );
+      },
+    });
+    executionOutcomeAvailable = true;
+
+    if (outcome.kind === "skipped") {
+      const guard = input.lease.freshGuard();
+      return storageCall(() =>
+        input.storage.finishRunOperation({
+          phase: "before_dispatch",
+          runId: input.run.id,
+          operationId: input.operation.operationId,
+          status: "skipped",
+          reconciliation: "not_required",
+          error: null,
+          finishedAt: safeNow(input.runtime),
+          lease: guard,
+        }),
+      );
+    }
+    const guard = input.lease.freshGuard();
+    return storageCall(() =>
+      input.storage.finishRunOperation({
+        phase: "after_dispatch",
+        runId: input.run.id,
+        operationId: input.operation.operationId,
+        status: "succeeded",
+        reconciliation: "not_required",
+        externalRequestId: outcome.receipt.requestId,
+        after: outcome.after,
+        error: null,
+        finishedAt: safeNow(input.runtime),
+        lease: guard,
+      }),
+    );
+  } catch (error) {
+    if (executionOutcomeAvailable) throw error;
+    const cancelled = isCancellation(error, input.callerSignal);
+    let finished: RunOperation;
+    if (!attemptStarted) {
+      const guard = input.lease.freshGuard();
+      finished = storageCall(() =>
+        input.storage.finishRunOperation({
+          phase: "before_dispatch",
+          runId: input.run.id,
+          operationId: input.operation.operationId,
+          status: "failed",
+          reconciliation: "confirmed_not_applied",
+          error: cancelled ? retryableCancellation() : serializeError(error),
+          finishedAt: safeNow(input.runtime),
+          lease: guard,
+        }),
+      );
+    } else if (!remoteDispatchEntered) {
+      const guard = input.lease.freshGuard();
+      finished = storageCall(() =>
+        input.storage.finishRunOperation({
+          phase: "after_dispatch",
+          runId: input.run.id,
+          operationId: input.operation.operationId,
+          status: "failed",
+          reconciliation: "confirmed_not_applied",
+          externalRequestId: null,
+          after: prepared?.before ?? null,
+          error: cancelled ? retryableCancellation() : serializeError(error),
+          finishedAt: safeNow(input.runtime),
+          lease: guard,
+        }),
+      );
+    } else if (
+      error instanceof AppError &&
+      error.code !== "RECONCILIATION_REQUIRED" &&
+      error.retryable === false &&
+      !cancelled
+    ) {
+      const guard = input.lease.freshGuard();
+      finished = storageCall(() =>
+        input.storage.finishRunOperation({
+          phase: "after_dispatch",
+          runId: input.run.id,
+          operationId: input.operation.operationId,
+          status: "failed",
+          reconciliation: "confirmed_not_applied",
+          externalRequestId: null,
+          after: prepared?.before ?? null,
+          error: serializeError(error),
+          finishedAt: safeNow(input.runtime),
+          lease: guard,
+        }),
+      );
+    } else {
+      const guard = input.lease.freshGuard();
+      finished = storageCall(() =>
+        input.storage.finishRunOperation({
+          phase: "after_dispatch",
+          runId: input.run.id,
+          operationId: input.operation.operationId,
+          status: "unresolved",
+          reconciliation: "unknown",
+          externalRequestId: null,
+          after: null,
+          error: unknownDispatchError(error),
+          finishedAt: safeNow(input.runtime),
+          lease: guard,
+        }),
+      );
+    }
+    if (cancelled) throw fixedAbortError();
+    return finished;
+  }
+}
+
+function dependencyBlockedError(
+  operation: ResolvedOperation,
+): SerializedDomainError {
+  return serializeError(
+    new AppError(
+      "PRECONDITION_FAILED",
+      "The operation is blocked by an incomplete dependency",
+      {
+        retryable: true,
+        details: {
+          reason: "dependency_blocked",
+          operationId: operation.operationId,
+          dependsOn: operation.dependsOn,
+        },
+      },
+    ),
+  );
+}
+
+function recordDependencyBlocked(input: {
+  storage: StoragePort;
+  runtime: ApplyRuntime;
+  lease: LeaseScope;
+  run: ChangeRun;
+  operation: ResolvedOperation;
+  sequence: number;
+  existing: RunOperation | null;
+}): RunOperation {
+  if (input.existing !== null) return input.existing;
+  storageCall(() =>
+    input.storage.createRunOperation({
+      operation: pendingOperation(input.run, input.operation, input.sequence),
+      lease: input.lease.freshGuard(),
+    }),
+  );
+  const guard = input.lease.freshGuard();
+  return storageCall(() =>
+    input.storage.finishRunOperation({
+      phase: "before_dispatch",
+      runId: input.run.id,
+      operationId: input.operation.operationId,
+      status: "failed",
+      reconciliation: "confirmed_not_applied",
+      error: dependencyBlockedError(input.operation),
+      finishedAt: safeNow(input.runtime),
+      lease: guard,
+    }),
+  );
+}
+
+function createdListIdFrom(row: RunOperation, operation: ResolvedOperation) {
+  if (operation.kind !== "list_create" || row.status !== "succeeded") {
+    return null;
+  }
+  if (
+    row.after === null ||
+    typeof row.after !== "object" ||
+    isJsonArray(row.after) ||
+    typeof row.after.listId !== "string"
+  ) {
+    throw storageFailure("succeeded_list_create_missing_list_id");
+  }
+  try {
+    return asUserListId(row.after.listId);
+  } catch {
+    throw storageFailure("succeeded_list_create_missing_list_id");
+  }
+}
+
+function rebuildExecutionContext(
+  plan: ChangePlan,
+  rows: readonly RunOperation[],
+): ExecutionContext {
+  const operations = new Map(
+    plan.operations.map((operation) => [operation.operationId, operation]),
+  );
+  const createdListIdsByOperationId = new Map<
+    string,
+    ReturnType<typeof asUserListId>
+  >();
+  for (const row of rows) {
+    const operation = operations.get(row.operationId);
+    if (operation === undefined) {
+      throw storageFailure("run_operation_not_in_plan");
+    }
+    const listId = createdListIdFrom(row, operation);
+    if (listId !== null) {
+      createdListIdsByOperationId.set(operation.operationId, listId);
+    }
+  }
+  return { createdListIdsByOperationId };
+}
+
+function reconciliationUnknown(
+  reason = "reconciliation_inconclusive",
+): SerializedDomainError & { readonly retryable: false } {
+  const serialized = serializeError(
+    new AppError(
+      "RECONCILIATION_REQUIRED",
+      "The live state could not confirm the previous mutation outcome",
+      {
+        retryable: false,
+        details: { reason },
+      },
+    ),
+  );
+  return Object.freeze({ ...serialized, retryable: false });
+}
+
+function reconciliationNotApplied(
+  previous: SerializedDomainError | null,
+): SerializedDomainError & {
+  readonly retryable: true;
+} {
+  const hints = retryHints(previous);
+  const serialized = serializeError(
+    new AppError(
+      "RECONCILIATION_REQUIRED",
+      "Reconciliation confirmed that the mutation was not applied",
+      {
+        retryable: true,
+        details: { reason: "reconciled_not_applied", ...hints },
+      },
+    ),
+  );
+  return Object.freeze({ ...serialized, retryable: true });
+}
+
+async function reconcileForResume(input: {
+  storage: StoragePort;
+  runtime: ApplyRuntime;
+  executor: ApplyExecutor;
+  lease: LeaseScope;
+  run: ChangeRun;
+  operation: ResolvedOperation;
+  row: RunOperation;
+  context: ExecutionContext;
+  callerSignal?: AbortSignal;
+}): Promise<RunOperation> {
+  const shouldReconcile =
+    input.row.status === "unresolved" ||
+    (input.row.status === "failed" &&
+      input.row.reconciliation === "confirmed_not_applied" &&
+      input.row.error?.retryable === true &&
+      input.row.attempts >= 1);
+  if (!shouldReconcile) return input.row;
+
+  input.lease.assertActive();
+  let decision: Awaited<ReturnType<typeof reconcileOperation>>;
+  try {
+    decision = await reconcileOperation(
+      input.executor,
+      input.operation,
+      input.context,
+      input.lease.signal,
+    );
+  } catch (error) {
+    if (signalAborted(input.callerSignal)) throw fixedAbortError();
+    input.lease.assertActive();
+    throw error;
+  }
+  input.lease.assertActive();
+  if (signalAborted(input.callerSignal)) throw fixedAbortError();
+  const guard = input.lease.freshGuard();
+  if (decision.kind === "confirmed_applied") {
+    return storageCall(() =>
+      input.storage.reconcileRunOperation({
+        runId: input.run.id,
+        operationId: input.operation.operationId,
+        status: "succeeded",
+        reconciliation: "confirmed_applied",
+        after: decision.state,
+        error: null,
+        observedAt: safeNow(input.runtime),
+        lease: guard,
+      }),
+    );
+  }
+  if (decision.kind === "confirmed_not_applied") {
+    return storageCall(() =>
+      input.storage.reconcileRunOperation({
+        runId: input.run.id,
+        operationId: input.operation.operationId,
+        status: "failed",
+        reconciliation: "confirmed_not_applied",
+        after: decision.state,
+        error: reconciliationNotApplied(input.row.error),
+        observedAt: safeNow(input.runtime),
+        lease: guard,
+      }),
+    );
+  }
+  return storageCall(() =>
+    input.storage.reconcileRunOperation({
+      runId: input.run.id,
+      operationId: input.operation.operationId,
+      status: "unresolved",
+      reconciliation: "unknown",
+      after: decision.state,
+      error: reconciliationUnknown(),
+      observedAt: safeNow(input.runtime),
+      lease: guard,
+    }),
+  );
+}
+
+function aggregateCounts(
+  operations: readonly RunOperation[],
+): Readonly<Record<RunOperationStatus, number>> {
+  const counts: Record<RunOperationStatus, number> = {
+    pending: 0,
+    running: 0,
+    succeeded: 0,
+    skipped: 0,
+    failed: 0,
+    unresolved: 0,
+  };
+  for (const operation of operations) counts[operation.status] += 1;
+  return Object.freeze(counts);
+}
+
+function resultFor(storage: StoragePort, run: ChangeRun): ApplyResult {
+  const operations = storageCall(() => storage.listRunOperations(run.id));
+  const errors = Object.freeze(
+    operations
+      .map((operation) => operation.error)
+      .filter((error): error is SerializedDomainError => error !== null)
+      .slice(0, MAX_ERRORS),
+  );
+  return Object.freeze({
+    run,
+    warnings: run.warnings,
+    counts: aggregateCounts(operations),
+    errors,
+    auditCursor: operations.length === 0 ? null : run.id,
+  });
+}
+
+function finalizeRun(input: {
+  storage: StoragePort;
+  runtime: ApplyRuntime;
+  lease: LeaseScope;
+  plan: ChangePlan;
+  run: ChangeRun;
+}): ChangeRun {
+  const guard = input.lease.freshGuard();
+  return storageCall(() =>
+    input.storage.withTransaction((tx) => {
+      const rows = tx.listRunOperations(input.run.id);
+      if (
+        rows.some((row) => row.status === "pending" || row.status === "running")
+      ) {
+        throw storageFailure("run_operations_in_flight");
+      }
+      const complete =
+        rows.length === input.plan.operations.length &&
+        rows.every(
+          (row) => row.status === "succeeded" || row.status === "skipped",
+        );
+      const finishedAt = safeNow(input.runtime);
+      const run = tx.compareAndSetRunState({
+        runId: input.run.id,
+        expected: ["running"],
+        next: complete ? "completed" : "partial",
+        finishedAt,
+        lease: guard,
+      });
+      tx.compareAndSetPlanState({
+        planId: input.plan.id,
+        expected: ["applying"],
+        next: complete ? "applied" : "partial",
+      });
+      return run;
+    }),
+  );
+}
+
+export class ApplyService {
+  readonly #github: GitHubStatusReadPort;
+  readonly #storage: StoragePort;
+  readonly #runtime: ApplyRuntime;
+  readonly #executor: ApplyExecutor;
+  readonly #pacer: ApplyPacer;
+  readonly #readOnly: boolean;
+  readonly #writeIntervalMs: number;
+  readonly #instanceId: string;
+  readonly #leaseScheduler: LeaseScheduler | undefined;
+
+  constructor(options: ApplyServiceOptions) {
+    this.#github = options.github;
+    this.#storage = options.storage;
+    this.#runtime = options.runtime;
+    this.#executor = options.executor;
+    this.#pacer = options.pacer;
+    this.#readOnly = options.config.readOnly;
+    this.#writeIntervalMs = writeInterval(options.config.writeIntervalMs);
+    this.#instanceId = stableInstanceId(options.instanceId);
+    this.#leaseScheduler = options.leaseScheduler;
+  }
+
+  async apply(input: ApplyInput, signal?: AbortSignal): Promise<ApplyResult> {
+    if (this.#readOnly) {
+      throw new AppError(
+        "CAPABILITY_UNAVAILABLE",
+        "Apply is disabled while the server is read-only",
+        {
+          retryable: false,
+          details: { reason: "read_only" },
+        },
+      );
+    }
+    assertNotAborted(signal);
+    const parsed = parseInput(input);
+    const plan = storageCall(() => this.#storage.getPlan(parsed.planId));
+    if (plan === null) {
+      throw new AppError("NOT_FOUND", "The change plan was not found", {
+        retryable: false,
+      });
+    }
+    assertPlanHash(plan, parsed.expectedHash);
+    if (plan.state !== "applied") {
+      assertPlanAvailable(plan, safeNow(this.#runtime));
+    }
+
+    let viewer: AccountBinding;
+    try {
+      viewer = parseBinding(await this.#github.getViewer(signal));
+      assertNotAborted(signal);
+    } catch (error) {
+      assertNotAborted(signal);
+      if (error instanceof AppError) throw error;
+      throw githubFailure("admission_failed", error);
+    }
+    if (!sameBinding(plan.executable.binding, viewer)) {
+      throw new AppError(
+        "PLAN_ACCOUNT_MISMATCH",
+        "The authenticated account does not match the change plan",
+        { retryable: false },
+      );
+    }
+    const replay = completedReplay(this.#storage, plan, viewer);
+    if (replay !== null) return resultFor(this.#storage, replay);
+    assertPlanAvailable(plan, safeNow(this.#runtime));
+
+    let capabilities: GitHubCapabilities;
+    try {
+      capabilities = parseCapabilities(
+        await this.#github.probeCapabilities(signal),
+      );
+      assertNotAborted(signal);
+    } catch (error) {
+      assertNotAborted(signal);
+      if (error instanceof AppError) throw error;
+      throw githubFailure("admission_failed", error);
+    }
+    const warnings = warningsFor(plan, capabilities);
+    const leaseName = `apply:${viewer.host}:${sha256Hex(viewer.accountId).slice(
+      0,
+      16,
+    )}`;
+    const durationMs = Math.max(
+      BASE_LEASE_MS,
+      this.#writeIntervalMs + LEASE_HEARTBEAT_MS,
+    );
+    const scope = LeaseScope.acquire({
+      storage: this.#storage,
+      runtime: this.#runtime,
+      name: leaseName,
+      ownerId: `${this.#instanceId}:${requestId(this.#runtime)}`,
+      ttlMs: durationMs,
+      ...(signal === undefined ? {} : { signal }),
+      ...(this.#leaseScheduler === undefined
+        ? {}
+        : { scheduler: this.#leaseScheduler }),
+    });
+
+    return scope.run(async (lease) => {
+      let primary: unknown;
+      let hasPrimary = false;
+      let result: ApplyResult | undefined;
+      try {
+        lease.assertActive();
+        const claimGuard = lease.freshGuard();
+        const claim = storageCall(() =>
+          this.#storage.withTransaction((tx) => {
+            tx.recoverAbandonedRuns({
+              binding: viewer,
+              lease: claimGuard,
+            });
+            return claimRun(
+              tx,
+              parsed,
+              plan,
+              viewer,
+              warnings,
+              this.#runtime,
+              claimGuard,
+            );
+          }),
+        );
+        if (claim.completed) {
+          result = resultFor(this.#storage, claim.run);
+        } else {
+          const existingRows = storageCall(() =>
+            this.#storage.listRunOperations(claim.run.id),
+          );
+          const context = rebuildExecutionContext(claim.plan, existingRows);
+          const rowsById = new Map(
+            existingRows.map((row) => [row.operationId, row]),
+          );
+          const byId = new Map(
+            claim.plan.operations.map((operation) => [
+              operation.operationId,
+              operation,
+            ]),
+          );
+          const sequenceById = new Map(
+            claim.plan.operations.map((operation, sequence) => [
+              operation.operationId,
+              sequence,
+            ]),
+          );
+          const orderedOperationIds = topologicalOperationIds(
+            claim.plan.operations,
+            claim.plan.dependencies,
+          );
+          let operationFailure: unknown;
+          try {
+            // Reconciliation is deliberately a separate phase. No new
+            // transport dispatch can begin until every recoverable row has
+            // received a fresh, persisted live-state decision.
+            for (const operationId of orderedOperationIds) {
+              const operation = byId.get(operationId);
+              if (operation === undefined) {
+                throw storageFailure("plan_operation_missing");
+              }
+              const current = rowsById.get(operation.operationId);
+              if (current === undefined) continue;
+              const reconciled = await reconcileForResume({
+                storage: this.#storage,
+                runtime: this.#runtime,
+                executor: this.#executor,
+                lease,
+                run: claim.run,
+                operation,
+                row: current,
+                context,
+                ...(signal === undefined ? {} : { callerSignal: signal }),
+              });
+              rowsById.set(operation.operationId, reconciled);
+            }
+
+            for (const operationId of orderedOperationIds) {
+              const operation = byId.get(operationId);
+              const sequence = sequenceById.get(operationId);
+              if (operation === undefined || sequence === undefined) {
+                throw storageFailure("plan_operation_missing");
+              }
+              let current = rowsById.get(operation.operationId) ?? null;
+              if (
+                current?.status === "succeeded" ||
+                current?.status === "skipped"
+              ) {
+                continue;
+              }
+              const dependenciesComplete = operation.dependsOn.every(
+                (dependencyId) => {
+                  const dependency = rowsById.get(dependencyId);
+                  return (
+                    dependency?.status === "succeeded" ||
+                    dependency?.status === "skipped"
+                  );
+                },
+              );
+              if (!dependenciesComplete) {
+                current = recordDependencyBlocked({
+                  storage: this.#storage,
+                  runtime: this.#runtime,
+                  lease,
+                  run: claim.run,
+                  operation,
+                  sequence,
+                  existing: current,
+                });
+                rowsById.set(operation.operationId, current);
+                if (parsed.failureMode === "stop") break;
+                continue;
+              }
+
+              let createWriteAhead = current === null;
+              if (current !== null) {
+                const retryable =
+                  current.status === "failed" &&
+                  current.reconciliation === "confirmed_not_applied" &&
+                  current.error?.retryable === true &&
+                  current.attempts < MAX_ATTEMPTS;
+                if (!retryable) {
+                  if (parsed.failureMode === "stop") break;
+                  continue;
+                }
+                lease.assertActive();
+                assertNotAborted(signal);
+                const delayMs = retryDelayMs(current.error, this.#runtime);
+                if (delayMs > 0) {
+                  try {
+                    await this.#pacer.waitForRetry(delayMs, lease.signal);
+                  } catch (error) {
+                    if (isCancellation(error, signal)) {
+                      throw fixedAbortError();
+                    }
+                    throw error;
+                  }
+                  lease.assertActive();
+                  assertNotAborted(signal);
+                }
+                const dependenciesStillComplete = operation.dependsOn.every(
+                  (dependencyId) => {
+                    const dependency = rowsById.get(dependencyId);
+                    return (
+                      dependency?.status === "succeeded" ||
+                      dependency?.status === "skipped"
+                    );
+                  },
+                );
+                if (!dependenciesStillComplete) {
+                  if (parsed.failureMode === "stop") break;
+                  continue;
+                }
+                current = storageCall(() =>
+                  this.#storage.retryRunOperation({
+                    runId: claim.run.id,
+                    operationId: operation.operationId,
+                    maxAttempts: MAX_ATTEMPTS,
+                    lease: lease.freshGuard(),
+                  }),
+                );
+                rowsById.set(operation.operationId, current);
+                createWriteAhead = false;
+              }
+              const finished = await executePendingOperation({
+                storage: this.#storage,
+                runtime: this.#runtime,
+                executor: this.#executor,
+                pacer: this.#pacer,
+                lease,
+                run: claim.run,
+                operation,
+                sequence,
+                context,
+                createWriteAhead,
+                ...(signal === undefined ? {} : { callerSignal: signal }),
+              });
+              rowsById.set(operation.operationId, finished);
+              if (
+                parsed.failureMode === "stop" &&
+                finished.status !== "succeeded" &&
+                finished.status !== "skipped"
+              ) {
+                break;
+              }
+            }
+          } catch (error) {
+            operationFailure = error;
+          }
+          if (operationFailure !== undefined) {
+            const interruptedRows = storageCall(() =>
+              this.#storage.listRunOperations(claim.run.id),
+            );
+            if (
+              interruptedRows.some(
+                (row) => row.status === "pending" || row.status === "running",
+              )
+            ) {
+              throw errorObject(operationFailure);
+            }
+          }
+          const run = finalizeRun({
+            storage: this.#storage,
+            runtime: this.#runtime,
+            lease,
+            plan: claim.plan,
+            run: claim.run,
+          });
+          if (operationFailure !== undefined)
+            throw errorObject(operationFailure);
+          result = resultFor(this.#storage, run);
+        }
+      } catch (error) {
+        primary = error;
+        hasPrimary = true;
+      }
+
+      const cleanupFailures: unknown[] = [];
+      try {
+        lease.renew(this.#writeIntervalMs + LEASE_HEARTBEAT_MS);
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+      let safetyWaitCompleted = false;
+      try {
+        await this.#pacer.waitForSafetyWindow();
+        safetyWaitCompleted = true;
+      } catch (error) {
+        cleanupFailures.push(error);
+      }
+      if (!safetyWaitCompleted) lease.retainUntilExpiry();
+
+      if (hasPrimary || cleanupFailures.length > 0) {
+        const authoritative = errorObject(
+          hasPrimary ? primary : cleanupFailures[0],
+        );
+        const diagnosticStart = hasPrimary ? 0 : 1;
+        for (
+          let index = diagnosticStart;
+          index < cleanupFailures.length;
+          index += 1
+        ) {
+          appendCleanupDiagnostic(authoritative, cleanupFailures[index]);
+        }
+        throw authoritative;
+      }
+      return result as ApplyResult;
+    });
+  }
+}

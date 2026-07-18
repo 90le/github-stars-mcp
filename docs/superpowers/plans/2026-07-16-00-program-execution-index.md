@@ -6,7 +6,7 @@
 
 **Architecture:** Work proceeds from pure domain contracts to adapters and services, then MCP/CLI/plugin packaging, and finally release evidence. Each subsystem plan produces testable commits; no plan may bypass the shared ports, official API allowlist, immutable plan/apply workflow, or default read-only gate.
 
-**Tech Stack:** TypeScript 7.0.2, Node.js 22/24, ESM, MCP SDK 1.29.0, Zod v4, Octokit 5.0.5, `better-sqlite3`, Vitest v4, npm, GitHub Actions.
+**Tech Stack:** TypeScript 6.0.3, Node.js 22/24, ESM, MCP SDK 1.29.0, Zod v4, Octokit 5.0.5, `better-sqlite3`, Vitest v4, npm, GitHub Actions.
 
 ## Global Constraints
 

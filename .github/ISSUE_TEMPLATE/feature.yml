@@ -1,0 +1,56 @@
+name: Feature request
+description: Propose one agent-facing workflow or safety improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        GitHub Stars MCP manages Stars and User Lists. Repository administration and repository contents remain outside the product boundary.
+  - type: textarea
+    id: use_case
+    attributes:
+      label: Agent use case
+      description: Describe the user's goal, the collection size, and the decision the agent must make.
+      placeholder: An agent needs to...
+    validations:
+      required: true
+  - type: textarea
+    id: proposed_contract
+    attributes:
+      label: Proposed contract
+      description: Show the input, bounded output, and errors that an MCP client needs.
+    validations:
+      required: true
+  - type: dropdown
+    id: mutation_allowlist
+    attributes:
+      label: GitHub mutation allowlist impact
+      description: An expansion needs a security review and allowlist contract tests.
+      options:
+        - No change
+        - Changes an existing Star or User List operation
+        - Requests a new Star or User List operation
+        - Unsure
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and audit behavior
+      description: Explain plan and apply separation, protected targets, preconditions, redaction, and rollback limits that apply.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Use fictional repository and account data. Do not include a token or private repository metadata.
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: Product boundary
+      options:
+        - label: This request does not add repository deletion, archive, transfer, rename, visibility, contents, generic API, shell, or browser capabilities.
+          required: true

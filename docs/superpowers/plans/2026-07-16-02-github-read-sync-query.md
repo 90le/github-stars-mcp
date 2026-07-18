@@ -6,7 +6,7 @@
 
 **Architecture:** `OctokitGitHubAdapter` is the only network adapter and implements named `GitHubPort` methods. Read services depend on that port and synchronous `StoragePort`; sync writes bounded batches to an unreadable `building` snapshot and atomically promotes it only after all remote pages pass completeness checks, while query, evidence, and discovery return bounded agent-ready data.
 
-**Tech Stack:** TypeScript 7.0.2 strict ESM, Node.js 22/24, Octokit 5.0.5 with retry/throttling, REST API `2026-03-10`, GitHub GraphQL, SQLite through `StoragePort`, Vitest v4.
+**Tech Stack:** TypeScript 6.0.3 strict ESM, Node.js 22/24, Octokit 5.0.5 with retry/throttling, REST API `2026-03-10`, GitHub GraphQL, SQLite through `StoragePort`, Vitest v4.
 
 ## Global Constraints
 
@@ -58,7 +58,11 @@ export type UserList = Readonly<{
 export type ListMembership = Readonly<{ listId: UserListId; repositoryId: RepositoryId }>;
 ```
 
-Plan 02 consumes `StoragePort` from `src/app/ports/storage-port.ts` with these locked methods: `acquireLease`, `renewLease`, `releaseLease`, `createSnapshot`, `appendSnapshotBatch`, `completeSnapshot`, `failSnapshot`, `getLatestCompleteSnapshot`, `getCompleteSnapshot`, `getRepositoryMetadata`, `queryRepositories`, `queryLists`, and `hasStar`. Plan 01 owns `SnapshotDraft`, `SnapshotBatch`, `SnapshotCounts`, `AcquireLeaseInput`, and all query types.
+Plan 02 consumes `StoragePort` from `src/app/ports/storage-port.ts` with these locked methods: `acquireLease`, `renewLease`, `releaseLease`, `recoverAbandonedSnapshots`, `createSnapshot`, `appendSnapshotBatch`, `beginSnapshotVerification`, `appendSnapshotVerificationBatch`, `finishSnapshotVerification`, `completeSnapshot`, `failSnapshot`, `getLatestCompleteSnapshot`, `getCompleteSnapshot`, `getRepositoryMetadata`, `queryRepositories`, `queryLists`, `queryListMemberships`, `getIncompleteRunSummaries`, and `hasStar`. Every staged write carries a current `LeaseGuard`. Plan 01 owns `SnapshotDraft`, `SnapshotBatch`, `SnapshotVerificationBatch`, `SnapshotCounts`, `ListCoverage`, `AcquireLeaseInput`, and all bounded query types.
+
+All GitHub timestamps are normalized at the adapter boundary through Plan
+01's `canonicalUtcTimestamp` to exact `.SSSZ` UTC form before they enter Star,
+List, repository, rate-limit, or snapshot records.
 
 Plan 02 creates this read side; Plan 03 extends the same interface with named Star/List mutations:
 
@@ -231,7 +235,7 @@ it.each([
 
 it("shares secondary-limit pauses, cancels waits, and never follows a cross-host redirect", async () => {
   const gate = fakeRateGate();
-  gate.observeSecondaryLimit("2026-07-17T00:01:00Z");
+  gate.observeSecondaryLimit("2026-07-17T00:01:00.000Z");
   const pending = gate.beforeRequest(abortController.signal);
   abortController.abort();
   await expect(pending).rejects.toMatchObject({code:"GITHUB_UNAVAILABLE"});
@@ -389,7 +393,7 @@ it("probes with reads only and returns a normalized paginated Star", async () =>
   await expect(scripted.adapter.getViewer()).resolves.toEqual({ host: "github.com", login: "octo", accountId: "U_7" });
   await expect(scripted.adapter.probeCapabilities()).resolves.toEqual({ starRead: "available", starWrite: "unknown", listRead: "available", listWrite: "unknown" });
   const page = await scripted.adapter.listStarredRepositories(null);
-  expect(page).toMatchObject({ nextCursor: "2", items: [{ starredAt: "2024-01-02T03:04:05Z", repository: { repositoryId: "R_42", repositoryDatabaseId: "42" } }] });
+  expect(page).toMatchObject({ nextCursor: "2", items: [{ starredAt: "2024-01-02T03:04:05.000Z", repository: { repositoryId: "R_42", repositoryDatabaseId: "42" } }] });
   expect(scripted.requests.at(-1)?.parameters).toMatchObject({ page: 1, per_page: 100, headers: { accept: "application/vnd.github.star+json" } });
   expect(scripted.requests.every((request) => request.kind === "rest" ? request.method === "GET" : ["ViewerLists", "UserListItems"].includes(request.operation))).toBe(true);
 });
@@ -430,10 +434,15 @@ GraphQL errors can never produce `available`; contract tests cover each case.
 `normalizeRestRepository` and `normalizeGraphqlRepository` are compile-time
 checked to return the exact Plan 01 `Repository`, including `isDisabled` and
 `isPrivate`; numeric IDs are stringified, visibility/topics normalized, and
-nullable `pushedAt`/license preserved. `normalizeUserList` includes nullable
-`lastAddedAt`. `StatusService.status` caches capabilities unless refresh is
+nullable `pushedAt`/license preserved. Every repository, Star, List, and
+rate-limit timestamp passes through `canonicalUtcTimestamp`, rejecting
+sub-millisecond precision, offsets, invalid dates, and expanded years before
+storage. `normalizeUserList` includes nullable `lastAddedAt`.
+`StatusService.status` caches capabilities unless refresh is
 requested and returns binding, credential source name, capabilities, latest
-complete snapshot, and rate-limit state without a token.
+complete snapshot, rate-limit state, and at most 20 incomplete-run summaries
+without a token. The summary also returns its full total and `truncated`
+indicator; it never expands every audit row.
 
 ```ts
 export function createScriptedGitHubAdapter(transcript: readonly ScriptedGitHubStep[], host = "github.com") {
@@ -522,6 +531,7 @@ git commit -m "feat: read complete GitHub User Lists"
 ### Task 5: Publish full and incremental immutable snapshots under a lease
 
 **Files:**
+- Create: `src/app/services/lease-scope.ts`
 - Create: `src/app/services/sync-service.ts`
 - Create: `test/unit/services/sync-service.test.ts`
 
@@ -534,14 +544,20 @@ git commit -m "feat: read complete GitHub User Lists"
 it("keeps staged batches unreadable until one completion and never publishes failure", async () => {
   const storage = fakeStoragePort();
   const github = fakeGitHubPort({ starPages: [[star("R_1")], [star("R_2")]], listPages: [[list("UL_1")]], itemPages: { UL_1: [[repositoryItem("R_1")], [repositoryItem("R_2")]] } });
-  const service = new SyncService(github, storage, fixedRuntime("2026-07-17T00:00:00Z"));
+  const service = new SyncService(github, storage, fixedRuntime("2026-07-17T00:00:00.000Z"));
   const result = await service.sync({ mode: "full", includeLists: true, metadataMaxAgeHours: 24 });
   expect(storage.createSnapshot).toHaveBeenCalledTimes(1);
-  expect(storage.appendSnapshotBatch.mock.calls.every(([,batch]) =>
+  expect(storage.appendSnapshotBatch.mock.calls.every(([{batch}]) =>
     batch.repositories.length <= 100 && batch.stars.length <= 100 &&
     batch.lists.length <= 100 && batch.memberships.length <= 100
   )).toBe(true);
   expect(storage.appendSnapshotBatch).toHaveBeenCalledTimes(5);
+  expect(storage.beginSnapshotVerification).toHaveBeenCalledTimes(1);
+  expect(storage.appendSnapshotVerificationBatch.mock.calls.every(([{batch}]) =>
+    batch.stars.length <= 100 && batch.lists.length <= 100 &&
+    batch.memberships.length <= 100
+  )).toBe(true);
+  expect(storage.finishSnapshotVerification).toHaveBeenCalledTimes(1);
   expect(storage.completeSnapshot).toHaveBeenCalledTimes(1);
   expect(result.counts).toMatchObject({ stars: 2, lists: 1, memberships: 2, refreshedRepositories: 2 });
   const failingStore = fakeStoragePort();
@@ -550,18 +566,25 @@ it("keeps staged batches unreadable until one completion and never publishes fai
   expect(failingStore.failSnapshot).toHaveBeenCalledTimes(1);
   expect(failingStore.releaseLease).toHaveBeenCalledTimes(1);
 });
-it("restarts an unstable head and uses local observation time for incremental reuse", async () => {
-  const fixture = changingHeadSyncFixture();
+it("restarts on deep-page churn and uses local observation time for incremental reuse", async () => {
+  const fixture = changingDeepPageSyncFixture();
   const result = await fixture.service.sync({
     mode:"incremental",includeLists:false,metadataMaxAgeHours:24,
   });
-  expect(fixture.github.firstPageReads).toBe(4); // initial + head check for each of two attempts
+  expect(fixture.github.completeStarEnumerations).toBe(4); // collect + verify for each attempt
   expect(fixture.storage.failedSnapshots()).toEqual(["snap_1"]);
   expect(result.snapshotId).toBe("snap_2");
   expect(result.counts).toMatchObject({refreshedRepositories:1,reusedMetadata:1});
   expect(fixture.storage.snapshot("snap_2").repositoryIds).toEqual(fixture.github.stableStarIds);
 });
 ```
+
+Add table-driven cases proving that a stable set returned in a different
+page/item order completes, while an added/removed Star, changed `starredAt`,
+changed List metadata, or changed membership fails the draft. One fixture
+mutates a Star only after first-pass Stars but during the long first-pass List
+traversal; assert the final Star verification detects it and no mixed snapshot
+publishes.
 - [ ] **Step 2: Run sync tests to verify failure**
 Run: `npm test -- test/unit/services/sync-service.test.ts`
 Expected: FAIL because `SyncService` is absent.
@@ -570,57 +593,114 @@ Expected: FAIL because `SyncService` is absent.
 ```ts
 async sync(input: SyncInput): Promise<SyncResult> {
   const binding = await this.github.getViewer();
+  const capabilities = await this.github.probeCapabilities();
+  if (input.includeLists && capabilities.listRead === "unknown") {
+    throw new AppError("CAPABILITY_UNAVAILABLE","List-read capability is temporarily unknown",{retryable:true});
+  }
   const ownerId = `sync:${process.pid}:${crypto.randomUUID()}`;
-  const name = `sync:${binding.host}:${binding.login}`;
+  const name = `sync:${binding.host}:${sha256Hex(binding.accountId).slice(0,16)}`;
   const leaseInput = () => ({ name, ownerId, now: this.runtime.now(), expiresAt: addMinutes(this.runtime.now(), 10) });
   const lease = this.storage.acquireLease(leaseInput());
   if (!lease) throw new AppError("STORAGE_ERROR", "Another sync holds this account lease");
-  try {
+  return this.leaseScopes.run({storage:this.storage,lease,leaseInput,heartbeatEveryMs:60_000},async (scope) => {
+    this.storage.recoverAbandonedSnapshots({binding,lease:scope.freshGuard()});
     for (let consistencyAttempt = 1; consistencyAttempt <= 3; consistencyAttempt += 1) {
-      const draft = { id:this.runtime.snapshotId(),binding,mode:input.mode,startedAt:this.runtime.now() };
-      this.storage.createSnapshot(draft);
+      const coverage = !input.includeLists ? "omitted" : capabilities.listRead === "available" ? "collecting" : "unavailable";
+      const draft = { id:this.runtime.snapshotId(),binding,mode:input.mode,listCoverage:coverage,startedAt:this.runtime.now() };
+      const guard = scope.freshGuard();
+      this.storage.createSnapshot({draft,lease:guard});
       try {
-        const result = await this.stageOneConsistentSnapshot(draft,input,leaseInput);
+        const result = await this.stageOneConsistentSnapshot(draft,input,scope);
         return result;
       } catch (error) {
-        this.storage.failSnapshot({id:draft.id,failedAt:this.runtime.now(),sourceRateLimit:null});
-        if (!(error instanceof StarHeadChanged) || consistencyAttempt === 3) throw error;
+        const cleanupGuard=scope.tryFreshGuard();
+        if (cleanupGuard) {
+          try {
+            this.storage.failSnapshot({id:draft.id,failedAt:cleanupGuard.now,sourceRateLimit:null,lease:cleanupGuard});
+          } catch (cleanupError) {
+            scope.recordCleanupError(cleanupError);
+          }
+        }
+        if (!(error instanceof CollectionChanged) || consistencyAttempt === 3 || scope.hasCleanupErrors) throw error;
       }
     }
     throw new AppError("GITHUB_UNAVAILABLE","Star collection did not stabilize",{retryable:true});
-  } finally { this.storage.releaseLease({ name, ownerId }); }
+  });
 }
 ```
 
 `stageOneConsistentSnapshot` performs these exact bounded phases:
 
-1. Read and retain only the first Star page fingerprint plus stable-ID/count
-   sets. For each Star page, reject repeated cursors/IDs and immediately append
-   one batch of at most 100 Stars plus observed repository versions.
+1. Fully enumerate Stars. For each page, reject repeated cursors/IDs within
+   that traversal, renew the lease, and immediately append one batch of at
+   most 100 Stars plus observed repository versions. Retain no
+   repository-sized array.
 2. Incremental reuse compares `draft.startedAt` with local
    `getRepositoryMetadata(id).observedAt`, never GitHub `updatedAt`. Reused
    metadata retains its original observation time; refreshed metadata records
    the current observation. Counters distinguish refreshed versus reused IDs.
-3. Re-read the first Star page after the last page. If its stable
-   ID/`starredAt` fingerprint differs, throw `StarHeadChanged`; the outer loop
-   fails that unreadable snapshot and restarts from a new ID. Duplicate IDs are
-   never silently counted twice.
-4. If Lists are available, append each List metadata page (≤100), then each
-   List item page (≤100) with repository versions and memberships. Unsupported
-   union members become warnings. Stable IDs are deduplicated.
-5. Verify accumulated unique counts and the snapshot's foreign-key/count
-   checks, then perform the sole `building→complete` publication.
+3. If List read is available and requested, enumerate every List metadata page
+   and every membership page, appending batches ≤100 while computing a
+   bounded count only. Unsupported union members are recorded in
+   failed-attempt diagnostics and immediately fail collection while the draft
+   remains `collecting`; the service may not
+   relabel already staged rows as unavailable/omitted. If collection is not
+   requested or capability is unavailable before staging, write no List rows
+   and preserve coverage `omitted` or
+   `unavailable`. A transient/unknown capability aborts before lease/snapshot
+   creation with a retryable error; it is never persisted as unavailable.
+4. After all first-pass Star/List work, call `beginSnapshotVerification`.
+   For complete List coverage, enumerate the entire List metadata and
+   membership sets into verification batches first. For unavailable/omitted
+   coverage, append no List verification rows.
+5. Enumerate the entire Star set into verification batches **last**, after all
+   List collection and verification work. This catches Star churn that occurs
+   while Lists are being collected. The second pass stores only normalized
+   `(repositoryId,starredAt)` records and does not refetch or rewrite
+   repository metadata.
+6. Call `finishSnapshotVerification`, renew the lease, and call
+   `completeSnapshot` with final coverage and the
+   accumulated counts. Storage independently derives actual distinct counts
+   and, in the same `BEGIN IMMEDIATE`, uses bidirectional SQL `EXCEPT` over
+   Stars, full List metadata, and memberships to prove exact set equality
+   regardless of page order; proves the stored exact-owner lease is still
+   active; and performs the sole `building→complete` publication.
 
-The service holds and renews the lease throughout, passes `AbortSignal` to all
-GitHub reads, and stores no unbounded metadata/page arrays in memory.
+There is no streaming sequence digest. Identical remote sets returned in a
+different page/item order must publish successfully, while any addition,
+removal, changed `starredAt`, changed List metadata field, or changed
+membership fails with `details.reason="collection_changed"`. Duplicate IDs
+within either traversal are also treated as collection churn. Since GitHub
+does not expose one atomic version token spanning Stars and Lists, the
+observable consistency boundary is the completed second traversal of each
+collection; final Stars are deliberately observed after all List work and
+publication follows immediately.
+
+`LeaseScope` starts a periodic heartbeat well below the TTL, and every storage
+write requests a fresh `now` guard. It stops scheduling remote reads as soon as
+renewal proves the lease lost. `tryFreshGuard` never reuses an earlier time and
+returns null after loss, so cleanup leaves the draft for recovery instead of
+issuing an owner-invalid fail. Scope cleanup stops the heartbeat and releases
+only when still owner. It preserves/rethrows the primary collection error;
+cleanup `NOT_FOUND`/`PRECONDITION_FAILED` is attached to diagnostics and never
+masks it. With no primary error, a cleanup failure is surfaced.
+
+The service passes `AbortSignal` to all GitHub reads and stores no unbounded
+metadata/page arrays in memory. A lost lease aborts without publication;
+recovery, not the displaced process, fails the abandoned draft after the
+winning lease is active/expired as appropriate.
 
 - [ ] **Step 4: Run sync/storage tests and typecheck**
 Run: `npm test -- test/unit/services/sync-service.test.ts test/integration/storage/snapshot.test.ts && npm run typecheck`
-Expected: PASS; success publishes once, failure publishes zero times, and both release the lease.
+Expected: PASS; stable full double enumerations publish once, reordered
+second-pass pages publish once, deep-page Star or List churn and Star churn
+during List collection publish zero mixed snapshots, unavailable/omitted
+coverage writes zero List rows, active-lease recovery skips live work, and all
+owned leases are released.
 
 - [ ] **Step 5: Commit**
 ```bash
-git add src/app/services/sync-service.ts test/unit/services/sync-service.test.ts
+git add src/app/services/lease-scope.ts src/app/services/sync-service.ts test/unit/services/sync-service.test.ts
 git commit -m "feat: synchronize immutable Star snapshots"
 ```
 
@@ -638,11 +718,13 @@ git commit -m "feat: synchronize immutable Star snapshots"
 - [ ] **Step 1: Write failing query service tests**
 ```ts
 it("uses latest or explicit complete snapshot and delegates stable filter/aggregate queries", async () => {
-  const storage = fakeStoragePort({ latestSnapshotId: "snap_1", queryPage: { total: 2, items: [repositoryView("R_2")], aggregates: { byLanguage: { TypeScript: 2 }, archived: 0, forks: 0 }, nextCursor: "opaque" }, listPage: { total: 1, items: [listView("UL_1", ["R_1", "R_2"])], nextCursor: null } });
-  const input = { snapshotId: null, filter: { all: [{ field: "stargazer_count", op: "lt", value: 10000 }, { field: "pushed_at", op: "before", value: "2023-07-17T00:00:00Z" }] }, sort: [{ field: "stargazer_count", direction: "desc" }], limit: 1, cursor: null, fields: ["repository_id", "full_name"], evidence: "none", evidenceLimit: 0 } as const;
+  const storage = fakeStoragePort({ latestSnapshotId: "snap_1", queryPage: { total: 2, items: [repositoryView("R_2")], aggregates: { languages: [{language:"TypeScript",count:2}], archived: 0, forks: 0 }, nextCursor: "opaque" }, listPage: { coverage:"complete",total: 1, items: [listSummary("UL_1",2)], nextCursor: null }, membershipPage:{coverage:"complete",selector:{kind:"list",listId:"UL_1"},total:2,repositoryIds:["R_1"],nextCursor:"members"} });
+  const input = { snapshotId: null, filter: { all: [{ field: "stargazer_count", op: "lt", value: 10000 }, { field: "pushed_at", op: "before", value: "2023-07-17T00:00:00.000Z" }] }, sort: [{ field: "stargazer_count", direction: "desc" }], limit: 1, cursor: null, fields: ["repository_id", "full_name"], evidence: "none", evidenceLimit: 0 } as const;
   await expect(new QueryService(storage, account()).query(input)).resolves.toMatchObject({ snapshotId: "snap_1", total: 2, nextCursor: "opaque" });
   expect(storage.queryRepositories).toHaveBeenCalledWith({ snapshotId: "snap_1", filter: input.filter, sort: input.sort, pageSize: 1, cursor: null });
-  await expect(new ListsQueryService(storage, account()).query({ snapshotId: null, limit: 50, cursor: null })).resolves.toMatchObject({ snapshotId: "snap_1", total: 1 });
+  const lists=new ListsQueryService(storage,account());
+  await expect(lists.query({mode:"lists",snapshotId:null,limit:50,cursor:null})).resolves.toMatchObject({snapshotId:"snap_1",coverage:"complete",total:1});
+  await expect(lists.query({mode:"memberships",snapshotId:null,listId:"UL_1",limit:1,cursor:null})).resolves.toMatchObject({snapshotId:"snap_1",coverage:"complete",repositoryIds:["R_1"],total:2,nextCursor:"members"});
 });
 ```
 
@@ -665,11 +747,23 @@ async query(input: StarsQueryInput): Promise<StarsQueryResult> {
 }
 ```
 
-`ListsQueryService.query` applies the same snapshot resolution and limit validation, then calls `queryLists({ snapshotId: snapshot.id, pageSize: input.limit, cursor: input.cursor })`. Plan 01 remains the only filter validation/evaluation/SQL, stable cursor, and aggregate implementation; `pushed_at` and `updated_at` stay distinct.
+`ListsQueryService.query` accepts a closed discriminated input. `mode:"lists"`
+calls `queryLists` and returns bounded `ListSummary` rows.
+`mode:"memberships"` requires exactly one of `listId` or `repositoryId`,
+constructs that exact selector, and calls `queryListMemberships`; it returns
+bounded relationship rows rather than embedding a complete membership array.
+Both modes return coverage and fail closed unless it is `complete`.
+
+`QueryService` allows non-List filters for final `unavailable`/`omitted`
+snapshots, but a filter tree containing `list_ids` or `is_unclassified`
+requires complete coverage. Plan 01 remains the only filter
+validation/evaluation/SQL, authenticated stable cursor, and aggregate
+implementation; cursor signing is internal to storage and never exposed by
+either service, while `pushed_at` and `updated_at` stay distinct.
 
 - [ ] **Step 4: Run query/domain/storage tests and typecheck**
 Run: `npm test -- test/unit/services/query-service.test.ts test/unit/domain/filter.test.ts test/integration/storage/snapshot.test.ts && npm run typecheck`
-Expected: PASS; pages have no duplicates and aggregates cover all matches, not only the page.
+Expected: PASS; pages have no duplicates, aggregates cover all matches rather than only the page, hostile language names remain inert array values, List summaries and two-direction memberships paginate independently, and incomplete List coverage rejects only List-dependent work.
 
 - [ ] **Step 5: Commit**
 ```bash

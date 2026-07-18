@@ -1,0 +1,23 @@
+{
+  "mcpServers": {
+    "github-stars-mcp": {
+      "command": "npx",
+      "args": ["-y", "github-stars-mcp@1.0.0", "--stdio"],
+      "env_vars": [
+        "GITHUB_STARS_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_HOST",
+        "GITHUB_STARS_MCP_DATA_DIR",
+        "GITHUB_STARS_MCP_READ_ONLY",
+        "GITHUB_STARS_MCP_AUTH_MODE",
+        "GITHUB_STARS_MCP_LOG_LEVEL",
+        "GITHUB_STARS_MCP_MAX_READ_CONCURRENCY",
+        "GITHUB_STARS_MCP_WRITE_INTERVAL_MS",
+        "GITHUB_STARS_MCP_MAX_PLAN_ACTIONS",
+        "GITHUB_STARS_MCP_PLAN_TTL_MINUTES"
+      ],
+      "tool_timeout_sec": 900
+    }
+  }
+}

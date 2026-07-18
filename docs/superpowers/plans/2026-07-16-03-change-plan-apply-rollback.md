@@ -6,7 +6,7 @@
 
 **Architecture:** `PlanService`, `ApplyService`, `RollbackService`, and `InspectService` depend only on the named `GitHubPort` and synchronous `StoragePort`. Planning resolves all selectors and membership deltas against one complete snapshot and persists canonical executable content once. Apply verifies the persisted content, authenticated account, capability, expiry, and global account lease before claiming a run. Every external mutation has a durable write-ahead row, stable-ID precondition, postcondition, one-at-a-time pacing, and explicit reconciliation. Rollback projects only successful source operations into a new immutable plan and never mutates GitHub.
 
-**Tech Stack:** Node.js 22/24, TypeScript 7.0.2 strict ESM, Octokit 5.0.5, `better-sqlite3` behind `StoragePort`, Node `crypto`, Vitest v4.
+**Tech Stack:** Node.js 22/24, TypeScript 6.0.3 strict ESM, Octokit 5.0.5, `better-sqlite3` behind `StoragePort`, Node `crypto`, Vitest v4.
 
 ## Locked Dependencies from Plans 01 and 02
 
@@ -16,13 +16,17 @@ Plan 01 owns these contracts; do not recreate or rename them:
 - `Snapshot.binding`, where `binding` is exact `host`, `login`, and stable `accountId`.
 - `PlanRequest.actions`, all six `ResolvedOperation` variants, `PlanExecutableContent`, `ChangePlan`, `ChangeRun`, `RunOperation`, `hashPlanExecutable`, `topologicalOperationIds`, and `reverseDependencyOperationIds`.
 - `StoragePort`, `StorageTransaction`, `SQLiteStore`, and `test/fixtures/memory-storage.ts#createMemoryStorage`.
-- `createRunOperation`, `startRunOperation`, and `retryRunOperation`: create
-  writes `pending` attempt zero, start is the sole `pending→running` CAS and
-  attempt increment immediately before dispatch, and retry queues only a
-  reconciled-not-applied or retryable-failed row back to `pending` while
-  preserving successful rows and original `before`.
+- `createRunOperation`, `startRunOperation`, `finishRunOperation`,
+  `reconcileRunOperation`, and `retryRunOperation`: create writes `pending`
+  attempt zero, start is the sole active-lease `pending→running` CAS and
+  appends an immutable per-dispatch attempt immediately before transport,
+  finish/reconcile update only legal discriminated outcomes, and retry queues
+  only `failed + confirmed_not_applied + retryable` within the attempt ceiling
+  while preserving all earlier attempts, successful rows, and original
+  `before`.
 
-Plan 02 owns the read side of `GitHubPort`, the adapter, the allowlisted transport, and the shared scripted seam:
+Plan 02 owns the read side of `GitHubPort`, the adapter, the allowlisted
+transport, the heartbeat-driven `LeaseScope`, and the shared scripted seam:
 
 ```ts
 createScriptedGitHubAdapter(
@@ -51,8 +55,10 @@ This plan extends those files. It does not expose a generic request, URL, HTTP v
 - Never automatically retry a mutation transport dispatch. A reset after dispatch is ambiguous and must be read back before a later attempt.
 - Keep one account apply lease for the whole run and keep it through the final pacing window. This provides cross-process serialization and at least the configured 1,000 ms between mutation starts.
 - Write the `pending` audit row before entering the mutation pacer. Inside the
-  paced callback, check `AbortSignal`, atomically mark it `running`, and then
-  dispatch immediately. Pass the signal through the pacer and executor.
+  paced callback, check `AbortSignal`, atomically mark it `running` and append
+  its attempt under the current exact-owner lease, and then dispatch
+  immediately with no intervening `await`. Pass the signal through the pacer
+  and executor.
 - A resume reuses the same run ID, never rewrites a successful row, and uses `retryRunOperation` rather than reinserting a write-ahead row.
 - Descriptions, names, README text, GitHub errors, and headers are inert untrusted data and are recursively redacted before persistence or output.
 - Rollback creation is closed-world and reads only persisted plan/run audit data. The resulting plan remains bound to the source run account, and the later apply step performs the live viewer/capability check. Re-starring cannot restore `starred_at`; List recreation cannot restore the former List ID.
@@ -195,7 +201,7 @@ expect(scripted.requests).toHaveLength(1);
 Run:
 
 ```bash
-npm test -- --run test/contract/github/mutations.test.ts
+npm test -- test/contract/github/mutations.test.ts
 ```
 
 Expected: FAIL on missing port methods, mutation documents, or mutation transcript variants.
@@ -275,7 +281,7 @@ Extend the scripted seam's REST method union with `PUT | DELETE`, GraphQL steps 
 Run:
 
 ```bash
-npm test -- --run test/contract/github/mutations.test.ts test/security/github-read-boundary.test.ts
+npm test -- test/contract/github/mutations.test.ts test/security/github-read-boundary.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -370,7 +376,12 @@ it("uses stable local operation IDs and hashes identical executable content iden
 
 Also test:
 
-- All `queryRepositories` and `queryLists` cursors are exhausted.
+- All `queryRepositories`, `queryLists`, and `queryListMemberships` cursors are
+  exhausted without ever requesting an unbounded member array.
+- Any action that reads or mutates Lists requires snapshot
+  `listCoverage:"complete"`; `unavailable`, `omitted`, and `collecting` fail
+  before a plan is saved. A Star-only plan remains valid on final non-List
+  coverage.
 - Missing stable IDs, incomplete/failed snapshots, conflicts, and graph cycles save no plan.
 - Protected repositories emit no operation.
 - Protected Lists cannot be updated/deleted and cannot be removed by membership delta; their existing membership is preserved.
@@ -385,7 +396,7 @@ Also test:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/plan-service.test.ts
+npm test -- test/unit/services/plan-service.test.ts
 ```
 
 Expected: FAIL resolving `plan-service.ts`, `operation-resolver.ts`, or the shared fixture.
@@ -394,12 +405,14 @@ Expected: FAIL resolving `plan-service.ts`, `operation-resolver.ts`, or the shar
 
 `resolveOperationRequests` receives `{ storage, snapshot, actions, protectedRepositoryIds, protectedListIds, nextOperationId }`. It must:
 
-1. Page every selector to exhaustion against `snapshot.id`.
-2. Resolve and sort repository and List targets by stable ID.
+1. Page every selector to exhaustion against `snapshot.id`. For List
+   metadata use `queryLists`; for deletion before-state and per-repository
+   membership use the appropriate bounded `queryListMemberships` direction.
+2. Resolve and sort repository and List targets by stable ID; expand a multi-ID `list_update` request to one resolved operation per List.
 3. Remove protected targets and preserve protected membership before assigning operation IDs.
 4. Normalize add/remove/set membership actions per repository into one exact sorted set.
 5. Use `expectedListIds` for the snapshot precondition and `targetLists` for the desired complete set.
-6. Convert created-List references to `{ kind: "created", createOperationId }` and add create-before-membership dependencies.
+6. Resolve request-time `{ kind: "created", clientRef }` references to exactly one matching `list_create`, convert them to `{ kind: "created", createOperationId }`, reject missing/duplicate references, and add create-before-membership dependencies.
 7. Snapshot full before/after/inverse JSON for every operation.
 8. Collapse exact duplicates and reject incompatible changes to the same target.
 9. Assign `op_000001`, `op_000002`, and later IDs only after deterministic sorting.
@@ -439,7 +452,7 @@ Call `topologicalOperationIds` before `savePlan`, save once inside one synchrono
 Run:
 
 ```bash
-npm test -- --run test/unit/services/plan-service.test.ts test/unit/domain/plan-run.test.ts
+npm test -- test/unit/services/plan-service.test.ts test/unit/domain/plan-run.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -471,10 +484,22 @@ export type ExecutionContext = {
 };
 
 export class MutationPacer {
-  run<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T>;
+  run<TPrepared,TResult>(input:{
+    readonly signal?:AbortSignal;
+    readonly prepare:()=>Promise<
+      | {readonly kind:"skipped";readonly outcome:ExecutionOutcome}
+      | {readonly kind:"dispatch";readonly prepared:TPrepared}
+    >;
+    readonly dispatch:(prepared:TPrepared)=>Promise<TResult>;
+  }):Promise<ExecutionOutcome|TResult>;
   waitForSafetyWindow(): Promise<void>;
 }
 
+export interface PreparedMutation {
+  readonly operation:ResolvedOperation;
+  readonly before:JsonValue;
+  readonly mutation:AllowlistedPreparedMutation;
+}
 export class MutationExecutor {
   readCurrentState(
     operation: ResolvedOperation,
@@ -483,11 +508,16 @@ export class MutationExecutor {
   ): Promise<JsonValue>;
   matchesBefore(operation: ResolvedOperation, state: JsonValue, context: ExecutionContext): boolean;
   matchesAfter(operation: ResolvedOperation, state: JsonValue, context: ExecutionContext): boolean;
-  execute(
+  prepare(
     operation: ResolvedOperation,
     context: ExecutionContext,
     signal?: AbortSignal,
-  ): Promise<ExecutionOutcome>;
+  ): Promise<{readonly kind:"skipped";readonly outcome:ExecutionOutcome}|{readonly kind:"dispatch";readonly prepared:PreparedMutation}>;
+  dispatchPrepared(
+    prepared:PreparedMutation,
+    context:ExecutionContext,
+    signal?:AbortSignal,
+  ):Promise<ExecutionOutcome>;
 }
 ```
 
@@ -503,12 +533,16 @@ Test all of the following:
 - A changed complete membership set fails before `setRepositoryListIds`.
 - An already-desired state returns `skipped` with zero mutation calls.
 - `list_create` stores the returned `list.listId` under its create operation ID.
-- The executor checks `signal`, re-reads the live stable precondition, and checks `signal` again immediately before the one mutation dispatch.
+- `prepare` checks `signal`, re-reads the live stable precondition, and returns
+  skipped or an opaque prepared allowlisted mutation without dispatch.
+- `dispatchPrepared` is a non-`async` entry that invokes the one named GitHub
+  mutation synchronously before returning its Promise; a scripted transport
+  records the request before the method returns.
 
 The membership assertion uses Plan 01 names:
 
 ```ts
-await expect(executor.execute({
+await expect(executor.prepare({
   operationId: "op_000001",
   kind: "list_membership_set",
   repositoryId: asRepositoryId("R_1"),
@@ -530,7 +564,7 @@ await expect(executor.execute({
 Run:
 
 ```bash
-npm test -- --run test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
+npm test -- test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
 ```
 
 Expected: FAIL resolving the two service modules.
@@ -540,23 +574,38 @@ Expected: FAIL resolving the two service modules.
 `MutationPacer` maintains a promise tail and monotonic `lastStart`. Its queued callback:
 
 1. Throws if aborted.
-2. Sleeps interruptibly until `lastStart + intervalMs`.
-3. Throws if aborted.
-4. Records `lastStart`.
-5. Calls exactly one supplied function.
+2. Sleeps interruptibly until `lastStart + intervalMs` when a previous
+   mutation exists.
+3. Throws if aborted, then calls and awaits the final `prepare` while retaining
+   the serial queue.
+4. If prepare returns skipped, returns it without changing `lastStart`.
+5. Otherwise throws if aborted, records the fresh actual mutation-start time,
+   and immediately calls exactly one `dispatch` callback.
+
+Waiting before the final live read ensures no pacing sleep can stale the
+precondition. A skipped operation after a mutation may wait once for the
+remaining safety window, but because it does not move `lastStart`, consecutive
+skips do not add artificial one-second intervals.
 
 `waitForSafetyWindow` is non-cancellable and waits until `lastStart + intervalMs`, so an account lease cannot be released early.
 
 For every Star operation, `MutationExecutor` calls `getRepositoryIdentity(coordinates)` and requires both stored IDs to match before reading/writing Star state. For Lists it calls `getUserList(listId)`. For membership it calls the fully paginated `getRepositoryListIds(repositoryId)`. It compares sorted exact state, not subset membership.
 
-`execute` performs the final state read itself, returns `skipped` if desired state already holds, throws `PRECONDITION_FAILED` if the exact before state does not hold, checks cancellation, calls one named mutation, then reads and requires the exact after state. A successful response without the after state throws `RECONCILIATION_REQUIRED`.
+`prepare` performs the final identity/state read, returns `skipped` if desired
+state already holds, and throws `PRECONDITION_FAILED` if the exact before state
+does not hold. No attempt exists yet. `dispatchPrepared` contains no `await`
+before its named mutation call; it invokes that transport synchronously, then
+chains the response and exact after-state read. A successful response without
+the after state throws `RECONCILIATION_REQUIRED`. Prepared values are frozen,
+opaque, single-use, bound to the operation/context, and cannot carry a generic
+route or GraphQL document.
 
 - [ ] **Step 4: Verify focused execution behavior**
 
 Run:
 
 ```bash
-npm test -- --run test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
+npm test -- test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -615,8 +664,17 @@ Also test:
 
 - The account lease name is derived from host and a stable hash of account ID, not login alone.
 - A second service/process cannot apply another plan for the same account while the first lease is held.
-- The lease is renewed before each mutation and remains held through `pacer.waitForSafetyWindow`.
+- Two concurrent `apply` calls through the same service instance receive
+  different scope owner IDs; exactly one acquires the account lease and the
+  other fails before a run/plan-state change or mutation.
+- The shared `LeaseScope` heartbeat renews periodically well below TTL,
+  remains held through `pacer.waitForSafetyWindow`, and uses fresh `now` for
+  every guarded write. A mutation that takes longer than one TTL still cannot
+  overlap a second owner.
 - A GitHub callback observes its run operation already in `running`.
+- The callback also observes a running attempt row with the same incremented
+  attempt number; every repeated dispatch leaves the earlier attempt rows
+  queryable.
 - A completed apply called twice returns the same run and performs no second mutation.
 - `stop` leaves later operations unscheduled and the run/plan partial.
 - `continue` executes independent operations but records a dependent operation as `failed`, `error.retryable === true`, `details.reason === "dependency_blocked"`, and `reconciliation === "confirmed_not_applied"` without dispatch.
@@ -630,7 +688,7 @@ Also test:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-service.test.ts
+npm test -- test/unit/services/apply-service.test.ts
 ```
 
 Expected: FAIL resolving `apply-service.ts`.
@@ -641,40 +699,90 @@ Implement this exact order:
 
 1. Reject read-only mode and an already-aborted signal.
 2. Load the persisted plan. Recompute `hashPlanExecutable(plan.executable)`, require it equals `plan.hash`, require `input.expectedHash` equals `plan.hash`, and require 64 lowercase hex.
-3. Reject expired or terminal/superseded state without mutation.
-4. Call `getViewer` and `probeCapabilities`; require exact binding and reject
+3. Call `getViewer` and require its exact host/login/stable account ID binding.
+   If the plan is already `applied`, load and validate its unique completed
+   run and return the original bounded result now—before capability probes,
+   expiry admission, or account-lease acquisition. A later TTL expiry or
+   another plan's active account lease cannot break this idempotent read.
+4. For any non-applied plan, reject expiry and
+   `expired|failed|superseded`/unknown states without local or remote
+   mutation. Call `probeCapabilities` and reject
    only a required write capability that is `unavailable`. Accept `unknown`
    because a no-write probe cannot prove every fine-grained token permission;
    create one stable, redacted warning per unknown required capability, persist
    it in the new run, return `warnings === run.warnings`, and preserve it
    unchanged on resume. Then let the fixed mutation endpoint
    return an audited `INSUFFICIENT_PERMISSION` without retry.
-5. Acquire `apply:<host>:<sha256(accountId)[0..15]>` with the injected process `instanceId`. Failure is retryable `CAPABILITY_UNAVAILABLE`.
-6. In one synchronous transaction, re-read/revalidate the plan, return an existing completed run unchanged, or atomically claim `ready|partial -> applying`, create/reuse one run, and move a partial run back to running. A resume must preserve its original `failureMode`; reject a conflicting mode.
-7. Rebuild `createdListIdsByOperationId` from every succeeded `list_create` run row's persisted `after.listId`.
-8. Iterate `topologicalOperationIds`. Skip only succeeded or semantically idempotent skipped rows. Before a dependent operation, require every dependency row to be succeeded or skipped; otherwise record the retryable dependency-blocked row described above.
-9. For a first attempt call `createRunOperation` with `pending`/attempt zero
-   before awaiting the pacer. For `unresolved` or retryable `failed`, reconcile
-   first and call `retryRunOperation` only when safe; that queues the existing
-   row as pending. Never recreate an existing row.
-10. Pass `signal` through `pacer.run`. Its callback checks cancellation, calls
-    `startRunOperation` (the sole attempt increment), then immediately calls
-    `executor.execute(operation, context, signal)` without another await.
-11. Finish each row with sanitized before/after, request ID, reconciliation, and serialized error. Successful rows are never modified again.
-12. Derive run and plan terminal/partial state from persisted rows in one synchronous transaction.
-13. Return bounded counts/errors and an inspection cursor.
-14. In `finally`, renew the lease to cover the remaining pacing interval, await non-cancellable `pacer.waitForSafetyWindow()`, then owner-check and release the lease. No SQLite transaction spans either await.
+5. Derive a new unpredictable owner ID
+   `${instanceId}:${runtime.requestId()}` for this call, acquire
+   `apply:<host>:<sha256(accountId)[0..15]>`, and start `LeaseScope`. Never use
+   the process-level `instanceId` alone as the lease owner. Storage rejects
+   every active reacquire including a same-owner value; only `renewLease` may
+   extend the scope. Failure is retryable `CAPABILITY_UNAVAILABLE`.
+6. Under that lease, call targeted
+   `recoverAbandonedRuns({binding,lease:freshGuard})`
+   before admission. This immediately converts an expired prior owner's
+   pending/running run to partial even when the server has not restarted; it
+   skips all exact-owner active work.
+7. In one synchronous transaction, assert the exact active lease,
+   re-read/revalidate the plan, return its one existing completed run
+   unchanged, or atomically claim `ready|partial -> applying`, create the
+   plan's only run, or rebind its existing partial run to this lease and move
+   it back to running. A resume must preserve its original `failureMode`;
+   reject a conflicting mode.
+8. Rebuild `createdListIdsByOperationId` from every succeeded `list_create` run row's persisted `after.listId`.
+9. Iterate `topologicalOperationIds`. Skip succeeded or semantically
+   idempotent skipped rows. If no audit row exists, first call lease-guarded
+   `createRunOperation` with `pending`/attempt zero. Reconcile every existing
+   unresolved row before any scheduling; a confirmed success is now terminal,
+   confirmed-not-applied becomes failed, and unknown remains unschedulable.
+10. Require every dependency row to be succeeded or skipped. For a new pending
+    row whose dependency is blocked, finish it as retryable
+    confirmed-not-applied with no attempt. Leave an already-failed retry row
+    failed while its dependency is blocked.
+11. When dependencies are ready, call `retryRunOperation` only for an existing
+    `failed/confirmed_not_applied` row with a retryable error and attempts below
+    `maxAttempts`; that queues it as pending without deleting attempts/events.
+    Never recreate a row and never pass unresolved directly to retry.
+12. Pass `signal` through `pacer.run`. Its `prepare` callback performs all
+    asynchronous identity/precondition reads. Already-desired state finishes
+    the pending row as skipped with no attempt; stale/precondition failure
+    finishes it as confirmed-not-applied with no attempt.
+13. Only for a prepared mutation, the pacer's `dispatch` callback obtains a
+    fresh heartbeat guard, calls `startRunOperation` (the sole attempt
+    increment and attempt-row append), then immediately calls
+    non-async `executor.dispatchPrepared(...)` without another await. The fake
+    transport must record dispatch before the callback returns its Promise.
+14. Finish each row through the discriminated lease-guarded method with
+    sanitized after state, request ID, reconciliation, and serialized error.
+    Storage—not the caller—preserves before/attempts and atomically finalizes
+    the current attempt. Successful rows are never modified again.
+15. Derive run and plan terminal/partial state from persisted rows in one
+    synchronous transaction that first asserts the lease.
+16. Return bounded counts/errors and an inspection cursor.
+17. In cleanup, keep the heartbeat alive through non-cancellable
+    `pacer.waitForSafetyWindow()`, stop it, then release only if still owner.
+    Preserve/rethrow the primary apply error; cleanup owner/not-found errors
+    are diagnostic and never mask it. With no primary error, cleanup failure is
+    surfaced. No SQLite transaction spans either await.
 
-Use `startRunOperation` as the sole attempt-increment CAS. Unscheduled
-operations have no row; a partial result is still derived by comparing rows
-with plan operations.
+Use `startRunOperation` as the sole attempt-increment CAS and audit-attempt
+append. Unscheduled operations have no row; pre-dispatch skipped/failed rows
+have no attempt; a partial result is still derived by comparing rows with plan
+operations.
+
+If heartbeat loss occurs before dispatch, stop without calling
+`startRunOperation`. If it occurs while one GitHub request is in flight, issue
+no further dispatch. Use a fresh guard to persist the response only if this
+process is still owner; otherwise leave the running attempt untouched for
+lease-aware startup recovery to mark unresolved and later reconcile.
 
 - [ ] **Step 4: Verify admission and orchestration**
 
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-service.test.ts test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
+npm test -- test/unit/services/apply-service.test.ts test/unit/services/mutation-pacer.test.ts test/unit/services/mutation-executor.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -735,7 +843,10 @@ Add resume tests proving:
 - Desired readback persists `succeeded` and `confirmed_applied`.
 - Before-state readback persists `failed`, a retryable serialized error, and `confirmed_not_applied`.
 - Third-state readback persists `unresolved` and `unknown`.
-- Resume first reconciles every recovered `running`, `unresolved`, and retryable `failed` row before any dispatch.
+- Startup recovery never exposes a recovered `running` row: expired-owner
+  running projections/attempts become unresolved, while another active
+  process's rows are skipped. Resume reconciles every unresolved row before
+  considering any retryable failed row.
 - Resume calls `retryRunOperation` to queue, then `startRunOperation` to
   increment attempts immediately before dispatch; it preserves success and
   reuses the run ID.
@@ -748,7 +859,7 @@ Add resume tests proving:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-reconciliation.test.ts
+npm test -- test/unit/services/apply-reconciliation.test.ts
 ```
 
 Expected: FAIL resolving `reconciliation.ts` or on incorrect resume state.
@@ -761,28 +872,35 @@ Expected: FAIL resolving `reconciliation.ts` or on incorrect resume state.
 - `confirmed_not_applied` -> `status: "failed"`, serialized `RECONCILIATION_REQUIRED` with `retryable: true`, `reconciliation: "confirmed_not_applied"`.
 - `unknown` -> `status: "unresolved"`, serialized `RECONCILIATION_REQUIRED` with `retryable: false`, `reconciliation: "unknown"`.
 
-All three transitions use `StoragePort.reconcileRunOperation`, the dedicated
-CAS from an existing unresolved row. They never route through
-`finishRunOperation`, which is reserved for pending/running first-attempt
-records.
+All three transitions use the lease-guarded
+`StoragePort.reconcileRunOperation`, the dedicated CAS from an existing
+unresolved projection. It preserves the dispatch attempt's original ambiguous
+outcome/time, appends an immutable reconciliation event, and atomically updates
+only the projection. Repeated unknown readbacks therefore remain independently
+auditable. They never route through `finishRunOperation`, which is reserved
+for pending/running current-attempt records.
 
 On apply/resume:
 
-1. Reconcile recovered `running` and unresolved rows before deciding whether they can run.
+1. Reconcile unresolved rows before deciding whether they can run; a running
+   row with another live owner is not resumable.
 2. Never retry `unknown`.
-3. Retry only `confirmed_not_applied`, only while `attempts < maxAttempts`, and only via `retryRunOperation`.
+3. Retry only `failed + confirmed_not_applied + error.retryable`, only while
+   `attempts < maxAttempts`, and only via `retryRunOperation`.
 4. Recheck dependencies immediately before retry.
 5. Honor persisted rate-limit time and cancellation before the retry write-ahead transition.
 6. Rebuild create-operation mappings before reconciling dependent membership.
 
-Keep the mutation transport's retry count at zero; all repeat dispatches are visible as incremented run-operation attempts.
+Keep the mutation transport's retry count at zero; all repeat dispatches and
+all reconciliation observations are visible as separate rows through bounded
+inspection.
 
 - [ ] **Step 4: Verify reconciliation and full apply**
 
 Run:
 
 ```bash
-npm test -- --run test/unit/services/apply-reconciliation.test.ts test/unit/services/apply-service.test.ts test/contract/github/mutations.test.ts
+npm test -- test/unit/services/apply-reconciliation.test.ts test/unit/services/apply-service.test.ts test/contract/github/mutations.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -846,7 +964,7 @@ Test:
 Run:
 
 ```bash
-npm test -- --run test/unit/services/rollback-service.test.ts
+npm test -- test/unit/services/rollback-service.test.ts
 ```
 
 Expected: FAIL resolving `rollback-service.ts`.
@@ -872,7 +990,7 @@ Rollback operation routing/preconditions come from persisted source `before`/`af
 Run:
 
 ```bash
-npm test -- --run test/unit/services/rollback-service.test.ts test/unit/domain/plan-run.test.ts
+npm test -- test/unit/services/rollback-service.test.ts test/unit/domain/plan-run.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -898,12 +1016,9 @@ git commit -m "feat: generate safe rollback plans"
 **Produces:**
 
 ```ts
-export type InspectInput = Readonly<{
-  kind: "plan" | "run";
-  id: string;
-  limit?: number;
-  cursor?: string | null;
-}>;
+export type InspectInput =
+  | Readonly<{kind:"plan"|"run";id:string;limit?:number;cursor?:string|null}>
+  | Readonly<{kind:"attempts"|"reconciliations";id:RunId;operationId:string;limit?:number;cursor?:string|null}>;
 
 export class InspectService {
   inspect(input: InspectInput): Promise<InspectResult>;
@@ -915,10 +1030,18 @@ export class InspectService {
 Test:
 
 - Default limit 50, allowed range 1–100, stable sequence ordering, no duplicates across pages.
-- Cursor payload is `{ version: 1, kind, targetId, afterSequence }`.
+- Plan/run cursor payload is
+  `{version:1,kind,targetId,afterSequence}`. Attempt cursor payload is
+  `{version:1,kind:"attempts",runId,operationId,afterAttempt}`.
+- Reconciliation cursor payload is
+  `{version:1,kind:"reconciliations",runId,operationId,afterEventSequence}`.
 - A run cursor reused for a plan, a cursor reused for a different ID, invalid base64/JSON/version, negative sequence, and sequence beyond target all fail `VALIDATION_ERROR`.
 - Nested error headers, URLs, descriptions, and details are recursively redacted.
-- Plan inspection pages its persisted `operations`; run inspection calls `listRunOperationsPage({ runId, afterSequence, pageSize })`.
+- Plan inspection pages its persisted `operations`; run inspection calls
+  `listRunOperationsPage`; attempt inspection calls
+  `listRunOperationAttemptsPage`; reconciliation inspection calls
+  `listRunOperationReconciliationsPage`. Each response includes total and
+  never flattens either history into the run page.
 - Empty final page has `nextCursor: null`.
 
 Do not reflect a TypeScript interface at runtime. Instead test the frozen executable manifest:
@@ -942,14 +1065,19 @@ The security test also reads `src/app/ports/github-port.ts` and `src/github/octo
 Run:
 
 ```bash
-npm test -- --run test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
+npm test -- test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
 ```
 
 Expected: FAIL resolving `inspect-service.ts` or the mutation manifest.
 
 - [ ] **Step 3: Implement target-bound cursor paging**
 
-Encode cursor JSON as base64url. Decode and validate every field before storage access. For run pages, convert only the validated `afterSequence` to the Plan 01 storage call and bind the returned next sequence into a new cursor with the same `kind` and `targetId`. For plan pages, treat operation order as one-based sequence and slice deterministically.
+Encode cursor JSON as base64url. Decode and validate every field before storage
+access. For run/attempt/reconciliation pages, convert only the validated
+boundary to the matching Plan 01 storage call and bind its returned next
+boundary into a new cursor with the exact kind and target tuple. For plan
+pages, treat operation order as zero-based sequence consistently with
+persisted plan operations and slice deterministically.
 
 Call `redactSecrets` on the complete presentation object after paging. Never return raw storage errors, auth headers, tokens, the full unbounded run-operation array, or a cursor containing account data.
 
@@ -958,7 +1086,7 @@ Call `redactSecrets` on the complete presentation object after paging. Never ret
 Run:
 
 ```bash
-npm test -- --run test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
+npm test -- test/unit/services/inspect-service.test.ts test/security/github-capability-boundary.test.ts
 npm run typecheck
 npm run lint
 ```
@@ -999,7 +1127,7 @@ Require the repository to equal `<login>/github-stars-mcp-fixture-<suffix>` with
 Run:
 
 ```bash
-npm test -- --run test/unit/live-contract-config.test.ts
+npm test -- test/unit/live-contract-config.test.ts
 ```
 
 Expected: FAIL resolving `test/fixtures/live-contract.ts`. This command must not discover or run `test/live/**`.
@@ -1037,8 +1165,8 @@ No PR/default CI command may execute the live suite.
 Run:
 
 ```bash
-npm test -- --run test/unit/live-contract-config.test.ts
-npm test -- --run test/security/github-capability-boundary.test.ts
+npm test -- test/unit/live-contract-config.test.ts
+npm test -- test/security/github-capability-boundary.test.ts
 npm run typecheck
 npm run lint
 ```
