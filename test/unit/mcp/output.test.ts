@@ -8,6 +8,7 @@ import {
   parseRunOperationAttempt,
   parseRunOperationReconciliation,
 } from "../../../src/domain/run.js";
+import { ToolNames } from "../../../src/mcp/schemas/common.js";
 import {
   ApplyOutputDataSchema,
   DiscoveryOutputDataSchema,
@@ -19,7 +20,6 @@ import {
   StatusOutputDataSchema,
   SyncOutputDataSchema,
   ToolFailureStructuredContentSchema,
-  ToolNames,
   ToolOutputSchemas,
 } from "../../../src/mcp/schemas/output.js";
 import {

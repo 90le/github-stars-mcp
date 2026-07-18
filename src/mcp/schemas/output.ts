@@ -7,18 +7,7 @@ import {
 import { APP_ERROR_CODES } from "../../domain/errors.js";
 import type { JsonValue } from "../../domain/json.js";
 import { canonicalUtcTimestamp } from "../../domain/timestamp.js";
-
-export const ToolNames = [
-  "github_stars_status",
-  "github_stars_sync",
-  "github_stars_query",
-  "github_lists_query",
-  "github_changes_plan",
-  "github_changes_inspect",
-  "github_changes_apply",
-  "github_changes_rollback",
-  "github_repositories_discover",
-] as const;
+import type { ToolName } from "./common.js";
 
 const SafeIntegerSchema = z.number().int().nonnegative().safe();
 const StableIdSchema = z
@@ -1109,7 +1098,4 @@ export const ToolOutputSchemas = {
   github_changes_apply: successOutput(ApplyOutputDataSchema),
   github_changes_rollback: successOutput(RollbackOutputDataSchema),
   github_repositories_discover: successOutput(DiscoveryOutputDataSchema),
-} as const satisfies Record<
-  (typeof ToolNames)[number],
-  z.ZodObject<z.ZodRawShape>
->;
+} as const satisfies Record<ToolName, z.ZodObject<z.ZodRawShape>>;
