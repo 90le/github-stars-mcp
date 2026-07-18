@@ -34,6 +34,8 @@ import {
   parseRunOperationReconciliation,
 } from "../../src/domain/run.js";
 
+export type FakeServices = ServiceRegistry;
+
 export const FAKE_NOW = "2026-07-16T00:00:00.000Z";
 const FAKE_LATER = "2026-07-16T00:01:00.000Z";
 const FAKE_EXPIRES = "2026-07-17T00:00:00.000Z";

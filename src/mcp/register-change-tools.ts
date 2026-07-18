@@ -31,6 +31,7 @@ export function registerChangeTools(
     server,
     {
       name: "github_changes_plan",
+      title: "Plan GitHub Changes",
       description:
         "Resolve and persist a local change plan only. This tool performs no GitHub network write; inspect the immutable plan before applying it.",
       inputSchema: PlanInputSchema,
@@ -53,6 +54,7 @@ export function registerChangeTools(
     server,
     {
       name: "github_changes_inspect",
+      title: "Inspect GitHub Changes",
       description:
         "Read a local plan, run, dispatch attempt, or reconciliation history page. This tool performs no network access and writes no state.",
       inputSchema: InspectInputSchema,
@@ -74,6 +76,7 @@ export function registerChangeTools(
     server,
     {
       name: "github_changes_apply",
+      title: "Apply GitHub Changes",
       description:
         "Apply an exact hash-bound plan through GitHub network writes. This can unstar repositories or delete Lists and is resumable through its persisted local run.",
       inputSchema: ApplyInputSchema,
@@ -96,6 +99,7 @@ export function registerChangeTools(
     server,
     {
       name: "github_changes_rollback",
+      title: "Create GitHub Rollback Plan",
       description:
         "Create and persist a local rollback plan from an audited run. This tool does not write to GitHub; inspect and explicitly apply the returned plan.",
       inputSchema: RollbackInputSchema,
