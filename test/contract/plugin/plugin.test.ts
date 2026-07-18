@@ -25,6 +25,8 @@ const PNG_SIGNATURE = VALID_PNG.subarray(0, 8);
 const PACKED_PLUGIN_PATHS = Object.freeze([
   "plugins/github-stars-mcp/.codex-plugin/plugin.json",
   "plugins/github-stars-mcp/.mcp.json",
+  "plugins/github-stars-mcp/assets/icon.png",
+  "plugins/github-stars-mcp/assets/logo.png",
   "plugins/github-stars-mcp/skills/manage-github-stars/SKILL.md",
 ]);
 const ENV_ALLOWLIST = Object.freeze([
