@@ -556,6 +556,42 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
   ],
   ["JS line comment", "Kl", "// Authorization: Bearer Kl"],
   ["JS block comment", "Mn", "/* Authorization: Bearer Mn */"],
+  ["multiline JS block comment", "Op", "/*\n * Authorization: Bearer Op\n */"],
+  [
+    "trailing JS line comment",
+    "Qr",
+    "const safe = true; // Authorization: Bearer Qr",
+  ],
+  [
+    "trailing same-line JS block comment",
+    "St",
+    "const safe = true; /* Authorization: Bearer St */",
+  ],
+  [
+    "CRLF multiline JS block comment",
+    "Uv",
+    "/*\r\n * Authorization: Bearer Uv\r\n */",
+  ],
+  [
+    "multiline JS block comment ending before code",
+    "Wx",
+    "const before = true; /*\n * Authorization: Bearer Wx\n */ const after = true;",
+  ],
+  [
+    "trailing line credential after a multiline JS block comment",
+    "Yz",
+    "/* safe block comment\r\n */ const after = true; // Authorization: Bearer Yz",
+  ],
+  [
+    "bare HTTPS scheme followed by a line credential",
+    "Za",
+    "https:// Authorization: Bearer Za",
+  ],
+  [
+    "line credential after a division expression",
+    "Bc",
+    "const ratio = total / count; // Authorization: Bearer Bc",
+  ],
   ["unterminated quoted literal", "Qq", 'const value = "Bearer Qq'],
   [
     "escaped nested literal",
@@ -1420,6 +1456,41 @@ describe("Codex plugin package", () => {
     [
       "quoted prose where Bearer occurs later",
       'const note = "The client supports Bearer token-based authentication.";\n',
+    ],
+    [
+      "comment-like placeholder in a string literal",
+      'const example = "// Authorization: Bearer <token>";\n',
+    ],
+    [
+      "comment-like interpolation in a template literal",
+      "const example = `// Authorization: Bearer ${token}`;\n",
+    ],
+    [
+      "line-comment syntax in a regular expression",
+      String.raw`const pattern = /\/\/ Authorization: Bearer [A-Za-z]+/u;` +
+        "\n",
+    ],
+    [
+      "block-comment syntax in a regular expression",
+      String.raw`const pattern = /\/\* Authorization: Bearer [A-Za-z]+ \*\//u;` +
+        "\n",
+    ],
+    [
+      "a regular expression after a division operator",
+      String.raw`const ratio = total / /[// Authorization: Bearer <token>]/u.source.length;` +
+        "\n",
+    ],
+    [
+      "an HTTPS URL in a string literal",
+      'const endpoint = "https://api.github.com/user/starred";\n',
+    ],
+    [
+      "prose in a real line comment",
+      "// The client supports Bearer token-based authentication.\n",
+    ],
+    [
+      "a placeholder in a real block comment",
+      "/* Authorization: Bearer <token> */\n",
     ],
   ])("accepts non-credential Bearer control: %s", async (_name, contents) => {
     await withPluginFixture(async (root) => {

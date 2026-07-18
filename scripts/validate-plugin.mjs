@@ -1015,18 +1015,6 @@ function configEntryContainsBearer(line, start) {
   return false;
 }
 
-function commentConfigSource(line) {
-  const index = skipBearerWhitespace(line, 0, true);
-  if (line.slice(index, index + 2) === "//") {
-    return line.slice(index + 2);
-  }
-  if (line.slice(index, index + 2) === "/*") {
-    const end = line.indexOf("*/", index + 2);
-    return line.slice(index + 2, end === -1 ? line.length : end);
-  }
-  return line;
-}
-
 function configContentStart(line) {
   const index = skipBearerWhitespace(line, 0, true);
   if (
@@ -1039,21 +1027,20 @@ function configContentStart(line) {
 }
 
 function configLineContainsBearer(line) {
-  const source = commentConfigSource(line);
-  const index = configContentStart(source);
+  const index = configContentStart(line);
   if (
-    source[index] === "-" &&
-    (source[index + 1] === " " || source[index + 1] === "\t")
+    line[index] === "-" &&
+    (line[index + 1] === " " || line[index + 1] === "\t")
   ) {
     const valueStart = index + 1;
     return (
-      configValueContainsBearer(source, valueStart) ||
-      configEntryContainsBearer(source, valueStart)
+      configValueContainsBearer(line, valueStart) ||
+      configEntryContainsBearer(line, valueStart)
     );
   }
   return (
-    configEntryContainsBearer(source, index) ||
-    completeBearerValue(source, index, true)
+    configEntryContainsBearer(line, index) ||
+    completeBearerValue(line, index, true)
   );
 }
 
@@ -1075,6 +1062,237 @@ function literalBearerValue(source, depth = 0) {
   return quotedContentContainsBearer(source, depth);
 }
 
+const REGEX_PREFIX_KEYWORDS = new Set([
+  "await",
+  "case",
+  "delete",
+  "do",
+  "else",
+  "in",
+  "instanceof",
+  "new",
+  "of",
+  "return",
+  "throw",
+  "typeof",
+  "void",
+  "yield",
+]);
+
+function javascriptIdentifierStart(character) {
+  return (
+    typeof character === "string" &&
+    character.length === 1 &&
+    /[A-Za-z_$]/u.test(character)
+  );
+}
+
+function javascriptIdentifierPart(character) {
+  return (
+    typeof character === "string" &&
+    character.length === 1 &&
+    /[A-Za-z0-9_$]/u.test(character)
+  );
+}
+
+function commentBodyContainsBearer(source) {
+  for (const rawLine of source.split("\n")) {
+    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+    const index = skipBearerWhitespace(line, 0, true);
+    const content = line[index] === "*" ? line.slice(index + 1) : line;
+    if (configLineContainsBearer(content)) return true;
+  }
+  return false;
+}
+
+function commentBearerValue(source) {
+  let state = "code";
+  let index = 0;
+  let commentStart = 0;
+  let canStartRegex = true;
+  let regexCharacterClass = false;
+  const templateExpressionDepths = [];
+
+  while (index < source.length) {
+    const character = source[index];
+
+    if (state === "line-comment") {
+      if (character === "\r" || character === "\n") {
+        if (commentBodyContainsBearer(source.slice(commentStart, index))) {
+          return true;
+        }
+        state = "code";
+      }
+      index += 1;
+      continue;
+    }
+
+    if (state === "block-comment") {
+      if (character === "*" && source[index + 1] === "/") {
+        if (commentBodyContainsBearer(source.slice(commentStart, index))) {
+          return true;
+        }
+        state = "code";
+        index += 2;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (state === "single-quote" || state === "double-quote") {
+      if (character === "\\") {
+        index += source[index + 1] === undefined ? 1 : 2;
+        continue;
+      }
+      if (
+        (state === "single-quote" && character === "'") ||
+        (state === "double-quote" && character === '"')
+      ) {
+        state = "code";
+        canStartRegex = false;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (state === "template") {
+      if (character === "\\") {
+        index += source[index + 1] === undefined ? 1 : 2;
+        continue;
+      }
+      if (character === "`") {
+        state = "code";
+        canStartRegex = false;
+        index += 1;
+        continue;
+      }
+      if (character === "$" && source[index + 1] === "{") {
+        templateExpressionDepths.push(1);
+        state = "code";
+        canStartRegex = true;
+        index += 2;
+        continue;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (state === "regex") {
+      if (character === "\\") {
+        index += source[index + 1] === undefined ? 1 : 2;
+        continue;
+      }
+      if (character === "[" && !regexCharacterClass) {
+        regexCharacterClass = true;
+      } else if (character === "]" && regexCharacterClass) {
+        regexCharacterClass = false;
+      } else if (character === "/" && !regexCharacterClass) {
+        state = "code";
+        canStartRegex = false;
+      } else if (character === "\r" || character === "\n") {
+        state = "code";
+        canStartRegex = true;
+      }
+      index += 1;
+      continue;
+    }
+
+    if (character === "/" && source[index + 1] === "/") {
+      state = "line-comment";
+      commentStart = index + 2;
+      index += 2;
+      continue;
+    }
+    if (character === "/" && source[index + 1] === "*") {
+      state = "block-comment";
+      commentStart = index + 2;
+      index += 2;
+      continue;
+    }
+    if (character === "'") {
+      state = "single-quote";
+      index += 1;
+      continue;
+    }
+    if (character === '"') {
+      state = "double-quote";
+      index += 1;
+      continue;
+    }
+    if (character === "`") {
+      state = "template";
+      index += 1;
+      continue;
+    }
+    if (character === "/") {
+      if (canStartRegex) {
+        state = "regex";
+        regexCharacterClass = false;
+      } else {
+        canStartRegex = true;
+      }
+      index += 1;
+      continue;
+    }
+    if (javascriptIdentifierStart(character)) {
+      const start = index;
+      index += 1;
+      while (javascriptIdentifierPart(source[index])) index += 1;
+      canStartRegex = REGEX_PREFIX_KEYWORDS.has(source.slice(start, index));
+      continue;
+    }
+    if (/[0-9]/u.test(character)) {
+      canStartRegex = false;
+      index += 1;
+      continue;
+    }
+    if (character === "{") {
+      if (templateExpressionDepths.length > 0) {
+        templateExpressionDepths[templateExpressionDepths.length - 1] += 1;
+      }
+      canStartRegex = true;
+      index += 1;
+      continue;
+    }
+    if (character === "}" && templateExpressionDepths.length > 0) {
+      const last = templateExpressionDepths.length - 1;
+      templateExpressionDepths[last] -= 1;
+      index += 1;
+      if (templateExpressionDepths[last] === 0) {
+        templateExpressionDepths.pop();
+        state = "template";
+      } else {
+        canStartRegex = false;
+      }
+      continue;
+    }
+    if (character === ")" || character === "]" || character === "}") {
+      canStartRegex = false;
+    } else if (
+      character === "(" ||
+      character === "[" ||
+      ",;:?=!~*%&|^<>".includes(character)
+    ) {
+      canStartRegex = true;
+    } else if (character === "+" || character === "-") {
+      if (source[index + 1] === character) {
+        index += 2;
+        continue;
+      }
+      canStartRegex = true;
+    } else if (!bearerWhitespace(character) && character !== ".") {
+      canStartRegex = false;
+    }
+    index += 1;
+  }
+
+  if (state === "line-comment" || state === "block-comment") {
+    return commentBodyContainsBearer(source.slice(commentStart));
+  }
+  return false;
+}
+
 function containsCredentialMaterial(contents) {
   let source;
   try {
@@ -1087,6 +1305,7 @@ function containsCredentialMaterial(contents) {
     /github_pat_[A-Za-z0-9_]{4,}/u.test(source) ||
     /gh[pousr]_[A-Za-z0-9_]{4,}/u.test(source) ||
     literalBearerValue(source) ||
+    commentBearerValue(source) ||
     /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/u.test(source)
   );
 }
