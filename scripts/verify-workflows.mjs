@@ -22,6 +22,8 @@ const RELEASE_WORKFLOW = ".github/workflows/release.yml";
 const ALLOWED_WORKFLOWS = new Set([...EXPECTED_WORKFLOWS, RELEASE_WORKFLOW]);
 
 const PINS = Object.freeze({
+  attest:
+    "actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661",
   checkout: "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5",
   codeqlAnalyze:
     "github/codeql-action/analyze@ddf5ce7296213f5548c91e2dd19df2d77d2b2d66",
@@ -29,7 +31,11 @@ const PINS = Object.freeze({
     "github/codeql-action/init@ddf5ce7296213f5548c91e2dd19df2d77d2b2d66",
   dependencyReview:
     "actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294",
+  downloadArtifact:
+    "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
   setupNode: "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020",
+  uploadArtifact:
+    "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
 });
 
 const PINNED_ACTION = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_./-]+@[0-9a-f]{40}$/;
@@ -42,10 +48,27 @@ const GITHUB_TOKEN_CONTEXT = /\bgithub\s*\.\s*token\b/iu;
 const GITHUB_INDEX_CONTEXT = /\bgithub\s*\[/iu;
 const GITHUB_OBJECT_FILTER_CONTEXT = /\bgithub\s*\.\s*\*/iu;
 const COMPLETE_GITHUB_CONTEXT = /\bgithub\b(?!\s*(?:\.|\[))/iu;
-const RELEASE_COMMAND =
-  'gh release create "${{ github.ref_name }}" --verify-tag';
-const NPM_PUBLISH_COMMAND =
-  "npm publish artifacts/package.tgz --provenance --access public";
+const RELEASE_INPUT_DESCRIPTION =
+  "Publish the verified tarball to npm after environment approval.";
+const PACK_COMMAND = `mkdir -p artifacts
+npm sbom --sbom-format cyclonedx > artifacts/github-stars-mcp.cdx.json
+npm pack --ignore-scripts --json --pack-destination artifacts > artifacts/pack.json
+PACK_REPORTED="$(node -p "JSON.parse(require('fs').readFileSync('artifacts/pack.json','utf8'))[0].filename")"
+set -- artifacts/*.tgz
+[ "$#" -eq 1 ]
+[ -f "$1" ]
+PACK_TARBALL="$1"
+[ "$PACK_TARBALL" = "artifacts/$PACK_REPORTED" ]
+echo "tarball=\${PACK_TARBALL}" >> "$GITHUB_OUTPUT"
+`;
+const RELEASE_COMMAND = `VERSION=$(node -p "require('./package.json').version")
+gh release create "v\${VERSION}" "\${{ steps.pack.outputs.tarball }}" artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes
+`;
+const NPM_PUBLISH_COMMAND = `set -- artifacts/*.tgz
+[ "$#" -eq 1 ]
+[ -f "$1" ]
+npm publish "$1" --provenance --access public
+`;
 const RELEASE_STEP_KEYS = new Set(["name", "env", "run"]);
 const RELEASE_ROOT_PERMISSIONS = Object.freeze({
   attestations: "write",
@@ -112,6 +135,12 @@ function scalarText(node) {
     return undefined;
   }
   return String(node.value);
+}
+
+function isBooleanScalar(node, expected) {
+  return (
+    isScalar(node) && typeof node.value === "boolean" && node.value === expected
+  );
 }
 
 function sequenceText(node) {
@@ -381,14 +410,28 @@ function validateForbiddenTriggers(context) {
 
 function requirePullRequestAndMainPush(context, code) {
   const triggers = nodeAt(context.root, ["on"]);
+  const pullRequest = pairAt(triggers, "pull_request")?.value;
   const push = pairAt(triggers, "push")?.value;
   if (
     !isMap(triggers) ||
-    !hasMapKey(triggers, "pull_request") ||
+    !isEmptyTriggerValue(pullRequest) ||
     !isMap(push) ||
+    !sameTextSet(mappingKeys(push), ["branches"]) ||
     !sameTextSet(sequenceText(pairAt(push, "branches")?.value), ["main"])
   ) {
     issueAt(context, triggers, code);
+  }
+}
+
+function isEmptyTriggerValue(node) {
+  return node === null || (isScalar(node) && node.value === null);
+}
+
+function requireEmptyTrigger(context, name, code) {
+  const triggers = nodeAt(context.root, ["on"]);
+  const pair = pairAt(triggers, name);
+  if (pair === undefined || !isEmptyTriggerValue(pair.value)) {
+    issueAt(context, pair?.value ?? triggers, code);
   }
 }
 
@@ -669,6 +712,7 @@ function validatePackageSmoke(context) {
     "PACKAGE_PERMISSIONS",
   );
   requirePullRequestAndMainPush(context, "PACKAGE_TRIGGERS");
+  requireEmptyTrigger(context, "workflow_dispatch", "PACKAGE_TRIGGERS");
   expectScalar(
     context,
     ["env", "GITHUB_STARS_MCP_READ_ONLY"],
@@ -818,7 +862,16 @@ function validateCodeql(context) {
   );
   requirePullRequestAndMainPush(context, "CODEQL_TRIGGERS");
   const triggers = nodeAt(context.root, ["on"]);
-  if (!isSeq(pairAt(triggers, "schedule")?.value)) {
+  const schedule = pairAt(triggers, "schedule")?.value;
+  const scheduleEntry =
+    isSeq(schedule) && schedule.items.length === 1
+      ? schedule.items[0]
+      : undefined;
+  if (
+    !isMap(scheduleEntry) ||
+    !sameTextSet(mappingKeys(scheduleEntry), ["cron"]) ||
+    scalarText(pairAt(scheduleEntry, "cron")?.value) !== "23 4 * * 1"
+  ) {
     issueAt(context, triggers, "CODEQL_SCHEDULE");
   }
   expectScalar(
@@ -944,7 +997,7 @@ function validateReleaseJob(
     name === "release"
       ? ["environment", "runs-on", "steps"]
       : ["if", "needs", "environment", "runs-on", "permissions", "steps"],
-    ["name", "permissions", "timeout-minutes"],
+    name === "release" ? ["name", "permissions", "timeout-minutes"] : ["name"],
     executionCode,
   );
 
@@ -967,7 +1020,7 @@ function validateReleaseJob(
   if (scalarText(pairAt(job, "runs-on")?.value) !== "ubuntu-latest") {
     issueAt(context, pairAt(job, "runs-on")?.value ?? job, executionCode);
   }
-  if (name === "npm-publish") {
+  if (name === "publish-npm") {
     if (scalarText(pairAt(job, "if")?.value) !== "${{ inputs.publish_npm }}") {
       issueAt(context, pairAt(job, "if")?.value ?? job, executionCode);
     }
@@ -989,8 +1042,8 @@ function validateReleaseJob(
 
 function validateReleaseExecution(context) {
   const code = "RELEASE_EXECUTION_POLICY";
-  const steps = exactStepMaps(context, "release", 2, code);
-  if (steps.length !== 2) return;
+  const steps = exactStepMaps(context, "release", 18, code);
+  if (steps.length !== 18) return;
   validateActionStep(
     context,
     steps[0],
@@ -998,18 +1051,9 @@ function validateReleaseExecution(context) {
     { "persist-credentials": "false" },
     code,
   );
-  if (!isGhReleaseStep(steps[1])) {
-    issueAt(context, steps[1], code);
-  }
-}
-
-function validateNpmPublishExecution(context) {
-  const code = "RELEASE_EXECUTION_POLICY";
-  const steps = exactStepMaps(context, "npm-publish", 2, code);
-  if (steps.length !== 2) return;
   validateActionStep(
     context,
-    steps[0],
+    steps[1],
     PINS.setupNode,
     {
       "node-version": "24",
@@ -1017,7 +1061,92 @@ function validateNpmPublishExecution(context) {
     },
     code,
   );
-  validateRunStep(context, steps[1], NPM_PUBLISH_COMMAND, code);
+  const commands = [
+    "npm ci",
+    "npm run verify",
+    "npm run docs:check",
+    "npm run plugin:validate",
+    "npm run release:verify -- --release",
+    "npm run smoke:mcp",
+    "npm install --global @openai/codex@0.144.5",
+    "codex --version",
+    "npm run smoke:codex-plugin",
+    "npm run verify:requirements -- --release",
+  ];
+  for (const [index, command] of commands.entries()) {
+    validateRunStep(context, steps[index + 2], command, code);
+  }
+  validateKeyContract(context, steps[12], ["id", "run"], ["name"], code);
+  if (
+    scalarText(pairAt(steps[12], "id")?.value) !== "pack" ||
+    scalarText(pairAt(steps[12], "run")?.value) !== PACK_COMMAND
+  ) {
+    issueAt(context, steps[12], code);
+  }
+  validateRunStep(
+    context,
+    steps[13],
+    'npm run package:verify -- --tarball "${{ steps.pack.outputs.tarball }}"',
+    code,
+  );
+  validateRunStep(
+    context,
+    steps[14],
+    'node scripts/checksums.mjs "${{ steps.pack.outputs.tarball }}"',
+    code,
+  );
+  validateActionStep(
+    context,
+    steps[15],
+    PINS.attest,
+    { "subject-path": "${{ steps.pack.outputs.tarball }}" },
+    code,
+  );
+  if (!isGhReleaseStep(steps[16])) {
+    issueAt(context, steps[16], code);
+  }
+  validateKeyContract(
+    context,
+    steps[17],
+    ["uses", "if", "with"],
+    ["name"],
+    code,
+  );
+  if (
+    scalarText(pairAt(steps[17], "uses")?.value) !== PINS.uploadArtifact ||
+    scalarText(pairAt(steps[17], "if")?.value) !==
+      "${{ inputs.publish_npm }}" ||
+    !sameMapping(nodeAt(steps[17], ["with"]), {
+      name: "npm-tarball",
+      path: "${{ steps.pack.outputs.tarball }}",
+    })
+  ) {
+    issueAt(context, steps[17], code);
+  }
+}
+
+function validateNpmPublishExecution(context) {
+  const code = "RELEASE_EXECUTION_POLICY";
+  const steps = exactStepMaps(context, "publish-npm", 3, code);
+  if (steps.length !== 3) return;
+  validateActionStep(
+    context,
+    steps[0],
+    PINS.downloadArtifact,
+    { name: "npm-tarball", path: "artifacts" },
+    code,
+  );
+  validateActionStep(
+    context,
+    steps[1],
+    PINS.setupNode,
+    {
+      "node-version": "24",
+      "registry-url": "https://registry.npmjs.org",
+    },
+    code,
+  );
+  validateRunStep(context, steps[2], NPM_PUBLISH_COMMAND, code);
 }
 
 function validateReleaseCheckout(context) {
@@ -1036,6 +1165,37 @@ function validateReleaseCheckout(context) {
   validateCheckoutPersistence(context, expected);
 }
 
+function validateReleaseInput(context, dispatch) {
+  const code = "RELEASE_INPUT";
+  if (!isMap(dispatch)) {
+    issueAt(context, dispatch, code);
+    return;
+  }
+  validateKeyContract(context, dispatch, ["inputs"], [], code);
+  const inputs = nodeAt(dispatch, ["inputs"]);
+  validateKeyContract(context, inputs, ["publish_npm"], [], code);
+  const publish = nodeAt(inputs, ["publish_npm"]);
+  validateKeyContract(
+    context,
+    publish,
+    ["description", "required", "type", "default"],
+    [],
+    code,
+  );
+  if (
+    !sameMapping(publish, {
+      default: "false",
+      description: RELEASE_INPUT_DESCRIPTION,
+      required: "true",
+      type: "boolean",
+    }) ||
+    !isBooleanScalar(pairAt(publish, "required")?.value, true) ||
+    !isBooleanScalar(pairAt(publish, "default")?.value, false)
+  ) {
+    issueAt(context, publish, code);
+  }
+}
+
 function validateRelease(context) {
   validateKeyContract(
     context,
@@ -1051,10 +1211,11 @@ function validateRelease(context) {
     triggerKeys === undefined ||
     triggerKeys.length !== 1 ||
     triggerKeys[0] !== "workflow_dispatch" ||
-    (dispatch !== null && !isMap(dispatch))
+    !isMap(dispatch)
   ) {
     issueAt(context, triggers, "RELEASE_TRIGGERS");
   }
+  validateReleaseInput(context, dispatch);
 
   const rootPermissions = nodeAt(context.root, ["permissions"]);
   if (!sameMapping(rootPermissions, RELEASE_ROOT_PERMISSIONS)) {
@@ -1066,7 +1227,8 @@ function validateRelease(context) {
   if (
     jobKeys === undefined ||
     !jobKeys.includes("release") ||
-    jobKeys.some((key) => key !== "release" && key !== "npm-publish")
+    !jobKeys.includes("publish-npm") ||
+    jobKeys.some((key) => key !== "release" && key !== "publish-npm")
   ) {
     issueAt(context, jobs, "RELEASE_JOBS");
   }
@@ -1081,17 +1243,15 @@ function validateRelease(context) {
       rootPermissions,
     );
     validateReleaseExecution(context);
-    if (pairAt(jobs, "npm-publish") !== undefined) {
-      validateReleaseJob(
-        context,
-        jobs,
-        "npm-publish",
-        "npm-publish",
-        NPM_PUBLISH_PERMISSIONS,
-        rootPermissions,
-      );
-      validateNpmPublishExecution(context);
-    }
+    validateReleaseJob(
+      context,
+      jobs,
+      "publish-npm",
+      "npm-publish",
+      NPM_PUBLISH_PERMISSIONS,
+      rootPermissions,
+    );
+    validateNpmPublishExecution(context);
   }
 
   validateReleaseCheckout(context);

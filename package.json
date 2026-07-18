@@ -14,7 +14,9 @@
     "dist",
     "plugins/github-stars-mcp",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "SECURITY.md",
+    "npm-shrinkwrap.json"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
@@ -26,9 +28,11 @@
     "@eslint/js": "9.39.2",
     "@types/better-sqlite3": "7.6.13",
     "@types/node": "24.10.1",
+    "@types/tar-stream": "3.1.4",
     "@vitest/coverage-v8": "4.0.18",
     "eslint": "9.39.2",
     "prettier": "3.7.4",
+    "tar-stream": "3.2.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.64.0",
     "vitest": "4.0.18",
@@ -49,6 +53,7 @@
     "verify:requirements": "node scripts/verify-requirements.mjs",
     "smoke:mcp": "node scripts/mcp-inspector-smoke.mjs",
     "smoke:codex-plugin": "node scripts/codex-plugin-smoke.mjs",
+    "package:verify": "node scripts/verify-package.mjs",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:coverage": "vitest run --coverage",
