@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-import { pathToFileURL } from "node:url";
+import { realpath } from "node:fs/promises";
 import type { Writable } from "node:stream";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { loadConfig, type AppConfig } from "./config.js";
 import { AppError } from "./domain/errors.js";
 import {
@@ -160,11 +161,20 @@ export function main(): Promise<number> {
   return runCli(process.argv.slice(2), process.env);
 }
 
-const entryPoint = process.argv[1];
-if (
-  entryPoint !== undefined &&
-  import.meta.url === pathToFileURL(entryPoint).href
-) {
+async function isEntryPoint(entryPoint: string | undefined): Promise<boolean> {
+  if (entryPoint === undefined) return false;
+  try {
+    const [modulePath, invokedPath] = await Promise.all([
+      realpath(fileURLToPath(import.meta.url)),
+      realpath(entryPoint),
+    ]);
+    return modulePath === invokedPath;
+  } catch {
+    return import.meta.url === pathToFileURL(entryPoint).href;
+  }
+}
+
+if (await isEntryPoint(process.argv[1])) {
   void main().then((exitCode) => {
     process.exitCode = exitCode;
   });

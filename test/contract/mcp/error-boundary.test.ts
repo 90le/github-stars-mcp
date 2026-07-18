@@ -351,11 +351,9 @@ describe("MCP call error boundary after tool discovery", () => {
     rejectNext(
       services,
       "github_stars_status",
-      new AppError(
-        "GITHUB_UNAVAILABLE",
-        `${"a".repeat(159)}😀TAIL`,
-        { retryable: true },
-      ),
+      new AppError("GITHUB_UNAVAILABLE", `${"a".repeat(159)}😀TAIL`, {
+        retryable: true,
+      }),
     );
     const result = await call(client, {
       name: "github_stars_status",

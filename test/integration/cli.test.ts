@@ -1,6 +1,7 @@
 import { execFile, spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { mkdtemp, readFile, rm, symlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { Writable } from "node:stream";
 import { promisify } from "node:util";
 import { beforeAll, describe, expect, it, vi } from "vitest";
@@ -197,5 +198,23 @@ describe("built CLI", () => {
       stdout: `${packageJson.version}\n`,
       stderr: "",
     });
+  });
+
+  it("runs through the symlink shape used by Unix npm bins", async () => {
+    const root = await mkdtemp(join(tmpdir(), "github-stars-mcp-bin-"));
+    try {
+      const linkedCli = join(root, "github-stars-mcp.mjs");
+      await symlink(resolve("dist/cli.js"), linkedCli, "file");
+      const result = await execFileAsync(process.execPath, [
+        linkedCli,
+        "--version",
+      ]);
+      expect(result).toEqual({
+        stdout: `${PACKAGE_VERSION}\n`,
+        stderr: "",
+      });
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

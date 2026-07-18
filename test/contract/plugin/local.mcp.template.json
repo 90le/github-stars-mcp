@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "github-stars-mcp": {
+      "command": "<node-executable>",
+      "args": ["<installed-package-root>/dist/cli.js", "--stdio"]
+    }
+  }
+}

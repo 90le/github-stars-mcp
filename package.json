@@ -44,6 +44,8 @@
     "workflows:check": "node scripts/verify-workflows.mjs",
     "plugin:validate": "node scripts/validate-plugin.mjs",
     "assets:check": "node scripts/verify-assets.mjs",
+    "smoke:mcp": "node scripts/mcp-inspector-smoke.mjs",
+    "smoke:codex-plugin": "node scripts/codex-plugin-smoke.mjs",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:coverage": "vitest run --coverage",
