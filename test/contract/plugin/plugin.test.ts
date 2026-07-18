@@ -568,6 +568,11 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
     "const safe = true; /* Authorization: Bearer St */",
   ],
   [
+    "block credential inside a template expression",
+    "Vw",
+    "const value = `${/* Authorization: Bearer Vw */ token}`;",
+  ],
+  [
     "CRLF multiline JS block comment",
     "Uv",
     "/*\r\n * Authorization: Bearer Uv\r\n */",
@@ -591,6 +596,42 @@ const WAVE4_BEARER_ENCODINGS = Object.freeze([
     "line credential after a division expression",
     "Bc",
     "const ratio = total / count; // Authorization: Bearer Bc",
+  ],
+  [
+    "line credential after division from a keyword-named property",
+    "De",
+    "const ratio = metrics.await / count; // Authorization: Bearer De",
+  ],
+  [
+    "block credential after division from a keyword-named property",
+    "Fg",
+    "const ratio = metrics.return / count; /* Authorization: Bearer Fg */",
+  ],
+  [
+    "line credential after division from an optional keyword-named property",
+    "Hi",
+    "const ratio = metrics?.of / count; // Authorization: Bearer Hi",
+  ],
+  [
+    "line credential after a TypeScript non-null division expression",
+    "Jk",
+    "const ratio = total! / count; // Authorization: Bearer Jk",
+  ],
+  [
+    "block credential after a TypeScript instantiation division expression",
+    "Lm",
+    "const ratio = identity<number> / count; /* Authorization: Bearer Lm */",
+  ],
+  ["TypeScript triple-slash comment", "No", "/// Authorization: Bearer No"],
+  [
+    "line comment after a Unicode line separator",
+    "Pq",
+    "// harmless\u2028// Authorization: Bearer Pq",
+  ],
+  [
+    "line comment after a Unicode paragraph separator",
+    "Rs",
+    "// harmless\u2029// Authorization: Bearer Rs",
   ],
   ["unterminated quoted literal", "Qq", 'const value = "Bearer Qq'],
   [
@@ -1479,6 +1520,26 @@ describe("Codex plugin package", () => {
       "a regular expression after a division operator",
       String.raw`const ratio = total / /[// Authorization: Bearer <token>]/u.source.length;` +
         "\n",
+    ],
+    [
+      "a regular expression after a compact less-than comparison",
+      "const result = a<b>/[/* Authorization: Bearer Tu */]/u.test(value);\n",
+    ],
+    [
+      "a block-marker character class regular expression after a control condition",
+      "if (ready) /[/* Authorization: Bearer Ab */]/u.test(value);\n",
+    ],
+    [
+      "a block-marker character class regular expression after a code block",
+      "if (ready) {}\n/[/* Authorization: Bearer Cd */]/u.test(value);\n",
+    ],
+    [
+      "a block-marker character class regular expression after export default",
+      "export default /[/* Authorization: Bearer Ef */]/u;\n",
+    ],
+    [
+      "a line-marker character class regular expression as a loop body",
+      "for (; ready;) /[// Authorization: Bearer Gh#]/u.test(value);\n",
     ],
     [
       "an HTTPS URL in a string literal",

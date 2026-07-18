@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { delimiter, extname, join, relative, resolve, sep } from "node:path";
 import process from "node:process";
 import { TextDecoder } from "node:util";
+import ts from "typescript";
 
 const REPOSITORY_ROOT = resolve(".");
 const PLUGIN_ROOT = resolve("plugins/github-stars-mcp");
@@ -584,7 +585,10 @@ async function validatePluginTree(assets) {
     const metadata = await fileMetadata(path, "PLUGIN_FILE");
     const contents = await readFile(path);
     const source = contents.toString("utf8");
-    assert(!containsCredentialMaterial(contents), "PLUGIN_CREDENTIAL_VALUE");
+    assert(
+      !containsCredentialMaterial(contents, path),
+      "PLUGIN_CREDENTIAL_VALUE",
+    );
     assert(
       ALLOWED_PLUGIN_EXTENSIONS.has(extension) &&
         (metadata.mode & 0o111) === 0 &&
@@ -1062,238 +1066,173 @@ function literalBearerValue(source, depth = 0) {
   return quotedContentContainsBearer(source, depth);
 }
 
-const REGEX_PREFIX_KEYWORDS = new Set([
-  "await",
-  "case",
-  "delete",
-  "do",
-  "else",
-  "in",
-  "instanceof",
-  "new",
-  "of",
-  "return",
-  "throw",
-  "typeof",
-  "void",
-  "yield",
+const JAVASCRIPT_SCRIPT_KINDS = Object.freeze([
+  ts.ScriptKind.JS,
+  ts.ScriptKind.JSX,
+  ts.ScriptKind.TS,
+  ts.ScriptKind.TSX,
 ]);
 
-function javascriptIdentifierStart(character) {
-  return (
-    typeof character === "string" &&
-    character.length === 1 &&
-    /[A-Za-z_$]/u.test(character)
-  );
-}
+const COMMENT_PROTECTED_SYNTAX_KINDS = new Set([
+  ts.SyntaxKind.StringLiteral,
+  ts.SyntaxKind.NoSubstitutionTemplateLiteral,
+  ts.SyntaxKind.TemplateHead,
+  ts.SyntaxKind.TemplateMiddle,
+  ts.SyntaxKind.TemplateTail,
+  ts.SyntaxKind.RegularExpressionLiteral,
+  ts.SyntaxKind.JsxText,
+  ts.SyntaxKind.JsxTextAllWhiteSpaces,
+]);
 
-function javascriptIdentifierPart(character) {
+function javascriptLineTerminator(character) {
   return (
-    typeof character === "string" &&
-    character.length === 1 &&
-    /[A-Za-z0-9_$]/u.test(character)
+    character === "\r" ||
+    character === "\n" ||
+    character === "\u2028" ||
+    character === "\u2029"
   );
 }
 
 function commentBodyContainsBearer(source) {
-  for (const rawLine of source.split("\n")) {
-    const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
-    const index = skipBearerWhitespace(line, 0, true);
-    const content = line[index] === "*" ? line.slice(index + 1) : line;
-    if (configLineContainsBearer(content)) return true;
+  for (const line of source.split(/\r\n|[\n\r\u2028\u2029]/u)) {
+    let index = skipBearerWhitespace(line, 0, true);
+    while (line[index] === "*" || line[index] === "/") {
+      index = skipBearerWhitespace(line, index + 1, true);
+    }
+    if (configLineContainsBearer(line.slice(index))) return true;
   }
   return false;
 }
 
-function commentBearerValue(source) {
-  let state = "code";
+function parserScriptKinds(path) {
+  const lowerPath = path.toLowerCase();
+  if (
+    lowerPath.endsWith(".js") ||
+    lowerPath.endsWith(".mjs") ||
+    lowerPath.endsWith(".cjs")
+  ) {
+    return [ts.ScriptKind.JS];
+  }
+  if (lowerPath.endsWith(".jsx")) return [ts.ScriptKind.JSX];
+  if (
+    lowerPath.endsWith(".ts") ||
+    lowerPath.endsWith(".mts") ||
+    lowerPath.endsWith(".cts")
+  ) {
+    return [ts.ScriptKind.TS];
+  }
+  if (lowerPath.endsWith(".tsx")) return [ts.ScriptKind.TSX];
+  if (lowerPath.endsWith(".json") || lowerPath.endsWith(".map")) {
+    return [ts.ScriptKind.JSON];
+  }
+  return JAVASCRIPT_SCRIPT_KINDS;
+}
+
+function protectedSyntaxRanges(source, path) {
+  for (const scriptKind of parserScriptKinds(path)) {
+    const sourceFile = ts.createSourceFile(
+      path === "" ? "packed-content" : path,
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      scriptKind,
+    );
+    if (sourceFile.parseDiagnostics.length > 0) continue;
+
+    const ranges = [];
+    const pendingNodes = [sourceFile];
+    while (pendingNodes.length > 0) {
+      const node = pendingNodes.pop();
+      if (COMMENT_PROTECTED_SYNTAX_KINDS.has(node.kind)) {
+        ranges.push([node.getStart(sourceFile), node.end]);
+      }
+      ts.forEachChild(node, (child) => {
+        pendingNodes.push(child);
+      });
+    }
+    ranges.sort((left, right) => left[0] - right[0]);
+    return ranges;
+  }
+
+  // Invalid or ambiguous input receives no exclusions: every raw comment
+  // delimiter remains a candidate, so parse failure cannot hide a credential.
+  return [];
+}
+
+function commentBearerValue(source, path) {
+  if (
+    !/bearer/iu.test(source) ||
+    (!source.includes("//") && !source.includes("/*"))
+  ) {
+    return false;
+  }
+
+  const protectedRanges = protectedSyntaxRanges(source, path);
+  let protectedRangeIndex = 0;
   let index = 0;
-  let commentStart = 0;
-  let canStartRegex = true;
-  let regexCharacterClass = false;
-  const templateExpressionDepths = [];
 
   while (index < source.length) {
-    const character = source[index];
-
-    if (state === "line-comment") {
-      if (character === "\r" || character === "\n") {
-        if (commentBodyContainsBearer(source.slice(commentStart, index))) {
-          return true;
-        }
-        state = "code";
-      }
-      index += 1;
-      continue;
-    }
-
-    if (state === "block-comment") {
-      if (character === "*" && source[index + 1] === "/") {
-        if (commentBodyContainsBearer(source.slice(commentStart, index))) {
-          return true;
-        }
-        state = "code";
-        index += 2;
-        continue;
-      }
-      index += 1;
-      continue;
-    }
-
-    if (state === "single-quote" || state === "double-quote") {
-      if (character === "\\") {
-        index += source[index + 1] === undefined ? 1 : 2;
-        continue;
-      }
-      if (
-        (state === "single-quote" && character === "'") ||
-        (state === "double-quote" && character === '"')
-      ) {
-        state = "code";
-        canStartRegex = false;
-      }
-      index += 1;
-      continue;
-    }
-
-    if (state === "template") {
-      if (character === "\\") {
-        index += source[index + 1] === undefined ? 1 : 2;
-        continue;
-      }
-      if (character === "`") {
-        state = "code";
-        canStartRegex = false;
-        index += 1;
-        continue;
-      }
-      if (character === "$" && source[index + 1] === "{") {
-        templateExpressionDepths.push(1);
-        state = "code";
-        canStartRegex = true;
-        index += 2;
-        continue;
-      }
-      index += 1;
-      continue;
-    }
-
-    if (state === "regex") {
-      if (character === "\\") {
-        index += source[index + 1] === undefined ? 1 : 2;
-        continue;
-      }
-      if (character === "[" && !regexCharacterClass) {
-        regexCharacterClass = true;
-      } else if (character === "]" && regexCharacterClass) {
-        regexCharacterClass = false;
-      } else if (character === "/" && !regexCharacterClass) {
-        state = "code";
-        canStartRegex = false;
-      } else if (character === "\r" || character === "\n") {
-        state = "code";
-        canStartRegex = true;
-      }
-      index += 1;
-      continue;
-    }
-
-    if (character === "/" && source[index + 1] === "/") {
-      state = "line-comment";
-      commentStart = index + 2;
-      index += 2;
-      continue;
-    }
-    if (character === "/" && source[index + 1] === "*") {
-      state = "block-comment";
-      commentStart = index + 2;
-      index += 2;
-      continue;
-    }
-    if (character === "'") {
-      state = "single-quote";
-      index += 1;
-      continue;
-    }
-    if (character === '"') {
-      state = "double-quote";
-      index += 1;
-      continue;
-    }
-    if (character === "`") {
-      state = "template";
-      index += 1;
-      continue;
-    }
-    if (character === "/") {
-      if (canStartRegex) {
-        state = "regex";
-        regexCharacterClass = false;
-      } else {
-        canStartRegex = true;
-      }
-      index += 1;
-      continue;
-    }
-    if (javascriptIdentifierStart(character)) {
-      const start = index;
-      index += 1;
-      while (javascriptIdentifierPart(source[index])) index += 1;
-      canStartRegex = REGEX_PREFIX_KEYWORDS.has(source.slice(start, index));
-      continue;
-    }
-    if (/[0-9]/u.test(character)) {
-      canStartRegex = false;
-      index += 1;
-      continue;
-    }
-    if (character === "{") {
-      if (templateExpressionDepths.length > 0) {
-        templateExpressionDepths[templateExpressionDepths.length - 1] += 1;
-      }
-      canStartRegex = true;
-      index += 1;
-      continue;
-    }
-    if (character === "}" && templateExpressionDepths.length > 0) {
-      const last = templateExpressionDepths.length - 1;
-      templateExpressionDepths[last] -= 1;
-      index += 1;
-      if (templateExpressionDepths[last] === 0) {
-        templateExpressionDepths.pop();
-        state = "template";
-      } else {
-        canStartRegex = false;
-      }
-      continue;
-    }
-    if (character === ")" || character === "]" || character === "}") {
-      canStartRegex = false;
-    } else if (
-      character === "(" ||
-      character === "[" ||
-      ",;:?=!~*%&|^<>".includes(character)
+    while (
+      protectedRangeIndex < protectedRanges.length &&
+      protectedRanges[protectedRangeIndex][1] <= index
     ) {
-      canStartRegex = true;
-    } else if (character === "+" || character === "-") {
-      if (source[index + 1] === character) {
-        index += 2;
-        continue;
-      }
-      canStartRegex = true;
-    } else if (!bearerWhitespace(character) && character !== ".") {
-      canStartRegex = false;
+      protectedRangeIndex += 1;
     }
+    const protectedRange = protectedRanges[protectedRangeIndex];
+    if (
+      protectedRange !== undefined &&
+      protectedRange[0] <= index &&
+      index < protectedRange[1]
+    ) {
+      index = protectedRange[1];
+      protectedRangeIndex += 1;
+      continue;
+    }
+
+    if (source[index] !== "/") {
+      index += 1;
+      continue;
+    }
+
+    if (source[index + 1] === "/") {
+      const bodyStart = index + 2;
+      let bodyEnd = bodyStart;
+      while (
+        bodyEnd < source.length &&
+        !javascriptLineTerminator(source[bodyEnd])
+      ) {
+        bodyEnd += 1;
+      }
+      if (commentBodyContainsBearer(source.slice(bodyStart, bodyEnd))) {
+        return true;
+      }
+      index = bodyEnd;
+      continue;
+    }
+
+    if (source[index + 1] === "*") {
+      const bodyStart = index + 2;
+      let bodyEnd = bodyStart;
+      while (
+        bodyEnd < source.length &&
+        !(source[bodyEnd] === "*" && source[bodyEnd + 1] === "/")
+      ) {
+        bodyEnd += 1;
+      }
+      if (commentBodyContainsBearer(source.slice(bodyStart, bodyEnd))) {
+        return true;
+      }
+      index = bodyEnd < source.length ? bodyEnd + 2 : source.length;
+      continue;
+    }
+
     index += 1;
   }
 
-  if (state === "line-comment" || state === "block-comment") {
-    return commentBodyContainsBearer(source.slice(commentStart));
-  }
   return false;
 }
 
-function containsCredentialMaterial(contents) {
+function containsCredentialMaterial(contents, path = "") {
   let source;
   try {
     source = new TextDecoder("utf-8", { fatal: true }).decode(contents);
@@ -1305,7 +1244,7 @@ function containsCredentialMaterial(contents) {
     /github_pat_[A-Za-z0-9_]{4,}/u.test(source) ||
     /gh[pousr]_[A-Za-z0-9_]{4,}/u.test(source) ||
     literalBearerValue(source) ||
-    commentBearerValue(source) ||
+    commentBearerValue(source, path) ||
     /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/u.test(source)
   );
 }
@@ -1407,7 +1346,7 @@ async function validatePackageDryRun(staticOnly, expectedDistPaths) {
     const contents = await readPackedFileIfPresent(path);
     if (contents !== null) {
       assert(
-        !containsCredentialMaterial(contents),
+        !containsCredentialMaterial(contents, path),
         "PACKAGE_DRY_RUN_SENSITIVE_CONTENT",
       );
     }
