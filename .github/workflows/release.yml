@@ -1,0 +1,210 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_npm:
+        description: Publish the verified tarball to npm after environment approval.
+        required: true
+        type: boolean
+        default: false
+      bootstrap_npm:
+        description: Bootstrap the first npm publication with a short-lived token.
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify-package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm install --global npm@11.12.1
+      - run: test "$(npm --version)" = "11.12.1"
+      - run: npm ci
+      - run: npm run verify
+      - run: npm run docs:check
+      - run: npm run plugin:validate
+      - run: npm run release:verify -- --release
+      - run: npm run smoke:mcp
+      - run: npm install --global @openai/codex@0.144.5
+      - run: codex --version
+      - run: npm run smoke:codex-plugin
+      - run: node scripts/verify-release.mjs --bundle-release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-bundle
+          path: artifacts/release-bundle/
+  release:
+    needs: verify-package
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-bundle
+          path: release-bundle
+      - name: Verify the immutable release bundle
+        run: |
+          set -euo pipefail
+          cd release-bundle
+          [ -f github-stars-mcp.cdx.json ]
+          [ -f requirements.json ]
+          [ -f release-manifest.json ]
+          [ -f SHA256SUMS ]
+          [ "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 5 ]
+          [ "$(find . -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0 ]
+          set -- ./*.tgz
+          [ "$#" -eq 1 ]
+          [ -f "$1" ]
+          TARBALL="${1#./}"
+          jq -e 'keys == ["commitSha", "gitRef", "name", "requirements", "sbom", "schemaVersion", "tarball", "version"]' release-manifest.json > /dev/null
+          [ "$(jq -er '.schemaVersion | select(. == 1)' release-manifest.json)" = "1" ]
+          NAME="$(jq -er '.name | select(type == "string" and length > 0)' release-manifest.json)"
+          VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+          COMMIT_SHA="$(jq -er '.commitSha | select(type == "string" and length > 0)' release-manifest.json)"
+          GIT_REF="$(jq -er '.gitRef | select(type == "string" and length > 0)' release-manifest.json)"
+          MANIFEST_TARBALL="$(jq -er '.tarball | select(type == "string" and length > 0)' release-manifest.json)"
+          [ "$COMMIT_SHA" = "$GITHUB_SHA" ]
+          [ "$GIT_REF" = "$GITHUB_REF" ]
+          [ "$GIT_REF" = "refs/tags/v${VERSION}" ]
+          [ "$MANIFEST_TARBALL" = "$TARBALL" ]
+          [ "$TARBALL" = "${NAME}-${VERSION}.tgz" ]
+          [ "$(jq -er '.sbom | select(type == "string")' release-manifest.json)" = "github-stars-mcp.cdx.json" ]
+          [ "$(jq -er '.requirements | select(type == "string")' release-manifest.json)" = "requirements.json" ]
+          EXPECTED_CHECKSUMS="$(printf '%s\n' "$TARBALL" github-stars-mcp.cdx.json requirements.json release-manifest.json | LC_ALL=C sort)"
+          ACTUAL_CHECKSUMS="$(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { name=$2; sub(/^\*/, "", name); print name }' SHA256SUMS | LC_ALL=C sort)"
+          [ "$(wc -l < SHA256SUMS)" -eq 4 ]
+          [ "$ACTUAL_CHECKSUMS" = "$EXPECTED_CHECKSUMS" ]
+          sha256sum --check --strict SHA256SUMS
+      - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
+        with:
+          subject-path: release-bundle/*
+      - name: Create or update the verified GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          cd release-bundle
+          VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+          TAG="v${VERSION}"
+          EXPECTED_ASSETS="$(printf '%s\n' "$TARBALL" github-stars-mcp.cdx.json requirements.json release-manifest.json SHA256SUMS | LC_ALL=C sort)"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            RELEASE_JSON="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets,isDraft,isPrerelease)"
+            while IFS= read -r ASSET; do
+              case "$ASSET" in
+                "$TARBALL"|github-stars-mcp.cdx.json|requirements.json|release-manifest.json|SHA256SUMS) ;;
+                *) gh release delete-asset "$TAG" "$ASSET" --yes --repo "$GITHUB_REPOSITORY" ;;
+              esac
+            done < <(jq -r '.assets[].name' <<< "$RELEASE_JSON")
+            gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" ./* --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi
+          gh release edit "$TAG" --draft=false --prerelease=false --repo "$GITHUB_REPOSITORY"
+          FINAL_RELEASE="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets,isDraft,isPrerelease)"
+          [ "$(jq -er '.isDraft' <<< "$FINAL_RELEASE")" = "false" ]
+          [ "$(jq -er '.isPrerelease' <<< "$FINAL_RELEASE")" = "false" ]
+          ACTUAL_ASSETS="$(jq -r '.assets[].name' <<< "$FINAL_RELEASE" | LC_ALL=C sort)"
+          [ "$ACTUAL_ASSETS" = "$EXPECTED_ASSETS" ]
+  publish-npm:
+    if: ${{ inputs.publish_npm }}
+    needs: release
+    environment: npm-publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-bundle
+          path: release-bundle
+      - name: Verify the immutable release bundle
+        run: |
+          set -euo pipefail
+          cd release-bundle
+          [ -f github-stars-mcp.cdx.json ]
+          [ -f requirements.json ]
+          [ -f release-manifest.json ]
+          [ -f SHA256SUMS ]
+          [ "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 5 ]
+          [ "$(find . -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0 ]
+          set -- ./*.tgz
+          [ "$#" -eq 1 ]
+          [ -f "$1" ]
+          TARBALL="${1#./}"
+          jq -e 'keys == ["commitSha", "gitRef", "name", "requirements", "sbom", "schemaVersion", "tarball", "version"]' release-manifest.json > /dev/null
+          [ "$(jq -er '.schemaVersion | select(. == 1)' release-manifest.json)" = "1" ]
+          NAME="$(jq -er '.name | select(type == "string" and length > 0)' release-manifest.json)"
+          VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+          COMMIT_SHA="$(jq -er '.commitSha | select(type == "string" and length > 0)' release-manifest.json)"
+          GIT_REF="$(jq -er '.gitRef | select(type == "string" and length > 0)' release-manifest.json)"
+          MANIFEST_TARBALL="$(jq -er '.tarball | select(type == "string" and length > 0)' release-manifest.json)"
+          [ "$COMMIT_SHA" = "$GITHUB_SHA" ]
+          [ "$GIT_REF" = "$GITHUB_REF" ]
+          [ "$GIT_REF" = "refs/tags/v${VERSION}" ]
+          [ "$MANIFEST_TARBALL" = "$TARBALL" ]
+          [ "$TARBALL" = "${NAME}-${VERSION}.tgz" ]
+          [ "$(jq -er '.sbom | select(type == "string")' release-manifest.json)" = "github-stars-mcp.cdx.json" ]
+          [ "$(jq -er '.requirements | select(type == "string")' release-manifest.json)" = "requirements.json" ]
+          EXPECTED_CHECKSUMS="$(printf '%s\n' "$TARBALL" github-stars-mcp.cdx.json requirements.json release-manifest.json | LC_ALL=C sort)"
+          ACTUAL_CHECKSUMS="$(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { name=$2; sub(/^\*/, "", name); print name }' SHA256SUMS | LC_ALL=C sort)"
+          [ "$(wc -l < SHA256SUMS)" -eq 4 ]
+          [ "$ACTUAL_CHECKSUMS" = "$EXPECTED_CHECKSUMS" ]
+          sha256sum --check --strict SHA256SUMS
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: |
+          npm install --global npm@11.12.1
+          test "$(npm --version)" = "11.12.1"
+      - name: Publish the exact verified package
+        env:
+          BOOTSTRAP_NPM: ${{ inputs.bootstrap_npm }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd release-bundle
+          set -- ./*.tgz
+          [ "$#" -eq 1 ]
+          [ -f "$1" ]
+          case "$BOOTSTRAP_NPM" in
+            true)
+              [ -n "${NPM_TOKEN:-}" ]
+              export NODE_AUTH_TOKEN="$NPM_TOKEN"
+              ;;
+            false)
+              unset NPM_TOKEN NODE_AUTH_TOKEN
+              ;;
+            *)
+              exit 1
+              ;;
+          esac
+          npm publish "$1" --provenance --access public

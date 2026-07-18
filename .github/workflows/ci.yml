@@ -33,7 +33,7 @@ jobs:
       - name: Install exact dependencies
         run: npm ci
       - name: Run deterministic verification
-        run: npm run verify
+        run: npm run verify:all
 
   dependency-review:
     name: Review dependency changes

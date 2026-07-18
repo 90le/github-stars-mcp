@@ -35,6 +35,11 @@ The plugin's `.mcp.json` launches:
 npx -y github-stars-mcp@1.0.0 --stdio
 ```
 
+The committed server definition allows 120 seconds for startup. That bound
+covers a first run in which `npx` must download the pinned package into an
+empty npm cache; normal warm starts are much faster. The 900-second tool
+timeout is separate and covers explicitly requested long sync or apply work.
+
 Codex must forward the chosen credential source and server configuration.
 Start with:
 

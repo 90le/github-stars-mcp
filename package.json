@@ -1,17 +1,45 @@
 {
   "name": "github-stars-mcp",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "description": "AI-native MCP server for safe, auditable GitHub Stars and User Lists management.",
   "type": "module",
+  "packageManager": "npm@11.12.1",
   "private": false,
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/90le/github-stars-mcp.git"
+  },
+  "homepage": "https://github.com/90le/github-stars-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/90le/github-stars-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "github",
+    "github-stars",
+    "github-api",
+    "ai-agent",
+    "github-lists"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
   "engines": {
     "node": ">=22"
+  },
+  "bin": {
+    "github-stars-mcp": "dist/cli.js"
   },
   "files": [
     "dist",
     "plugins/github-stars-mcp",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "SECURITY.md",
+    "npm-shrinkwrap.json"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
@@ -23,9 +51,11 @@
     "@eslint/js": "9.39.2",
     "@types/better-sqlite3": "7.6.13",
     "@types/node": "24.10.1",
+    "@types/tar-stream": "3.1.4",
     "@vitest/coverage-v8": "4.0.18",
     "eslint": "9.39.2",
     "prettier": "3.7.4",
+    "tar-stream": "3.2.0",
     "typescript": "6.0.3",
     "typescript-eslint": "8.64.0",
     "vitest": "4.0.18",
@@ -41,9 +71,20 @@
     "workflows:check": "node scripts/verify-workflows.mjs",
     "plugin:validate": "node scripts/validate-plugin.mjs",
     "assets:check": "node scripts/verify-assets.mjs",
+    "docs:generate": "npm run build && node scripts/generate-tool-reference.mjs",
+    "docs:check": "npm run build && node scripts/verify-docs.mjs",
+    "verify:requirements": "node scripts/verify-requirements.mjs",
+    "smoke:mcp": "node scripts/mcp-inspector-smoke.mjs",
+    "smoke:codex-plugin": "node scripts/codex-plugin-smoke.mjs",
+    "package:verify": "node scripts/verify-package.mjs",
+    "release:verify": "node scripts/verify-release.mjs",
+    "release:check": "node scripts/verify-release.mjs --check-only",
+    "release:prepare": "node scripts/verify-release.mjs --prepare-only",
+    "verify:requirements:release": "node scripts/verify-requirements.mjs --release",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "test:coverage": "vitest run --coverage",
-    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build"
+    "verify": "npm run format:check && npm run lint && npm run typecheck && npm run test:coverage && npm run build",
+    "verify:all": "npm run verify && npm run yaml:check && npm run workflows:check && npm run docs:check && npm run assets:check && npm run plugin:validate && npm run package:verify && npm run verify:requirements"
   }
 }

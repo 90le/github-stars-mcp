@@ -79,12 +79,68 @@ before dispatch and preserve stable run IDs during recovery.
 
 ## Release preparation
 
-Run the complete verification suite, validate YAML and workflows, pack the
-npm tarball, install it into a clean temporary project, and run `--help`,
-`--version`, and fixture-backed `--doctor`.
-Validate the plugin in an isolated home. Produce the SBOM, checksums, and
-provenance from the verified commit.
+Run `npm run release:prepare` from a clean worktree. The equivalent direct
+command is `npm run release:verify -- --prepare-only`. It builds the runtime,
+checks package ownership and version consistency, produces one npm tarball,
+verifies that exact tarball in an isolated installation, and creates
+`artifacts/release-bundle/` with exactly:
 
-The release workflow uses a manually approved environment for publication.
-Tag, package, plugin, and README versions must match. Pull-request workflows
-never receive a mutation credential.
+- `github-stars-mcp-<version>.tgz`
+- `github-stars-mcp.cdx.json`
+- `requirements.json`
+- `release-manifest.json`
+- `SHA256SUMS`
+
+The manifest binds the version, tag ref, commit, and filenames. `SHA256SUMS`
+covers the tarball and all three JSON files. Preparation does not publish to
+npm, create a GitHub Release, or require a release tag.
+
+Before enabling releases, create two protected GitHub environments:
+
+- `release` gates attestation and the GitHub Release.
+- `npm-publish` gates the optional npm publication.
+
+Configure required reviewers and allow only tags matching `v*` for both
+environments. The `publish_npm` workflow input defaults to `false`; an input
+is intent, not approval.
+
+For a release, commit the version, create signed or annotated tag
+`v<package-version>` on that exact commit, push the tag, and dispatch the
+Release workflow against that tag. The unprivileged `verify-package` job
+checks out source, installs fixed tooling, runs all verification, calls
+`--bundle-release`, and uploads the five-file bundle. It has read-only
+repository permission and no publishing identity.
+
+After environment approval, the privileged `release` job downloads only that
+bundle. It does not check out or execute repository code. System tools
+recheck every digest and bind `release-manifest.json` to `GITHUB_SHA`,
+`GITHUB_REF`, the version tag, and the single tarball before attestation and
+an idempotent GitHub Release update. The optional `publish-npm` job downloads
+the same bundle, repeats those checks, and publishes that exact tarball. It
+never repacks.
+
+### First npm publication
+
+An unclaimed npm package cannot configure a trusted publisher yet. Bootstrap
+the first version inside the protected `npm-publish` job:
+
+1. Create a short-lived granular npm access token with only the necessary
+   read/write package access and bypass-2FA enabled for this non-interactive
+   publication.
+2. Store it as the `NPM_TOKEN` secret on the `npm-publish` environment, not as
+   a repository secret.
+3. Dispatch the exact version tag with `publish_npm=true` and
+   `bootstrap_npm=true`. Only the publish step receives the token, and npm
+   publishes with provenance from the GitHub-hosted runner.
+4. Configure npm trusted publishing for repository
+   `90le/github-stars-mcp`, workflow `release.yml`, and environment
+   `npm-publish`.
+5. Delete the environment secret and revoke the granular token.
+
+For later releases, dispatch with `publish_npm=true` and
+`bootstrap_npm=false`. npm 11.12.1 uses GitHub OIDC; no npm token is present.
+Never enable `bootstrap_npm` after trusted publishing is configured.
+
+Tag, package, shrinkwrap, plugin, launcher, CLI, changelog, and generated
+reference versions must match. Pull-request workflows never receive a live
+mutation credential.

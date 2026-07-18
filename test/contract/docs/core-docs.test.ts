@@ -154,14 +154,14 @@ describe("core documentation", () => {
     );
   });
 
-  it("uses the plural plugin path and no links to ungenerated documents", async () => {
+  it("uses the plural plugin path and links generated references", async () => {
     const plugin = await readFile("docs/plugin.md", "utf8");
     expect(plugin).toContain("plugins/github-stars-mcp");
     expect(plugin).not.toMatch(/(?<!s)\/plugin\/github-stars-mcp/u);
 
     const readme = await readFile("README.md", "utf8");
     const requirements = await readFile("docs/requirements.md", "utf8");
-    expect(readme).not.toContain("docs/tool-reference.md");
-    expect(requirements).not.toContain("verification-matrix.md");
+    expect(readme).toContain("docs/tool-reference.md");
+    expect(requirements).toContain("verification-matrix.md");
   });
 });

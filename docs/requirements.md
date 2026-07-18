@@ -113,6 +113,9 @@ mappers, and contract tests define the executable public contract.
 records the staged implementation plan. Contract, security, package, and
 live-read tests use these family names.
 
+[The verification matrix](verification-matrix.md) maps all 80 approved
+requirement IDs to concrete implementation and executable verification files.
+
 No acceptance row may rely on a live mutation in pull-request CI. Live
 contracts use read-only credentials unless a maintainer starts a separate,
 explicitly authorized mutation run.
