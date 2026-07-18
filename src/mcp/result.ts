@@ -886,7 +886,7 @@ export function toolSuccess<T extends Readonly<Record<string, unknown>>>(
       ? null
       : freezeOutputGraph({
           remaining: rateLimit.remaining,
-          resetAt: rateLimit.resetAt,
+          reset_at: rateLimit.resetAt,
         });
   const sanitizedCursor =
     nextCursor === null

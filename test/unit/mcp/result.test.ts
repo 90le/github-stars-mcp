@@ -96,7 +96,7 @@ describe("MCP result envelopes", () => {
         warnings: ["metadata reused"],
         rate_limit: {
           remaining: 4_999,
-          resetAt: "2026-07-16T08:00:00.000Z",
+          reset_at: "2026-07-16T08:00:00.000Z",
         },
         next_cursor: "cursor_1",
       },
@@ -201,7 +201,7 @@ describe("MCP result envelopes", () => {
       warnings: ["original warning"],
       rate_limit: {
         remaining: 12,
-        resetAt: "2026-07-16T08:00:00.000Z",
+        reset_at: "2026-07-16T08:00:00.000Z",
       },
       next_cursor: "cursor_original",
     });
@@ -562,7 +562,13 @@ describe("success input validation", () => {
       );
     if (valid) {
       expect(callback().structuredContent).toMatchObject({
-        rate_limit: rateLimit,
+        rate_limit:
+          rateLimit === null
+            ? null
+            : {
+                remaining: rateLimit.remaining,
+                reset_at: rateLimit.resetAt,
+              },
       });
     } else {
       expectValidationError(callback);
