@@ -17,9 +17,10 @@ const EXPECTED_WORKFLOWS = [
   ".github/workflows/ci.yml",
   ".github/workflows/codeql.yml",
   ".github/workflows/package-smoke.yml",
+  ".github/workflows/release.yml",
 ];
 const RELEASE_WORKFLOW = ".github/workflows/release.yml";
-const ALLOWED_WORKFLOWS = new Set([...EXPECTED_WORKFLOWS, RELEASE_WORKFLOW]);
+const ALLOWED_WORKFLOWS = new Set(EXPECTED_WORKFLOWS);
 
 const PINS = Object.freeze({
   attest:
@@ -50,27 +51,78 @@ const GITHUB_OBJECT_FILTER_CONTEXT = /\bgithub\s*\.\s*\*/iu;
 const COMPLETE_GITHUB_CONTEXT = /\bgithub\b(?!\s*(?:\.|\[))/iu;
 const RELEASE_INPUT_DESCRIPTION =
   "Publish the verified tarball to npm after environment approval.";
-const PACK_COMMAND = `mkdir -p artifacts
-npm sbom --sbom-format cyclonedx > artifacts/github-stars-mcp.cdx.json
-npm pack --ignore-scripts --json --pack-destination artifacts > artifacts/pack.json
-PACK_REPORTED="$(node -p "JSON.parse(require('fs').readFileSync('artifacts/pack.json','utf8'))[0].filename")"
-set -- artifacts/*.tgz
+const BOOTSTRAP_INPUT_DESCRIPTION =
+  "Bootstrap the first npm publication with a short-lived token.";
+const BUNDLE_VALIDATION_COMMAND = `set -euo pipefail
+cd release-bundle
+[ -f github-stars-mcp.cdx.json ]
+[ -f requirements.json ]
+[ -f release-manifest.json ]
+[ -f SHA256SUMS ]
+[ "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 5 ]
+[ "$(find . -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0 ]
+set -- ./*.tgz
 [ "$#" -eq 1 ]
 [ -f "$1" ]
-PACK_TARBALL="$1"
-[ "$PACK_TARBALL" = "artifacts/$PACK_REPORTED" ]
-echo "tarball=\${PACK_TARBALL}" >> "$GITHUB_OUTPUT"
+TARBALL="\${1#./}"
+jq -e 'keys == ["commitSha", "gitRef", "name", "requirements", "sbom", "schemaVersion", "tarball", "version"]' release-manifest.json > /dev/null
+[ "$(jq -er '.schemaVersion | select(. == 1)' release-manifest.json)" = "1" ]
+NAME="$(jq -er '.name | select(type == "string" and length > 0)' release-manifest.json)"
+VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+COMMIT_SHA="$(jq -er '.commitSha | select(type == "string" and length > 0)' release-manifest.json)"
+GIT_REF="$(jq -er '.gitRef | select(type == "string" and length > 0)' release-manifest.json)"
+MANIFEST_TARBALL="$(jq -er '.tarball | select(type == "string" and length > 0)' release-manifest.json)"
+[ "$COMMIT_SHA" = "$GITHUB_SHA" ]
+[ "$GIT_REF" = "$GITHUB_REF" ]
+[ "$GIT_REF" = "refs/tags/v\${VERSION}" ]
+[ "$MANIFEST_TARBALL" = "$TARBALL" ]
+[ "$TARBALL" = "\${NAME}-\${VERSION}.tgz" ]
+[ "$(jq -er '.sbom | select(type == "string")' release-manifest.json)" = "github-stars-mcp.cdx.json" ]
+[ "$(jq -er '.requirements | select(type == "string")' release-manifest.json)" = "requirements.json" ]
+EXPECTED_CHECKSUMS="$(printf '%s\\n' "$TARBALL" github-stars-mcp.cdx.json requirements.json release-manifest.json | LC_ALL=C sort)"
+ACTUAL_CHECKSUMS="$(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { name=$2; sub(/^\\*/, "", name); print name }' SHA256SUMS | LC_ALL=C sort)"
+[ "$(wc -l < SHA256SUMS)" -eq 4 ]
+[ "$ACTUAL_CHECKSUMS" = "$EXPECTED_CHECKSUMS" ]
+sha256sum --check --strict SHA256SUMS
 `;
-const RELEASE_COMMAND = `VERSION=$(node -p "require('./package.json').version")
-gh release create "v\${VERSION}" "\${{ steps.pack.outputs.tarball }}" artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes
+const RELEASE_COMMAND = `set -euo pipefail
+cd release-bundle
+VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+TAG="v\${VERSION}"
+if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+  gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+else
+  gh release create "$TAG" ./* --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
+fi
 `;
-const NPM_PUBLISH_COMMAND = `set -- artifacts/*.tgz
+const NPM_VERSION_COMMAND = `npm install --global npm@11.12.1
+test "$(npm --version)" = "11.12.1"
+`;
+const NPM_PUBLISH_COMMAND = `set -euo pipefail
+cd release-bundle
+set -- ./*.tgz
 [ "$#" -eq 1 ]
 [ -f "$1" ]
+case "$BOOTSTRAP_NPM" in
+  true)
+    [ -n "\${NPM_TOKEN:-}" ]
+    export NODE_AUTH_TOKEN="$NPM_TOKEN"
+    ;;
+  false)
+    unset NPM_TOKEN NODE_AUTH_TOKEN
+    ;;
+  *)
+    exit 1
+    ;;
+esac
 npm publish "$1" --provenance --access public
 `;
 const RELEASE_STEP_KEYS = new Set(["name", "env", "run"]);
 const RELEASE_ROOT_PERMISSIONS = Object.freeze({
+  contents: "read",
+});
+const VERIFY_PACKAGE_PERMISSIONS = RELEASE_ROOT_PERMISSIONS;
+const RELEASE_JOB_PERMISSIONS = Object.freeze({
   attestations: "write",
   contents: "write",
   "id-token": "write",
@@ -140,6 +192,12 @@ function scalarText(node) {
 function isBooleanScalar(node, expected) {
   return (
     isScalar(node) && typeof node.value === "boolean" && node.value === expected
+  );
+}
+
+function isNumberScalar(node, expected) {
+  return (
+    isScalar(node) && typeof node.value === "number" && node.value === expected
   );
 }
 
@@ -617,7 +675,7 @@ function validateCi(context) {
     context,
     verifySteps,
     "run",
-    ["npm ci", "npm run verify"],
+    ["npm ci", "npm run verify:all"],
     "CI_COMMANDS",
   );
   validateCheckoutPersistence(context, verifySteps);
@@ -637,7 +695,7 @@ function validateCi(context) {
       code,
     );
     validateRunStep(context, verifySteps[2], "npm ci", code);
-    validateRunStep(context, verifySteps[3], "npm run verify", code);
+    validateRunStep(context, verifySteps[3], "npm run verify:all", code);
   }
 
   const reviewJob = nodeAt(context.root, ["jobs", "dependency-review"]);
@@ -959,6 +1017,23 @@ function isGhReleaseStep(step) {
   return command === RELEASE_COMMAND;
 }
 
+function isNpmPublishStep(step) {
+  const keys = mappingKeys(step);
+  if (
+    keys === undefined ||
+    !sameTextSet(keys, ["name", "env", "run"]) ||
+    scalarText(pairAt(step, "name")?.value) !==
+      "Publish the exact verified package" ||
+    !sameMapping(nodeAt(step, ["env"]), {
+      BOOTSTRAP_NPM: "${{ inputs.bootstrap_npm }}",
+      NPM_TOKEN: "${{ secrets.NPM_TOKEN }}",
+    })
+  ) {
+    return false;
+  }
+  return scalarText(pairAt(step, "run")?.value) === NPM_PUBLISH_COMMAND;
+}
+
 function allowedReleaseTokenNodes(context) {
   const allowed = new Set();
   for (const step of stepMaps(context, "release")) {
@@ -972,6 +1047,17 @@ function allowedReleaseTokenNodes(context) {
       if (isScalar(token.value)) allowed.add(token.value);
     }
   }
+  for (const step of stepMaps(context, "publish-npm")) {
+    if (!isNpmPublishStep(step)) continue;
+    const token = pairAt(nodeAt(step, ["env"]), "NPM_TOKEN");
+    if (
+      token !== undefined &&
+      scalarText(token.value) === "${{ secrets.NPM_TOKEN }}"
+    ) {
+      if (isScalar(token.key)) allowed.add(token.key);
+      if (isScalar(token.value)) allowed.add(token.value);
+    }
+  }
   return allowed;
 }
 
@@ -979,9 +1065,7 @@ function validateReleaseJob(
   context,
   jobs,
   name,
-  environment,
-  permissions,
-  inheritedPermissions,
+  { requiredKeys, environment, permissions, timeout, needs, condition },
 ) {
   const jobPair = pairAt(jobs, name);
   const job = jobPair?.value;
@@ -991,17 +1075,12 @@ function validateReleaseJob(
   }
 
   const executionCode = "RELEASE_EXECUTION_POLICY";
-  validateKeyContract(
-    context,
-    job,
-    name === "release"
-      ? ["environment", "runs-on", "steps"]
-      : ["if", "needs", "environment", "runs-on", "permissions", "steps"],
-    name === "release" ? ["name", "permissions", "timeout-minutes"] : ["name"],
-    executionCode,
-  );
+  validateKeyContract(context, job, requiredKeys, ["name"], executionCode);
 
-  if (scalarText(pairAt(job, "environment")?.value) !== environment) {
+  if (
+    environment !== undefined &&
+    scalarText(pairAt(job, "environment")?.value) !== environment
+  ) {
     issueAt(
       context,
       pairAt(job, "environment")?.value ?? job,
@@ -1009,7 +1088,7 @@ function validateReleaseJob(
     );
   }
 
-  if (name === "release" && hasMapKey(job, "defaults")) {
+  if (hasMapKey(job, "defaults")) {
     issueAt(
       context,
       pairAt(job, "defaults")?.key ?? job,
@@ -1020,30 +1099,33 @@ function validateReleaseJob(
   if (scalarText(pairAt(job, "runs-on")?.value) !== "ubuntu-latest") {
     issueAt(context, pairAt(job, "runs-on")?.value ?? job, executionCode);
   }
-  if (name === "publish-npm") {
-    if (scalarText(pairAt(job, "if")?.value) !== "${{ inputs.publish_npm }}") {
-      issueAt(context, pairAt(job, "if")?.value ?? job, executionCode);
-    }
-    if (scalarText(pairAt(job, "needs")?.value) !== "release") {
-      issueAt(context, pairAt(job, "needs")?.value ?? job, executionCode);
-    }
+  const timeoutNode = pairAt(job, "timeout-minutes")?.value;
+  if (!isNumberScalar(timeoutNode, timeout)) {
+    issueAt(context, timeoutNode ?? job, executionCode);
+  }
+  if (
+    needs !== undefined &&
+    scalarText(pairAt(job, "needs")?.value) !== needs
+  ) {
+    issueAt(context, pairAt(job, "needs")?.value ?? job, executionCode);
+  }
+  if (
+    condition !== undefined &&
+    scalarText(pairAt(job, "if")?.value) !== condition
+  ) {
+    issueAt(context, pairAt(job, "if")?.value ?? job, executionCode);
   }
 
   const jobPermissions = pairAt(job, "permissions")?.value;
-  const effectivePermissions = jobPermissions ?? inheritedPermissions;
-  if (!sameMapping(effectivePermissions, permissions)) {
-    issueAt(
-      context,
-      jobPermissions ?? effectivePermissions ?? job,
-      "RELEASE_PERMISSIONS",
-    );
+  if (!sameMapping(jobPermissions, permissions)) {
+    issueAt(context, jobPermissions ?? job, "RELEASE_PERMISSIONS");
   }
 }
 
-function validateReleaseExecution(context) {
+function validateVerifyPackageExecution(context) {
   const code = "RELEASE_EXECUTION_POLICY";
-  const steps = exactStepMaps(context, "release", 18, code);
-  if (steps.length !== 18) return;
+  const steps = exactStepMaps(context, "verify-package", 15, code);
+  if (steps.length !== 15) return;
   validateActionStep(
     context,
     steps[0],
@@ -1057,11 +1139,13 @@ function validateReleaseExecution(context) {
     PINS.setupNode,
     {
       "node-version": "24",
-      "registry-url": "https://registry.npmjs.org",
+      cache: "npm",
     },
     code,
   );
   const commands = [
+    "npm install --global npm@11.12.1",
+    'test "$(npm --version)" = "11.12.1"',
     "npm ci",
     "npm run verify",
     "npm run docs:check",
@@ -1071,74 +1155,81 @@ function validateReleaseExecution(context) {
     "npm install --global @openai/codex@0.144.5",
     "codex --version",
     "npm run smoke:codex-plugin",
-    "npm run verify:requirements -- --release",
+    "node scripts/verify-release.mjs --bundle-release",
   ];
   for (const [index, command] of commands.entries()) {
     validateRunStep(context, steps[index + 2], command, code);
   }
-  validateKeyContract(context, steps[12], ["id", "run"], ["name"], code);
-  if (
-    scalarText(pairAt(steps[12], "id")?.value) !== "pack" ||
-    scalarText(pairAt(steps[12], "run")?.value) !== PACK_COMMAND
-  ) {
-    issueAt(context, steps[12], code);
-  }
-  validateRunStep(
-    context,
-    steps[13],
-    'npm run package:verify -- --tarball "${{ steps.pack.outputs.tarball }}"',
-    code,
-  );
-  validateRunStep(
-    context,
-    steps[14],
-    'node scripts/checksums.mjs "${{ steps.pack.outputs.tarball }}"',
-    code,
-  );
   validateActionStep(
     context,
-    steps[15],
-    PINS.attest,
-    { "subject-path": "${{ steps.pack.outputs.tarball }}" },
+    steps[14],
+    PINS.uploadArtifact,
+    {
+      name: "release-bundle",
+      path: "artifacts/release-bundle/",
+    },
     code,
   );
-  if (!isGhReleaseStep(steps[16])) {
-    issueAt(context, steps[16], code);
-  }
-  validateKeyContract(
+}
+
+function validateReleaseExecution(context) {
+  const code = "RELEASE_EXECUTION_POLICY";
+  const steps = exactStepMaps(context, "release", 4, code);
+  if (steps.length !== 4) return;
+  validateActionStep(
     context,
-    steps[17],
-    ["uses", "if", "with"],
-    ["name"],
+    steps[0],
+    PINS.downloadArtifact,
+    { name: "release-bundle", path: "release-bundle" },
     code,
   );
+  validateKeyContract(context, steps[1], ["name", "run"], [], code);
   if (
-    scalarText(pairAt(steps[17], "uses")?.value) !== PINS.uploadArtifact ||
-    scalarText(pairAt(steps[17], "if")?.value) !==
-      "${{ inputs.publish_npm }}" ||
-    !sameMapping(nodeAt(steps[17], ["with"]), {
-      name: "npm-tarball",
-      path: "${{ steps.pack.outputs.tarball }}",
-    })
+    scalarText(pairAt(steps[1], "name")?.value) !==
+      "Verify the immutable release bundle" ||
+    scalarText(pairAt(steps[1], "run")?.value) !== BUNDLE_VALIDATION_COMMAND
   ) {
-    issueAt(context, steps[17], code);
+    issueAt(context, steps[1], code);
+  }
+  validateActionStep(
+    context,
+    steps[2],
+    PINS.attest,
+    { "subject-path": "release-bundle/*" },
+    code,
+  );
+  validateKeyContract(context, steps[3], ["name", "env", "run"], [], code);
+  if (
+    scalarText(pairAt(steps[3], "name")?.value) !==
+      "Create or update the verified GitHub release" ||
+    !isGhReleaseStep(steps[3])
+  ) {
+    issueAt(context, steps[3], code);
   }
 }
 
 function validateNpmPublishExecution(context) {
   const code = "RELEASE_EXECUTION_POLICY";
-  const steps = exactStepMaps(context, "publish-npm", 3, code);
-  if (steps.length !== 3) return;
+  const steps = exactStepMaps(context, "publish-npm", 5, code);
+  if (steps.length !== 5) return;
   validateActionStep(
     context,
     steps[0],
     PINS.downloadArtifact,
-    { name: "npm-tarball", path: "artifacts" },
+    { name: "release-bundle", path: "release-bundle" },
     code,
   );
+  validateKeyContract(context, steps[1], ["name", "run"], [], code);
+  if (
+    scalarText(pairAt(steps[1], "name")?.value) !==
+      "Verify the immutable release bundle" ||
+    scalarText(pairAt(steps[1], "run")?.value) !== BUNDLE_VALIDATION_COMMAND
+  ) {
+    issueAt(context, steps[1], code);
+  }
   validateActionStep(
     context,
-    steps[1],
+    steps[2],
     PINS.setupNode,
     {
       "node-version": "24",
@@ -1146,11 +1237,15 @@ function validateNpmPublishExecution(context) {
     },
     code,
   );
-  validateRunStep(context, steps[2], NPM_PUBLISH_COMMAND, code);
+  validateRunStep(context, steps[3], NPM_VERSION_COMMAND, code);
+  validateKeyContract(context, steps[4], ["name", "env", "run"], [], code);
+  if (!isNpmPublishStep(steps[4])) {
+    issueAt(context, steps[4], code);
+  }
 }
 
 function validateReleaseCheckout(context) {
-  const steps = stepMaps(context, "release");
+  const steps = stepMaps(context, "verify-package");
   const checkoutSteps = steps.filter((step) => {
     const reference = scalarText(pairAt(step, "uses")?.value);
     return reference !== undefined && /^actions\/checkout@/iu.test(reference);
@@ -1173,26 +1268,37 @@ function validateReleaseInput(context, dispatch) {
   }
   validateKeyContract(context, dispatch, ["inputs"], [], code);
   const inputs = nodeAt(dispatch, ["inputs"]);
-  validateKeyContract(context, inputs, ["publish_npm"], [], code);
-  const publish = nodeAt(inputs, ["publish_npm"]);
   validateKeyContract(
     context,
-    publish,
-    ["description", "required", "type", "default"],
+    inputs,
+    ["publish_npm", "bootstrap_npm"],
     [],
     code,
   );
-  if (
-    !sameMapping(publish, {
-      default: "false",
-      description: RELEASE_INPUT_DESCRIPTION,
-      required: "true",
-      type: "boolean",
-    }) ||
-    !isBooleanScalar(pairAt(publish, "required")?.value, true) ||
-    !isBooleanScalar(pairAt(publish, "default")?.value, false)
-  ) {
-    issueAt(context, publish, code);
+  for (const [name, description] of [
+    ["publish_npm", RELEASE_INPUT_DESCRIPTION],
+    ["bootstrap_npm", BOOTSTRAP_INPUT_DESCRIPTION],
+  ]) {
+    const input = nodeAt(inputs, [name]);
+    validateKeyContract(
+      context,
+      input,
+      ["description", "required", "type", "default"],
+      [],
+      code,
+    );
+    if (
+      !sameMapping(input, {
+        default: "false",
+        description,
+        required: "true",
+        type: "boolean",
+      }) ||
+      !isBooleanScalar(pairAt(input, "required")?.value, true) ||
+      !isBooleanScalar(pairAt(input, "default")?.value, false)
+    ) {
+      issueAt(context, input, code);
+    }
   }
 }
 
@@ -1200,10 +1306,11 @@ function validateRelease(context) {
   validateKeyContract(
     context,
     context.root,
-    ["name", "on", "permissions", "jobs"],
+    ["name", "on", "concurrency", "permissions", "jobs"],
     [],
     "RELEASE_EXECUTION_POLICY",
   );
+  expectScalar(context, ["name"], "Release", "RELEASE_EXECUTION_POLICY");
   const triggers = nodeAt(context.root, ["on"]);
   const triggerKeys = mappingKeys(triggers);
   const dispatch = pairAt(triggers, "workflow_dispatch")?.value;
@@ -1217,6 +1324,22 @@ function validateRelease(context) {
   }
   validateReleaseInput(context, dispatch);
 
+  const concurrency = nodeAt(context.root, ["concurrency"]);
+  validateKeyContract(
+    context,
+    concurrency,
+    ["group", "cancel-in-progress"],
+    [],
+    "RELEASE_CONCURRENCY",
+  );
+  if (
+    scalarText(pairAt(concurrency, "group")?.value) !==
+      "release-${{ github.ref }}" ||
+    !isBooleanScalar(pairAt(concurrency, "cancel-in-progress")?.value, false)
+  ) {
+    issueAt(context, concurrency, "RELEASE_CONCURRENCY");
+  }
+
   const rootPermissions = nodeAt(context.root, ["permissions"]);
   if (!sameMapping(rootPermissions, RELEASE_ROOT_PERMISSIONS)) {
     issueAt(context, rootPermissions, "RELEASE_PERMISSIONS");
@@ -1226,31 +1349,53 @@ function validateRelease(context) {
   const jobKeys = mappingKeys(jobs);
   if (
     jobKeys === undefined ||
-    !jobKeys.includes("release") ||
-    !jobKeys.includes("publish-npm") ||
-    jobKeys.some((key) => key !== "release" && key !== "publish-npm")
+    !sameTextSet(jobKeys, ["verify-package", "release", "publish-npm"])
   ) {
     issueAt(context, jobs, "RELEASE_JOBS");
   }
 
   if (isMap(jobs)) {
-    validateReleaseJob(
-      context,
-      jobs,
-      "release",
-      "release",
-      RELEASE_ROOT_PERMISSIONS,
-      rootPermissions,
-    );
+    validateReleaseJob(context, jobs, "verify-package", {
+      requiredKeys: ["runs-on", "timeout-minutes", "permissions", "steps"],
+      environment: undefined,
+      permissions: VERIFY_PACKAGE_PERMISSIONS,
+      timeout: 45,
+      needs: undefined,
+      condition: undefined,
+    });
+    validateVerifyPackageExecution(context);
+    validateReleaseJob(context, jobs, "release", {
+      requiredKeys: [
+        "needs",
+        "environment",
+        "runs-on",
+        "timeout-minutes",
+        "permissions",
+        "steps",
+      ],
+      environment: "release",
+      permissions: RELEASE_JOB_PERMISSIONS,
+      timeout: 10,
+      needs: "verify-package",
+      condition: undefined,
+    });
     validateReleaseExecution(context);
-    validateReleaseJob(
-      context,
-      jobs,
-      "publish-npm",
-      "npm-publish",
-      NPM_PUBLISH_PERMISSIONS,
-      rootPermissions,
-    );
+    validateReleaseJob(context, jobs, "publish-npm", {
+      requiredKeys: [
+        "if",
+        "needs",
+        "environment",
+        "runs-on",
+        "timeout-minutes",
+        "permissions",
+        "steps",
+      ],
+      environment: "npm-publish",
+      permissions: NPM_PUBLISH_PERMISSIONS,
+      timeout: 10,
+      needs: "release",
+      condition: "${{ inputs.publish_npm }}",
+    });
     validateNpmPublishExecution(context);
   }
 

@@ -32,6 +32,7 @@ const workflowPaths = [
   ".github/workflows/ci.yml",
   ".github/workflows/package-smoke.yml",
   ".github/workflows/codeql.yml",
+  ".github/workflows/release.yml",
 ] as const;
 
 async function runVerifier(root = repositoryRoot) {
@@ -81,9 +82,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
   release:
@@ -93,9 +92,76 @@ jobs:
       - run: echo verified
 `;
 
-const validReleaseCommand = `|
-          VERSION=$(node -p "require('./package.json').version")
-          gh release create "v\${VERSION}" "\${{ steps.pack.outputs.tarball }}" artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes`;
+const validBundleValidationCommand = `set -euo pipefail
+cd release-bundle
+[ -f github-stars-mcp.cdx.json ]
+[ -f requirements.json ]
+[ -f release-manifest.json ]
+[ -f SHA256SUMS ]
+[ "$(find . -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 5 ]
+[ "$(find . -mindepth 1 -maxdepth 1 ! -type f | wc -l)" -eq 0 ]
+set -- ./*.tgz
+[ "$#" -eq 1 ]
+[ -f "$1" ]
+TARBALL="\${1#./}"
+jq -e 'keys == ["commitSha", "gitRef", "name", "requirements", "sbom", "schemaVersion", "tarball", "version"]' release-manifest.json > /dev/null
+[ "$(jq -er '.schemaVersion | select(. == 1)' release-manifest.json)" = "1" ]
+NAME="$(jq -er '.name | select(type == "string" and length > 0)' release-manifest.json)"
+VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+COMMIT_SHA="$(jq -er '.commitSha | select(type == "string" and length > 0)' release-manifest.json)"
+GIT_REF="$(jq -er '.gitRef | select(type == "string" and length > 0)' release-manifest.json)"
+MANIFEST_TARBALL="$(jq -er '.tarball | select(type == "string" and length > 0)' release-manifest.json)"
+[ "$COMMIT_SHA" = "$GITHUB_SHA" ]
+[ "$GIT_REF" = "$GITHUB_REF" ]
+[ "$GIT_REF" = "refs/tags/v\${VERSION}" ]
+[ "$MANIFEST_TARBALL" = "$TARBALL" ]
+[ "$TARBALL" = "\${NAME}-\${VERSION}.tgz" ]
+[ "$(jq -er '.sbom | select(type == "string")' release-manifest.json)" = "github-stars-mcp.cdx.json" ]
+[ "$(jq -er '.requirements | select(type == "string")' release-manifest.json)" = "requirements.json" ]
+EXPECTED_CHECKSUMS="$(printf '%s\\n' "$TARBALL" github-stars-mcp.cdx.json requirements.json release-manifest.json | LC_ALL=C sort)"
+ACTUAL_CHECKSUMS="$(awk 'NF == 2 && $1 ~ /^[0-9a-f]{64}$/ { name=$2; sub(/^\\*/, "", name); print name }' SHA256SUMS | LC_ALL=C sort)"
+[ "$(wc -l < SHA256SUMS)" -eq 4 ]
+[ "$ACTUAL_CHECKSUMS" = "$EXPECTED_CHECKSUMS" ]
+sha256sum --check --strict SHA256SUMS
+`;
+
+const validReleaseCommand = `set -euo pipefail
+cd release-bundle
+VERSION="$(jq -er '.version | select(type == "string" and length > 0)' release-manifest.json)"
+TAG="v\${VERSION}"
+if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+  gh release upload "$TAG" ./* --clobber --repo "$GITHUB_REPOSITORY"
+else
+  gh release create "$TAG" ./* --verify-tag --generate-notes --repo "$GITHUB_REPOSITORY"
+fi
+`;
+
+const validNpmPublishCommand = `set -euo pipefail
+cd release-bundle
+set -- ./*.tgz
+[ "$#" -eq 1 ]
+[ -f "$1" ]
+case "$BOOTSTRAP_NPM" in
+  true)
+    [ -n "\${NPM_TOKEN:-}" ]
+    export NODE_AUTH_TOKEN="$NPM_TOKEN"
+    ;;
+  false)
+    unset NPM_TOKEN NODE_AUTH_TOKEN
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+npm publish "$1" --provenance --access public
+`;
+
+const indentCommand = (command: string): string =>
+  command
+    .trimEnd()
+    .split("\n")
+    .map((line) => `          ${line}`)
+    .join("\n");
 
 const validFutureReleaseWorkflow = `name: Release
 
@@ -107,16 +173,25 @@ on:
         required: true
         type: boolean
         default: false
+      bootstrap_npm:
+        description: Bootstrap the first npm publication with a short-lived token.
+        required: true
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-\${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 jobs:
-  release:
-    environment: release
+  verify-package:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - name: Check out source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -126,7 +201,9 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+          cache: npm
+      - run: npm install --global npm@11.12.1
+      - run: test "$(npm --version)" = "11.12.1"
       - run: npm ci
       - run: npm run verify
       - run: npm run docs:check
@@ -136,56 +213,67 @@ jobs:
       - run: npm install --global @openai/codex@0.144.5
       - run: codex --version
       - run: npm run smoke:codex-plugin
-      - run: npm run verify:requirements -- --release
-      - id: pack
+      - run: node scripts/verify-release.mjs --bundle-release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: release-bundle
+          path: artifacts/release-bundle/
+  release:
+    needs: verify-package
+    environment: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: release-bundle
+          path: release-bundle
+      - name: Verify the immutable release bundle
         run: |
-          mkdir -p artifacts
-          npm sbom --sbom-format cyclonedx > artifacts/github-stars-mcp.cdx.json
-          npm pack --ignore-scripts --json --pack-destination artifacts > artifacts/pack.json
-          PACK_REPORTED="$(node -p "JSON.parse(require('fs').readFileSync('artifacts/pack.json','utf8'))[0].filename")"
-          set -- artifacts/*.tgz
-          [ "$#" -eq 1 ]
-          [ -f "$1" ]
-          PACK_TARBALL="$1"
-          [ "$PACK_TARBALL" = "artifacts/$PACK_REPORTED" ]
-          echo "tarball=\${PACK_TARBALL}" >> "$GITHUB_OUTPUT"
-      - run: npm run package:verify -- --tarball "\${{ steps.pack.outputs.tarball }}"
-      - run: node scripts/checksums.mjs "\${{ steps.pack.outputs.tarball }}"
+${indentCommand(validBundleValidationCommand)}
       - uses: actions/attest-build-provenance@43d14bc2b83dec42d39ecae14e916627a18bb661
         with:
-          subject-path: \${{ steps.pack.outputs.tarball }}
-      - name: Create the verified GitHub release
+          subject-path: release-bundle/*
+      - name: Create or update the verified GitHub release
         env:
           GH_TOKEN: \${{ github.token }}
-        run: ${validReleaseCommand}
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: \${{ inputs.publish_npm }}
-        with:
-          name: npm-tarball
-          path: \${{ steps.pack.outputs.tarball }}
+        run: |
+${indentCommand(validReleaseCommand)}
   publish-npm:
     if: \${{ inputs.publish_npm }}
     needs: release
     environment: npm-publish
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       id-token: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: npm-tarball
-          path: artifacts
+          name: release-bundle
+          path: release-bundle
+      - name: Verify the immutable release bundle
+        run: |
+${indentCommand(validBundleValidationCommand)}
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
       - run: |
-          set -- artifacts/*.tgz
-          [ "$#" -eq 1 ]
-          [ -f "$1" ]
-          npm publish "$1" --provenance --access public
+          npm install --global npm@11.12.1
+          test "$(npm --version)" = "11.12.1"
+      - name: Publish the exact verified package
+        env:
+          BOOTSTRAP_NPM: \${{ inputs.bootstrap_npm }}
+          NPM_TOKEN: \${{ secrets.NPM_TOKEN }}
+        run: |
+${indentCommand(validNpmPublishCommand)}
 `;
 
 async function withPolicyFixture<T>(
@@ -218,7 +306,7 @@ async function writeWorkflow(
 
 function replaceJobDefinition(
   source: string,
-  name: "release" | "publish-npm",
+  name: "verify-package" | "release" | "publish-npm",
   value: string,
 ): string {
   const pattern = new RegExp(`^  ${name}:\\n(?: {4,}.*\\n)*`, "mu");
@@ -246,7 +334,7 @@ describe("GitHub workflow policy", () => {
     expect(ci).toContain(pins.setupNode);
     expect(ci).toContain(pins.dependencyReview);
     expect(ci).toContain("npm ci");
-    expect(ci).toContain("npm run verify");
+    expect(ci).toContain("npm run verify:all");
   });
 
   it("runs the packed-install contract on three operating systems and two Node versions", async () => {
@@ -314,6 +402,17 @@ describe("GitHub workflow policy", () => {
     expect(result.stdout).toMatch(
       /^Workflow policy check passed: \d+ workflows and 2 dependency ecosystems\.\n$/,
     );
+  });
+
+  it("requires the manually gated release workflow", async () => {
+    await withPolicyFixture(async (fixtureRoot) => {
+      await rm(resolve(fixtureRoot, ".github/workflows/release.yml"), {
+        force: true,
+      });
+      const stderr = await verifierFailure(fixtureRoot);
+      expect(stderr).toContain(".github/workflows/release.yml");
+      expect(stderr).toContain("(WORKFLOW_MISSING)");
+    });
   });
 
   it.each([
@@ -543,6 +642,73 @@ describe("GitHub workflow policy", () => {
 
   it.each([
     {
+      name: "a missing bootstrap_npm input",
+      before: `      bootstrap_npm:
+        description: Bootstrap the first npm publication with a short-lived token.
+        required: true
+        type: boolean
+        default: false
+`,
+      after: "",
+      code: "RELEASE_INPUT",
+    },
+    {
+      name: "bootstrap_npm enabled by default",
+      before: `      bootstrap_npm:
+        description: Bootstrap the first npm publication with a short-lived token.
+        required: true
+        type: boolean
+        default: false`,
+      after: `      bootstrap_npm:
+        description: Bootstrap the first npm publication with a short-lived token.
+        required: true
+        type: boolean
+        default: true`,
+      code: "RELEASE_INPUT",
+    },
+    {
+      name: "a ref-independent concurrency group",
+      before: "  group: release-${{ github.ref }}",
+      after: "  group: release",
+      code: "RELEASE_CONCURRENCY",
+    },
+    {
+      name: "concurrency cancellation",
+      before: "  cancel-in-progress: false",
+      after: "  cancel-in-progress: true",
+      code: "RELEASE_CONCURRENCY",
+    },
+    {
+      name: "quoted concurrency cancellation",
+      before: "  cancel-in-progress: false",
+      after: '  cancel-in-progress: "false"',
+      code: "RELEASE_CONCURRENCY",
+    },
+    {
+      name: "workflow-wide write permission",
+      before: "permissions:\n  contents: read",
+      after: "permissions:\n  contents: write",
+      code: "RELEASE_PERMISSIONS",
+    },
+  ])(
+    "rejects release control-plane mutation through $name",
+    async (fixture) => {
+      await withPolicyFixture(async (fixtureRoot) => {
+        expect(validFutureReleaseWorkflow).toContain(fixture.before);
+        await writeWorkflow(
+          fixtureRoot,
+          "release.yml",
+          validFutureReleaseWorkflow.replace(fixture.before, fixture.after),
+        );
+
+        const stderr = await verifierFailure(fixtureRoot);
+        expect(stderr).toContain(`(${fixture.code})`);
+      });
+    },
+  );
+
+  it.each([
+    {
       name: "an unpinned attestation action",
       before: pins.attest,
       after: "actions/attest-build-provenance@v3",
@@ -567,10 +733,9 @@ describe("GitHub workflow policy", () => {
       code: "RELEASE_EXECUTION_POLICY",
     },
     {
-      name: "a verifier that ignores the packed tarball",
-      before:
-        'npm run package:verify -- --tarball "${{ steps.pack.outputs.tarball }}"',
-      after: "npm run package:verify",
+      name: "a floating npm version",
+      before: "npm install --global npm@11.12.1",
+      after: "npm install --global npm@latest",
       code: "RELEASE_EXECUTION_POLICY",
     },
     {
@@ -580,37 +745,91 @@ describe("GitHub workflow policy", () => {
       code: "RELEASE_EXECUTION_POLICY",
     },
     {
-      name: "a pack lifecycle hook",
+      name: "a bundle command outside bundle mode",
+      before: "node scripts/verify-release.mjs --bundle-release",
+      after: "node scripts/verify-release.mjs --prepare-only",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "an upload path broader than the exact bundle",
+      before: "          path: artifacts/release-bundle/",
+      after: "          path: artifacts/",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a release job checkout",
+      before: `    steps:
+      - uses: ${pins.downloadArtifact}`,
+      after: `    steps:
+      - uses: ${pins.checkout}
+      - uses: ${pins.downloadArtifact}`,
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a missing system checksum verification",
+      before: "sha256sum --check --strict SHA256SUMS",
+      after: "true # checksum bypassed",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a missing commit SHA binding",
+      before: '[ "$COMMIT_SHA" = "$GITHUB_SHA" ]',
+      after: "true # commit binding bypassed",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a missing ref binding",
+      before: '[ "$GIT_REF" = "$GITHUB_REF" ]',
+      after: "true # ref binding bypassed",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a missing tag/version binding",
+      before: '[ "$GIT_REF" = "refs/tags/v${VERSION}" ]',
+      after: "true # tag binding bypassed",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a missing manifest/tarball binding",
+      before: '[ "$MANIFEST_TARBALL" = "$TARBALL" ]',
+      after: "true # tarball binding bypassed",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a narrower attestation subject",
+      before: "          subject-path: release-bundle/*",
+      after: "          subject-path: release-bundle/*.tgz",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "a non-idempotent GitHub release",
       before:
-        "npm pack --ignore-scripts --json --pack-destination artifacts > artifacts/pack.json",
-      after:
-        "npm pack --json --pack-destination artifacts > artifacts/pack.json",
-      code: "RELEASE_EXECUTION_POLICY",
-    },
-    {
-      name: "a missing unique-tarball assertion",
-      before: '          [ "$#" -eq 1 ]\n',
-      after: "",
-      code: "RELEASE_EXECUTION_POLICY",
-    },
-    {
-      name: "a wildcard checksum target",
-      before: 'node scripts/checksums.mjs "${{ steps.pack.outputs.tarball }}"',
-      after: "node scripts/checksums.mjs artifacts",
-      code: "RELEASE_EXECUTION_POLICY",
-    },
-    {
-      name: "a wildcard GitHub release asset",
-      before:
-        'gh release create "v${VERSION}" "${{ steps.pack.outputs.tarball }}" artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes',
-      after:
-        'gh release create "v${VERSION}" artifacts/*.tgz artifacts/github-stars-mcp.cdx.json artifacts/requirements.json SHA256SUMS --verify-tag --generate-notes',
+        'if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then',
+      after: "if false; then",
       code: "RELEASE_EXECUTION_POLICY",
     },
     {
       name: "a fresh npm repack during publication",
       before: 'npm publish "$1" --provenance --access public',
       after: "npm publish --provenance --access public",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "npm publication without provenance",
+      before: 'npm publish "$1" --provenance --access public',
+      after: 'npm publish "$1" --access public',
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "bootstrap mode without a non-empty token assertion",
+      before: '    [ -n "${NPM_TOKEN:-}" ]',
+      after: "    true # token assertion bypassed",
+      code: "RELEASE_EXECUTION_POLICY",
+    },
+    {
+      name: "OIDC mode that retains the npm token",
+      before: "    unset NPM_TOKEN NODE_AUTH_TOKEN",
+      after: "    true # token retained",
       code: "RELEASE_EXECUTION_POLICY",
     },
   ])("rejects release pipeline mutation through $name", async (fixture) => {
@@ -700,7 +919,7 @@ touch guard-bypassed
     });
   });
 
-  it("rejects jobs outside the release and publish-npm allowlist", async () => {
+  it("rejects jobs outside the three release-stage allowlist", async () => {
     await withPolicyFixture(async (fixtureRoot) => {
       await writeWorkflow(
         fixtureRoot,
@@ -720,6 +939,9 @@ touch guard-bypassed
   });
 
   it.each([
+    ["verify-package", "null", "null"],
+    ["verify-package", "a scalar", "invalid"],
+    ["verify-package", "a sequence", "\n    - invalid"],
     ["release", "null", "null"],
     ["release", "a scalar", "invalid"],
     ["release", "a sequence", "\n    - invalid"],
@@ -816,13 +1038,15 @@ touch guard-bypassed
     },
   ])("rejects GH_TOKEN beside $name", async ({ run }) => {
     await withPolicyFixture(async (fixtureRoot) => {
+      const validRunBlock = `        run: |
+${indentCommand(validReleaseCommand)}`;
+      const mutatedRunBlock = `        run: |
+${indentCommand(run)}`;
+      expect(validFutureReleaseWorkflow).toContain(validRunBlock);
       await writeWorkflow(
         fixtureRoot,
         "release.yml",
-        validFutureReleaseWorkflow.replace(
-          `run: ${validReleaseCommand}`,
-          `run: ${run}`,
-        ),
+        validFutureReleaseWorkflow.replace(validRunBlock, mutatedRunBlock),
       );
 
       const stderr = await verifierFailure(fixtureRoot);
@@ -833,9 +1057,11 @@ touch guard-bypassed
   it.each([
     {
       name: "a custom shell wrapper",
-      before: `        run: ${validReleaseCommand}`,
+      before: `        run: |
+${indentCommand(validReleaseCommand)}`,
       after: `        shell: bash -c 'env; {0}'
-        run: ${validReleaseCommand}`,
+        run: |
+${indentCommand(validReleaseCommand)}`,
     },
     {
       name: "a shell startup environment hook",
@@ -862,11 +1088,13 @@ touch guard-bypassed
         fixtureRoot,
         "release.yml",
         validFutureReleaseWorkflow.replace(
-          "    runs-on: ubuntu-latest\n",
-          `    runs-on: ubuntu-latest
+          "    timeout-minutes: 10\n    permissions:\n      contents: write\n",
+          `    timeout-minutes: 10
     defaults:
       run:
         shell: bash -c 'env; {0}'
+    permissions:
+      contents: write
 `,
         ),
       );
@@ -884,21 +1112,24 @@ touch guard-bypassed
     },
     {
       name: "a release-job BASH_ENV hook",
-      before: "    runs-on: ubuntu-latest\n",
+      before:
+        "    timeout-minutes: 10\n    permissions:\n      contents: write\n",
       after:
-        "    runs-on: ubuntu-latest\n    env:\n      BASH_ENV: ./release-wrapper.sh\n",
+        "    timeout-minutes: 10\n    env:\n      BASH_ENV: ./release-wrapper.sh\n    permissions:\n      contents: write\n",
     },
     {
       name: "a release-job NODE_OPTIONS hook",
-      before: "    runs-on: ubuntu-latest\n",
+      before:
+        "    timeout-minutes: 10\n    permissions:\n      contents: write\n",
       after:
-        "    runs-on: ubuntu-latest\n    env:\n      NODE_OPTIONS: --require ./release-wrapper.cjs\n",
+        "    timeout-minutes: 10\n    env:\n      NODE_OPTIONS: --require ./release-wrapper.cjs\n    permissions:\n      contents: write\n",
     },
     {
       name: "a release-job ENV hook",
-      before: "    runs-on: ubuntu-latest\n",
+      before:
+        "    timeout-minutes: 10\n    permissions:\n      contents: write\n",
       after:
-        "    runs-on: ubuntu-latest\n    env:\n      ENV: ./release-wrapper.sh\n",
+        "    timeout-minutes: 10\n    env:\n      ENV: ./release-wrapper.sh\n    permissions:\n      contents: write\n",
     },
   ])("rejects GH_TOKEN inheritance beside $name", async ({ before, after }) => {
     await withPolicyFixture(async (fixtureRoot) => {
@@ -919,10 +1150,10 @@ touch guard-bypassed
         fixtureRoot,
         "release.yml",
         validFutureReleaseWorkflow.replace(
-          "      - name: Create the verified GitHub release\n",
+          "      - name: Create or update the verified GitHub release\n",
           `      - name: Rewrite the command search path
         run: echo "./bin" >> "$GITHUB_PATH"
-      - name: Create the verified GitHub release
+      - name: Create or update the verified GitHub release
 `,
         ),
       );
@@ -957,7 +1188,7 @@ touch guard-bypassed
       after: "          persist-credentials: true",
       code: "CHECKOUT_CREDENTIAL_PERSISTENCE",
     },
-  ])("rejects release checkout with $name", async (fixture) => {
+  ])("rejects verify-package checkout with $name", async (fixture) => {
     await withPolicyFixture(async (fixtureRoot) => {
       expect(validFutureReleaseWorkflow).toContain(fixture.before);
       await writeWorkflow(
@@ -971,7 +1202,7 @@ touch guard-bypassed
     });
   });
 
-  it("accepts the future Task 7 manually gated release workflow", async () => {
+  it("accepts the three-stage least-privilege release workflow", async () => {
     await withPolicyFixture(async (fixtureRoot) => {
       await writeWorkflow(
         fixtureRoot,
@@ -1132,9 +1363,9 @@ touch guard-bypassed
     {
       name: "CI verify",
       path: ".github/workflows/ci.yml",
-      before: "        run: npm run verify\n",
+      before: "        run: npm run verify:all\n",
       after:
-        "        shell: \"bash -c 'true # {0}'\"\n        run: npm run verify\n",
+        "        shell: \"bash -c 'true # {0}'\"\n        run: npm run verify:all\n",
       code: "CI_EXECUTION_POLICY",
     },
     {
