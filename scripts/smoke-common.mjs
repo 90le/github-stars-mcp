@@ -33,6 +33,7 @@ export const EXPECTED_TOOL_NAMES = Object.freeze([
   "github_stars_query",
   "github_lists_query",
   "github_repositories_discover",
+  "github_repositories_candidates",
   "github_changes_plan",
   "github_changes_inspect",
   "github_changes_apply",
